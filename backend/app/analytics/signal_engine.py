@@ -89,18 +89,50 @@ class Signal:
 # individual checks
 # --------------------------------------------------------------------------
 
-def check_structure(state: structure.StructureState) -> Check:
+# A structure break matters most on the bar it happens. Full weight while
+# fresh, fading to nothing by STALE_BARS — a CHoCH from five hours ago that
+# price has since traded back through is not evidence of anything.
+FRESH_BARS = 12      # one hour on a 5m chart
+STALE_BARS = 60      # five hours
+
+
+def check_structure(state: structure.StructureState, current_index: int,
+                    price: float) -> Check:
     ev = structure.last_event(state)
     if ev is None:
         return Check("structure", 0.0, WEIGHTS["structure"],
                      "No confirmed break of structure yet.")
+
+    bars_ago = max(0, current_index - ev.index)
+    if bars_ago >= STALE_BARS:
+        return Check("structure", 0.0, WEIGHTS["structure"],
+                     f"Last break was {bars_ago} bars ago — too old to trade on.",
+                     disabled=True)
+
+    decay = 1.0 if bars_ago <= FRESH_BARS else \
+        1.0 - (bars_ago - FRESH_BARS) / (STALE_BARS - FRESH_BARS)
+
     direction = 1.0 if ev.direction == "bullish" else -1.0
+
+    # A break price has since traded back through has failed, whatever the
+    # label says. Reporting it at full strength is how you end up buying a
+    # bullish CHoCH while price sits below the level it supposedly broke.
+    reclaimed = (ev.direction == "bullish" and price < ev.broken_level) or \
+                (ev.direction == "bearish" and price > ev.broken_level)
+    if reclaimed:
+        decay *= 0.3
+
+    age = "this bar" if bars_ago == 0 else f"{bars_ago} bars ago"
+    note = " — but price has traded back through it, so the break failed" \
+        if reclaimed else ""
+
     if ev.kind == "CHOCH":
-        return Check("structure", direction * 0.7, WEIGHTS["structure"],
-                     f"CHoCH {ev.direction} — broke {ev.broken_level:.2f}, "
-                     f"first sign the old trend is failing.")
-    return Check("structure", direction, WEIGHTS["structure"],
-                 f"BOS {ev.direction} — cleared {ev.broken_level:.2f} in the trend direction.")
+        return Check("structure", direction * 0.7 * decay, WEIGHTS["structure"],
+                     f"CHoCH {ev.direction} {age}, broke {ev.broken_level:.2f}"
+                     f"{note}.")
+    return Check("structure", direction * decay, WEIGHTS["structure"],
+                 f"BOS {ev.direction} {age}, cleared {ev.broken_level:.2f}"
+                 f"{note}.")
 
 
 def check_vwap(row: pd.Series) -> Check:
@@ -169,14 +201,33 @@ def check_liquidity(sweep: dict | None, pools: list[smc.LiquidityPool], price: f
                  f"({nearest.touches} touches) is likely to attract price.")
 
 
-def check_fvg(gaps: list[smc.FairValueGap], price: float) -> Check:
+# How close price must be before an unfilled gap is worth reacting to,
+# measured in ATR so it scales with volatility instead of being a fixed
+# number of points that means different things on different days.
+FVG_REACH_ATR = 2.0
+
+
+def check_fvg(gaps: list[smc.FairValueGap], price: float, atr: float) -> Check:
     live = [g for g in gaps if not g.filled]
     if not live:
         return Check("fvg", 0.0, WEIGHTS["fvg"], "No unfilled fair value gaps.")
+
     nearest = min(live, key=lambda g: abs(g.midpoint - price))
     inside = nearest.bottom <= price <= nearest.top
+    distance = 0.0 if inside else min(abs(price - nearest.top),
+                                      abs(price - nearest.bottom))
+
+    # Without this gate a gap 300 points away scored the same as one price
+    # was about to trade into, which quietly pushed every signal around.
+    if not inside and atr > 0 and distance > atr * FVG_REACH_ATR:
+        return Check("fvg", 0.0, WEIGHTS["fvg"],
+                     f"Nearest unfilled {nearest.direction} FVG is "
+                     f"{distance:.0f} points away ({distance / atr:.1f} ATR) "
+                     f"— too far to matter.",
+                     disabled=True)
+
     score = (1.0 if nearest.direction == "bullish" else -1.0) * (1.0 if inside else 0.4)
-    where = "trading inside" if inside else "approaching"
+    where = "Trading inside" if inside else f"{distance:.0f} points from"
     return Check("fvg", score, WEIGHTS["fvg"],
                  f"{where} a {nearest.direction} FVG "
                  f"({nearest.bottom:.2f}-{nearest.top:.2f}).")
@@ -246,11 +297,11 @@ def generate(
     chain_summary = options.summarise(chain, price) if chain is not None else None
 
     checks = [
-        check_structure(state),
+        check_structure(state, len(df) - 1, price),
         check_vwap(row),
         check_trend(row),
         check_liquidity(sweep, pools, price),
-        check_fvg(gaps, price),
+        check_fvg(gaps, price, float(row["atr14"])),
         check_option_chain(chain_summary),
         check_volume(row, volume_is_real=indicators.has_real_volume(df)),
     ]

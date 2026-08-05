@@ -118,15 +118,77 @@ def test_disabled_checks_renormalise_the_weights(candles):
     flat["volume"] = 1.0
 
     sig = signal_engine.generate(flat)          # no chain, no volume
-    assert set(sig.context["disabled_checks"]) == {"volume", "option_chain"}
+    # Volume and the chain must always disable here. Other checks may also
+    # disable depending on the data — asserting an exact set made this test
+    # break every time a new check learned to switch itself off.
+    assert {"volume", "option_chain"} <= set(sig.context["disabled_checks"])
 
     live_weight = sum(c.weight for c in sig.checks if not c.disabled)
     assert sig.context["weight_scale"] == pytest.approx(1 / live_weight, rel=1e-3)
     assert 0 <= sig.confidence <= 1
 
 
-def test_all_checks_live_means_no_rescaling(candles):
+def test_scale_always_matches_the_surviving_weight(candles):
+    """The invariant that actually matters: whatever is disabled, the live
+    checks must together be able to reach full confidence."""
     broker = MockBroker()
     sig = signal_engine.generate(candles, chain=broker.option_chain(), india_vix=13.0)
-    assert sig.context["disabled_checks"] == []
-    assert sig.context["weight_scale"] == pytest.approx(1.0)
+
+    live_weight = sum(c.weight for c in sig.checks if not c.disabled)
+    assert sig.context["weight_scale"] == pytest.approx(1 / live_weight, rel=1e-3)
+    assert sum(c.contribution for c in sig.checks if c.disabled) == 0.0
+    if not sig.context["disabled_checks"]:
+        assert sig.context["weight_scale"] == pytest.approx(1.0)
+
+
+def test_stale_structure_break_is_discounted(candles):
+    """A CHoCH from five hours ago is not evidence about right now. Live
+    output showed a bullish CHoCH at full weight while price sat below the
+    level it supposedly broke."""
+    from app.analytics.structure import StructureEvent, StructureState
+
+    state = StructureState(trend="bullish")
+    state.events.append(StructureEvent(
+        index=100, timestamp=candles["timestamp"].iloc[100],
+        kind="CHOCH", direction="bullish", broken_level=24500.0, close=24510.0))
+
+    fresh = signal_engine.check_structure(state, current_index=102, price=24510.0)
+    aging = signal_engine.check_structure(state, current_index=140, price=24510.0)
+    stale = signal_engine.check_structure(state, current_index=200, price=24510.0)
+
+    assert abs(fresh.score) > abs(aging.score) > 0
+    assert stale.disabled and stale.contribution == 0.0
+
+
+def test_a_break_price_traded_back_through_is_downweighted(candles):
+    """This is the exact live case: bullish CHoCH broke 24501.35, price then
+    24494.29 — below it. The break failed and must not score full strength."""
+    from app.analytics.structure import StructureEvent, StructureState
+
+    state = StructureState(trend="bullish")
+    state.events.append(StructureEvent(
+        index=100, timestamp=candles["timestamp"].iloc[100],
+        kind="CHOCH", direction="bullish", broken_level=24501.35, close=24505.0))
+
+    held = signal_engine.check_structure(state, 102, price=24510.0)
+    failed = signal_engine.check_structure(state, 102, price=24494.29)
+
+    assert failed.score < held.score
+    assert "failed" in failed.reason
+
+
+def test_distant_fvg_does_not_move_the_signal(candles):
+    """A gap 300 points away scored the same as one price was about to trade
+    into, quietly pushing every signal around."""
+    from app.analytics.smc import FairValueGap
+
+    price, atr = 24494.0, 25.0
+    near = FairValueGap(10, candles["timestamp"].iloc[10], "bullish", 24510.0, 24500.0)
+    far = FairValueGap(10, candles["timestamp"].iloc[10], "bearish", 24832.0, 24819.0)
+
+    assert signal_engine.check_fvg([near], price, atr).contribution != 0.0
+
+    far_check = signal_engine.check_fvg([far], price, atr)
+    assert far_check.disabled
+    assert far_check.contribution == 0.0
+    assert "too far" in far_check.reason
