@@ -18,7 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from ..analytics.indicators import drop_unclosed
+from ..analytics.indicators import (
+    drop_future,
+    drop_outside_session,
+    drop_unclosed,
+)
 from ..models import CandleRecord
 
 log = logging.getLogger(__name__)
@@ -29,7 +33,12 @@ CHUNK_SIZE = 500
 
 
 def archive(db: Session, df: pd.DataFrame, symbol: str, timeframe: str,
-            source: str = "free", skip_unclosed: bool = True) -> int:
+            source: str, skip_unclosed: bool = True) -> int:
+    # `source` is deliberately required. It used to default to "free", so a
+    # caller that forgot to pass it labelled mock candles as real data — and
+    # the one column that distinguished good rows from bad became useless
+    # exactly when it was needed. A missing argument is now a TypeError at
+    # import time rather than corruption discovered weeks later.
     """Store candles, updating any that already exist. Returns rows written.
 
     Two things this has to survive that a naive bulk insert does not:
@@ -50,6 +59,8 @@ def archive(db: Session, df: pd.DataFrame, symbol: str, timeframe: str,
 
     if skip_unclosed:
         df = drop_unclosed(df, timeframe)
+        df = drop_outside_session(df)
+        df = drop_future(df)
         if df.empty:
             return 0
 

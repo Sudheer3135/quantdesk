@@ -174,3 +174,124 @@ def test_every_module_is_syntactically_valid():
         path = backend / (name.replace(".", "/") + ".py")
         assert path.exists(), f"{name} is missing at {path}"
         ast.parse(path.read_text(), filename=str(path))
+
+
+def test_weekend_and_after_hours_candles_are_rejected():
+    """The mock broker steps five minutes at a time with no notion of
+    weekends, so its bars land on valid boundaries on a Sunday afternoon.
+    Once in the archive they are invisible — 750 of them reached a real
+    archive this way."""
+    import pandas as pd
+    from app.analytics.indicators import drop_outside_session
+
+    stamps = pd.to_datetime([
+        "2026-08-07T04:00:00Z",   # Fri 09:30 IST — keep
+        "2026-08-07T09:55:00Z",   # Fri 15:25 IST — keep
+        "2026-08-07T10:55:00Z",   # Fri 16:25 IST — after close
+        "2026-08-07T03:30:00Z",   # Fri 09:00 IST — before open
+        "2026-08-08T05:00:00Z",   # Saturday
+        "2026-08-09T05:00:00Z",   # Sunday
+    ], utc=True)
+    df = pd.DataFrame({"timestamp": stamps, "open": 1.0, "high": 1.0,
+                       "low": 1.0, "close": 1.0, "volume": 1.0})
+
+    kept = drop_outside_session(df)
+    assert len(kept) == 2
+    assert kept["timestamp"].dt.tz_convert("Asia/Kolkata").dt.dayofweek.max() < 5
+
+
+def test_mock_broker_candles_are_mostly_rejected():
+    """Proof the guard catches the actual source of the contamination."""
+    from app.analytics.indicators import drop_outside_session
+    from app.brokers.mock import MockBroker
+
+    raw = MockBroker().candles(days=10)
+    kept = drop_outside_session(raw)
+    assert len(kept) < len(raw), "mock candles should not all survive"
+
+
+def test_mock_broker_rejects_unknown_intervals():
+    """`interval="5m"` fell through to 375 bars a session, producing 22,125
+    candles for a 59-day request with timestamps two months in the future —
+    all of which reached a real archive."""
+    from app.brokers.mock import MockBroker
+
+    b = MockBroker()
+    assert len(b.candles(days=10, interval="5m")) == \
+           len(b.candles(days=10, interval="5minute"))
+
+    with pytest.raises(ValueError, match="unknown interval"):
+        b.candles(interval="not-a-timeframe")
+
+
+def test_no_candle_may_be_dated_in_the_future():
+    import pandas as pd
+    from app.analytics.indicators import drop_future
+
+    now = pd.Timestamp.now(tz="UTC")
+    df = pd.DataFrame({
+        "timestamp": [now - pd.Timedelta(days=1), now + pd.Timedelta(days=30)],
+        "open": [1.0, 1.0], "high": [1.0, 1.0], "low": [1.0, 1.0],
+        "close": [1.0, 1.0], "volume": [1.0, 1.0],
+    })
+    assert len(drop_future(df)) == 1
+
+
+def test_mock_candles_never_reach_the_archive_shape():
+    """End to end: whatever the mock broker produces, the archive guards
+    reject weekends, after-hours bars and anything future-dated."""
+    import pandas as pd
+    from app.analytics.indicators import (
+        drop_future,
+        drop_outside_session,
+        drop_unclosed,
+    )
+    from app.brokers.mock import MockBroker
+
+    df = MockBroker().candles(days=30, interval="5m")
+    clean = drop_future(drop_outside_session(drop_unclosed(df, "5m")))
+
+    local = clean["timestamp"].dt.tz_convert("Asia/Kolkata")
+    assert (local.dt.dayofweek < 5).all()
+    assert clean["timestamp"].max() <= pd.Timestamp.now(tz="UTC")
+
+
+def test_archive_requires_an_explicit_source():
+    """`source` defaulted to "free", so the backfill endpoint — which never
+    passed it — labelled 19,000 mock candles as real data. The column that
+    distinguished trustworthy rows from junk became useless precisely when
+    it mattered. A forgotten argument must fail loudly."""
+    import ast
+
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    tree = ast.parse((backend / "app/workers/archiver.py").read_text())
+
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "archive")
+    names = [a.arg for a in fn.args.args]
+    # defaults align to the tail of the argument list
+    defaults = dict(zip(names[len(names) - len(fn.args.defaults):],
+                        fn.args.defaults, strict=True))
+    assert "source" not in defaults, "source must not have a default value"
+
+
+def test_every_archive_caller_passes_a_source():
+    """A signature check only helps if nothing calls it wrongly. This walks
+    the actual call sites."""
+    import ast
+
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    callers = ["app/api/market.py", "app/workers/agent.py"]
+
+    for rel in callers:
+        tree = ast.parse((backend / rel).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "archive":
+                continue
+            passed = {kw.arg for kw in node.keywords}
+            assert "source" in passed or len(node.args) >= 5, \
+                f"{rel} calls archive() without a source"

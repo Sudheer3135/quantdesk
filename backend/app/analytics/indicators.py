@@ -112,6 +112,61 @@ TIMEFRAME_MINUTES = {
 }
 
 
+# NSE cash and index sessions. Anything outside this never happened.
+MARKET_OPEN = (9, 15)
+MARKET_CLOSE = (15, 30)
+
+
+def drop_outside_session(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.DataFrame:
+    """Remove candles from weekends and from outside 09:15-15:30 IST.
+
+    Boundary alignment alone is not enough. The mock broker steps forward
+    five minutes at a time with no notion of weekends, so its candles land
+    on perfectly valid 5-minute boundaries on a Sunday afternoon. Once mixed
+    into the archive they are invisible — and a backtest that trades a
+    Sunday is not measuring anything real.
+
+    This does not catch exchange holidays, which need a calendar. Weekends
+    and clock hours remove the overwhelming majority of impossible bars.
+    """
+    if df.empty:
+        return df
+
+    local = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(tz)
+    weekday = local.dt.dayofweek < 5                      # Monday-Friday
+    open_t = pd.Timestamp(*(2000, 1, 1), *MARKET_OPEN).time()
+    close_t = pd.Timestamp(*(2000, 1, 1), *MARKET_CLOSE).time()
+    in_hours = (local.dt.time >= open_t) & (local.dt.time <= close_t)
+
+    keep = weekday & in_hours
+    dropped = int((~keep).sum())
+    if dropped:
+        logging.getLogger(__name__).info(
+            "dropped %s candles outside NSE session hours", dropped)
+    return df[keep].reset_index(drop=True)
+
+
+def drop_future(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove candles dated after now.
+
+    Nothing legitimate produces these. A misconfigured generator dated bars
+    two months ahead and they sat in the archive looking exactly like real
+    data — the count went up, nothing errored, and the only visible symptom
+    was a "last candle" date that had not happened yet.
+
+    A cheap absolute guard is worth more here than a clever one.
+    """
+    if df.empty:
+        return df
+    now = pd.Timestamp.now(tz="UTC")
+    keep = pd.to_datetime(df["timestamp"], utc=True) <= now
+    dropped = int((~keep).sum())
+    if dropped:
+        logging.getLogger(__name__).warning(
+            "dropped %s candles dated in the future — check the data source", dropped)
+    return df[keep].reset_index(drop=True)
+
+
 def drop_unclosed(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """Remove candles that have not finished forming.
 

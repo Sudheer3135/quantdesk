@@ -23,9 +23,29 @@ class MockBroker(Broker):
         self.rng = np.random.default_rng(seed)
         self.base_price = base_price
 
+    # Bars per NSE session, keyed by every spelling the platform uses.
+    # An unrecognised interval used to fall through to 375 bars a day, which
+    # produced 22,125 candles for a 59-day request and timestamps two months
+    # in the future. Silent, plausible-looking, and completely wrong.
+    BARS_PER_SESSION = {
+        "1m": 375, "1minute": 375,
+        "3m": 125, "3minute": 125,
+        "5m": 75, "5minute": 75,
+        "15m": 25, "15minute": 25,
+        "30m": 13, "30minute": 13,
+        "1h": 7, "60m": 7, "60minute": 7,
+        "1d": 1, "day": 1,
+    }
+
     def candles(self, symbol: str = "NIFTY", interval: str = "5minute",
                 days: int = 5) -> pd.DataFrame:
-        per_day = 75 if interval == "5minute" else 375
+        if interval not in self.BARS_PER_SESSION:
+            raise ValueError(
+                f"unknown interval {interval!r}; expected one of "
+                f"{sorted(self.BARS_PER_SESSION)}"
+            )
+        per_day = self.BARS_PER_SESSION[interval]
+        step = timedelta(minutes=375 // per_day) if per_day > 1 else timedelta(days=1)
         n = per_day * days
         drift = np.linspace(0, self.rng.normal(0, 120), n)
         noise = np.cumsum(self.rng.normal(0, 12, n))
@@ -42,7 +62,7 @@ class MockBroker(Broker):
         stamps, cursor, count = [], start, 0
         while len(stamps) < n:
             stamps.append(cursor)
-            cursor += timedelta(minutes=5)
+            cursor += step
             count += 1
             if count % per_day == 0:
                 cursor = (cursor + timedelta(days=1)).replace(hour=9, minute=15)

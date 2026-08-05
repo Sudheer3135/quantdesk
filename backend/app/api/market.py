@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from ..analytics import indicators, options, smc, structure
 from ..cache import get_json, set_json
+from ..config import get_settings
 from ..db import get_db
 from ..deps import get_broker
 from ..workers import archiver
@@ -82,5 +83,6 @@ def archive_backfill(symbol: str = "NIFTY", timeframe: str = "5m",
     up every five minutes.
     """
     candles = get_broker().candles(symbol, timeframe, days)
-    written = archiver.archive(db, candles, symbol, timeframe)
+    written = archiver.archive(db, candles, symbol, timeframe,
+                               source=get_settings().broker)
     return {"written": written, "coverage": archiver.coverage(db, symbol, timeframe)}
