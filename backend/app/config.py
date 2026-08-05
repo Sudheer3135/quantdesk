@@ -1,0 +1,44 @@
+"""Settings. Everything comes from environment variables — nothing secret
+is ever committed. See .env.example at the repo root."""
+from functools import lru_cache
+from typing import Literal
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    app_name: str = "QuantDesk"
+    environment: Literal["dev", "prod"] = "dev"
+    log_level: str = "INFO"
+
+    database_url: str = "postgresql+psycopg://quant:quant@localhost:5432/quantdesk"
+    redis_url: str = "redis://localhost:6379/0"
+
+    broker: Literal["mock", "free", "kite"] = "mock"
+    kite_api_key: str | None = None
+    kite_api_secret: str | None = None
+    kite_access_token: str | None = None
+
+    # Nothing places a real order unless this is explicitly true.
+    live_trading: bool = False
+
+    capital: float = 100_000.0
+    risk_per_trade_pct: float = 1.0
+    max_trades_per_day: int = 2
+    min_risk_reward: float = 2.0
+    lot_size: int = 75
+
+    archive_candles: bool = True
+
+    agent_interval_minutes: int = 5
+    watch_symbol: str = "NIFTY"
+    watch_timeframe: str = "5m"
+
+    cors_origins: str = "http://localhost:5173"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

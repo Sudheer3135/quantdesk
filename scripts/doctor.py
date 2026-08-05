@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""QuantDesk doctor.
+
+Runs every check that cannot be run without a real machine, real network and
+real containers, then prints one report. Run this on your Mac and paste the
+whole output back — it tells me exactly what broke and where, so a round of
+fixes takes one message instead of five.
+
+    python3 scripts/doctor.py              # everything
+    python3 scripts/doctor.py --no-network # skip NSE and Yahoo
+    python3 scripts/doctor.py --api        # also hit a running backend
+
+Safe to run any time. It only reads. It never places an order and never
+writes to your database.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import platform
+import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+for candidate in (ROOT / "backend", Path("/srv")):
+    if candidate.exists():
+        sys.path.insert(0, str(candidate))
+
+PASS, FAIL, WARN, SKIP = "PASS", "FAIL", "WARN", "SKIP"
+results: list[tuple[str, str, str]] = []
+
+
+def record(name: str, status: str, detail: str = "") -> None:
+    results.append((name, status, detail))
+    mark = {PASS: "  ok  ", FAIL: " FAIL ", WARN: " warn ", SKIP: " skip "}[status]
+    print(f"[{mark}] {name}" + (f"\n         {detail}" if detail else ""), flush=True)
+
+
+def check(name: str):
+    """Decorator: run a check, catch anything, record the outcome."""
+    def wrap(fn):
+        try:
+            detail = fn()
+            record(name, PASS, detail or "")
+        except SkipCheck as exc:
+            record(name, SKIP, str(exc))
+        except WarnCheck as exc:
+            record(name, WARN, str(exc))
+        except Exception as exc:
+            line = traceback.extract_tb(exc.__traceback__)[-1]
+            where = f"{line.filename.split('/')[-1]}:{line.lineno}"
+            record(name, FAIL, f"{type(exc).__name__}: {exc}  ({where})")
+        return fn
+    return wrap
+
+
+class SkipCheck(Exception):
+    pass
+
+
+class WarnCheck(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+def section(title: str) -> None:
+    print(f"\n--- {title} " + "-" * max(0, 56 - len(title)), flush=True)
+
+
+def run_environment() -> None:
+    section("environment")
+
+    @check("python version")
+    def _():
+        v = sys.version_info
+        if v < (3, 11):
+            raise WarnCheck(f"Python {v.major}.{v.minor}; the backend targets 3.12")
+        return f"Python {v.major}.{v.minor}.{v.micro} on {platform.machine()}"
+
+    for module in ("pandas", "numpy", "fastapi", "sqlalchemy", "redis",
+                   "httpx", "apscheduler", "yfinance"):
+        @check(f"import {module}")
+        def _(m=module):
+            mod = __import__(m)
+            return getattr(mod, "__version__", "version unknown")
+
+
+def run_analytics() -> None:
+    section("analytics (no network needed)")
+
+    @check("mock broker generates candles")
+    def _():
+        from app.brokers.mock import MockBroker
+        df = MockBroker().candles(days=5)
+        if df.empty:
+            raise RuntimeError("mock broker returned an empty frame")
+        return f"{len(df)} candles, {df['timestamp'].iloc[0]} to {df['timestamp'].iloc[-1]}"
+
+    @check("indicators compute without NaN leakage")
+    def _():
+        from app.analytics import indicators
+        from app.brokers.mock import MockBroker
+        df = indicators.enrich(MockBroker().candles(days=5))
+        tail = df.tail(50)
+        bad = [c for c in ("ema20", "atr14", "vwap", "rvol") if tail[c].isna().any()]
+        if bad:
+            raise RuntimeError(f"NaN in the last 50 bars of: {bad}")
+        return f"vwap={df['vwap'].iloc[-1]:.2f} atr14={df['atr14'].iloc[-1]:.2f}"
+
+    @check("signal engine produces a decision")
+    def _():
+        from app.analytics import signal_engine
+        from app.brokers.mock import MockBroker
+        b = MockBroker()
+        sig = signal_engine.generate(b.candles(days=8), chain=b.option_chain(), india_vix=14.0)
+        return f"{sig.action} at {sig.confidence:.0%}, {len(sig.checks)} checks"
+
+    @check("risk manager approves a valid trade")
+    def _():
+        from datetime import date
+
+        from app.risk.manager import DayState, RiskConfig, evaluate
+        d = evaluate(config=RiskConfig(capital=500_000, lot_size=75),
+                     state=DayState(trading_day=date.today()),
+                     entry=24_000, stop_loss=23_970, target=23_940)
+        if not d.approved:
+            raise RuntimeError(f"blocked a valid trade: {d.reasons}")
+        return f"{d.quantity} units ({d.lots} lots)"
+
+    @check("backtest runs end to end")
+    def _():
+        from app.backtest.engine import run
+        from app.brokers.mock import MockBroker
+        from app.risk.manager import RiskConfig
+        res = run(MockBroker().candles(days=10), starting_capital=500_000,
+                  risk_config=RiskConfig(capital=500_000, lot_size=75))
+        st = res.stats
+        return f"{st.get('trades', 0)} trades, expectancy {st.get('expectancy_r', 0)}R"
+
+
+def run_infrastructure() -> None:
+    section("infrastructure")
+
+    # Every infrastructure check imports app.config, so one missing package
+    # would otherwise produce four identical failures and hide the real
+    # state of your database. Gate on it and say what to run instead.
+    try:
+        import pydantic_settings  # noqa: F401
+    except ImportError:
+        record("infrastructure checks", SKIP,
+               "Backend dependencies are not installed in this Python. Run:\n"
+               "         python3 -m pip install -r backend/requirements-local.txt")
+        return
+
+    @check("settings load from environment")
+    def _():
+        from app.config import get_settings
+        s = get_settings()
+        return f"broker={s.broker} live_trading={s.live_trading} env={s.environment}"
+
+    @check("postgres reachable and tables create")
+    def _():
+        from app.db import engine, init_db
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            version = conn.execute(text("select version()")).scalar()
+        init_db()
+        return str(version).split(",")[0]
+
+    @check("candle upsert is idempotent")
+    def _():
+        from app.brokers.mock import MockBroker
+        from app.db import SessionLocal
+        from app.workers import archiver
+        df = MockBroker(seed=99).candles(days=1).head(20)
+        with SessionLocal() as db:
+            archiver.archive(db, df, "__DOCTOR__", "5m", source="doctor")
+            archiver.archive(db, df, "__DOCTOR__", "5m", source="doctor")
+            back = archiver.load(db, "__DOCTOR__", "5m")
+            from app.models import CandleRecord
+            db.query(CandleRecord).filter(CandleRecord.symbol == "__DOCTOR__").delete()
+            db.commit()
+        if len(back) != len(df):
+            raise RuntimeError(
+                f"wrote {len(df)} rows twice but read back {len(back)} — "
+                "the upsert is duplicating instead of updating")
+        return f"{len(back)} rows after two identical writes (correct)"
+
+    @check("redis reachable")
+    def _():
+        from app.cache import client
+        c = client()
+        if not c:
+            raise WarnCheck("Redis is not reachable; caching is disabled but the app still runs")
+        return "ping ok"
+
+
+def run_network() -> None:
+    section("live data sources")
+
+    @check("NSE option chain endpoint")
+    def _():
+        from app.brokers.nse import NSEClient, parse_option_chain
+        client = NSEClient()
+        payload = client.raw_option_chain("NIFTY")
+        chain, spot = parse_option_chain(payload)
+        client.close()
+        if chain.empty:
+            raise RuntimeError("NSE responded but the chain parsed empty")
+        return (f"{len(chain)} strikes, spot {spot}, "
+                f"expiries {payload['records'].get('expiryDates', [])[:2]}")
+
+    @check("NSE India VIX")
+    def _():
+        from app.brokers.freedata import FreeDataBroker
+        vix = FreeDataBroker().india_vix()
+        if vix is None:
+            raise RuntimeError("VIX came back None — check the index name in allIndices")
+        return f"India VIX {vix}"
+
+    @check("Yahoo 5m candles")
+    def _():
+        from app.brokers.freedata import FreeDataBroker
+        df = FreeDataBroker().candles("NIFTY", "5m", days=5)
+        if df.empty:
+            raise RuntimeError("Yahoo returned an empty frame")
+        zero_vol = df["volume"].nunique() == 1
+        note = " (volume is synthetic — Yahoo reports none)" if zero_vol else ""
+        return f"{len(df)} candles, last close {df['close'].iloc[-1]:.2f}{note}"
+
+    @check("free broker feeds the analytics unchanged")
+    def _():
+        from app.analytics import signal_engine
+        from app.brokers.freedata import FreeDataBroker
+        b = FreeDataBroker()
+        chain, _ = b.chain_with_spot("NIFTY")
+        sig = signal_engine.generate(b.candles("NIFTY", "5m", days=10),
+                                     chain=chain, india_vix=b.india_vix())
+        return f"{sig.action} at {sig.confidence:.0%} on live data"
+
+
+def run_api(base: str) -> None:
+    section(f"running backend at {base}")
+    try:
+        import httpx
+    except ImportError:
+        record("api checks", SKIP, "httpx not installed")
+        return
+
+    for path in ("/health", "/health/broker", "/signals/live",
+                 "/market/structure", "/market/archive"):
+        @check(f"GET {path}")
+        def _(p=path):
+            r = httpx.get(f"{base}{p}", timeout=60)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:180]}")
+            body = r.json()
+            if not isinstance(body, dict):
+                return json.dumps(body)[:180]
+            return ", ".join(f"{k}={v}" for k, v in list(body.items())[:4])[:180]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-network", action="store_true", help="skip NSE and Yahoo")
+    parser.add_argument("--no-infra", action="store_true", help="skip Postgres and Redis")
+    parser.add_argument("--api", nargs="?", const="http://localhost:8000",
+                        help="also probe a running backend")
+    args = parser.parse_args()
+
+    print("QuantDesk doctor")
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {platform.platform()}")
+
+    run_environment()
+    run_analytics()
+    if not args.no_infra:
+        run_infrastructure()
+    else:
+        section("infrastructure")
+        record("postgres / redis", SKIP, "--no-infra")
+    if not args.no_network:
+        run_network()
+    else:
+        section("live data sources")
+        record("NSE / Yahoo", SKIP, "--no-network")
+    if args.api:
+        run_api(args.api.rstrip("/"))
+
+    section("summary")
+    counts = {s: sum(1 for _, st, _ in results if st == s) for s in (PASS, FAIL, WARN, SKIP)}
+    print(f"{counts[PASS]} passed, {counts[FAIL]} failed, "
+          f"{counts[WARN]} warnings, {counts[SKIP]} skipped")
+
+    failures = [(n, d) for n, st, d in results if st == FAIL]
+    if failures:
+        print("\nFailures to fix:")
+        for name, detail in failures:
+            print(f"  - {name}: {detail}")
+        print("\nPaste this whole output back and I will fix them.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
