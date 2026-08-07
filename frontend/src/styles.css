@@ -154,3 +154,63 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* ---- live connection + market status ---- */
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; letter-spacing: 0.06em; text-transform: lowercase;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--ink-line); color: var(--muted);
+}
+.pill.on { color: var(--bull); border-color: currentColor; }
+.pill.off { color: var(--muted); }
+
+.dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+.pill.link-live { color: var(--bull); border-color: currentColor; }
+.pill.link-live .dot { animation: pulse 2s ease-in-out infinite; }
+.pill.link-polling { color: var(--amber); border-color: currentColor; }
+.pill.link-connecting { color: var(--muted); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.25; }
+}
+
+.muted { opacity: 0.45; }
+.muted-body { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 0; }
+
+.warn-line {
+  color: var(--amber); font-size: 12px; line-height: 1.6;
+  margin: 0 0 12px; padding-left: 10px;
+  border-left: 2px solid currentColor;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill.link-live .dot { animation: none; }
+}
+
+/* ---- live price ticker ---- */
+.ticker {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  margin-top: 22px; padding-bottom: 4px;
+}
+.ticker-price {
+  font-size: 38px; font-weight: 500; letter-spacing: -0.02em;
+  line-height: 1; transition: color 160ms ease;
+}
+.ticker-change { font-size: 15px; }
+.ticker-change.up { color: var(--bull); }
+.ticker-change.down { color: var(--bear); }
+.ticker-note { font-size: 12px; color: var(--muted); }
+
+/* A brief tint on each tick — enough to see the market is alive, short
+   enough not to become a strobe on a fast-moving day. */
+.flash-up { color: var(--bull); }
+.flash-down { color: var(--bear); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ticker-price { transition: none; }
+}

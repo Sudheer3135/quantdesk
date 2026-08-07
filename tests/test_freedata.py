@@ -295,3 +295,53 @@ def test_every_archive_caller_passes_a_source():
             passed = {kw.arg for kw in node.keywords}
             assert "source" in passed or len(node.args) >= 5, \
                 f"{rel} calls archive() without a source"
+
+
+def test_market_hours_has_one_definition():
+    """Open and close times lived in three modules at once — the agent, the
+    ticker and the stream. Three copies is three chances to disagree, and
+    the first symptom would be the dashboard calling the market open while
+    the agent had already stopped for the day."""
+    import re
+
+    backend = Path(__file__).resolve().parents[1] / "backend"
+    offenders = []
+    for path in (backend / "app").rglob("*.py"):
+        if path.name == "market_hours.py":
+            continue
+        if re.search(r"time\(9,\s*15\)|time\(15,\s*30\)", path.read_text()):
+            offenders.append(path.name)
+    assert not offenders, f"market hours redefined in: {offenders}"
+
+
+def test_ticker_only_runs_during_market_hours():
+    """Polling a closed market wastes requests and risks throttling for
+    nothing. Weekends and out-of-hours must read as closed."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.market_hours import is_open as market_is_open
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    cases = {
+        datetime(2026, 8, 5, 11, 0, tzinfo=ist): True,    # Wed midday
+        datetime(2026, 8, 5, 9, 15, tzinfo=ist): True,    # Wed at the open
+        datetime(2026, 8, 5, 15, 30, tzinfo=ist): True,   # Wed at the close
+        datetime(2026, 8, 5, 16, 40, tzinfo=ist): False,  # Wed after close
+        datetime(2026, 8, 5, 8, 30, tzinfo=ist): False,   # Wed pre-open
+        datetime(2026, 8, 8, 11, 0, tzinfo=ist): False,   # Saturday
+        datetime(2026, 8, 9, 11, 0, tzinfo=ist): False,   # Sunday
+    }
+    for when, expected in cases.items():
+        assert market_is_open(when) is expected, when
+
+
+def test_market_status_labels_the_session():
+    from datetime import datetime, timedelta, timezone
+
+    from app.market_hours import status as market_status
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    assert market_status(datetime(2026, 8, 5, 11, 0, tzinfo=ist))["session"] == "open"
+    assert market_status(datetime(2026, 8, 5, 8, 0, tzinfo=ist))["session"] == "pre-open"
+    assert market_status(datetime(2026, 8, 5, 17, 0, tzinfo=ist))["session"] == "closed"
+    assert market_status(datetime(2026, 8, 8, 11, 0, tzinfo=ist))["session"] == "weekend"

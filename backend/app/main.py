@@ -4,10 +4,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import backtest, health, journal, market, signals
+from .api import backtest, health, journal, market, signals, stream
 from .config import get_settings
 from .db import init_db
-from .workers import agent
+from .workers import agent, ticker
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
@@ -27,7 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for router in (health.router, market.router, signals.router, journal.router, backtest.router):
+for router in (health.router, market.router, signals.router,
+               journal.router, backtest.router, stream.router):
     app.include_router(router)
 
 _scheduler = None
@@ -38,6 +39,9 @@ def on_startup():
     global _scheduler
     init_db()
     _scheduler = agent.start()
+    # Share one scheduler: the agent runs every few minutes, the price
+    # ticker every few seconds.
+    ticker.start(_scheduler)
 
 
 @app.on_event("shutdown")

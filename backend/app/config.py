@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     archive_candles: bool = True
 
     agent_interval_minutes: int = 5
+    # How often the price ticker polls. Below ~5s you risk being throttled
+    # by the free sources, and the data is not tick-level anyway.
+    ticker_interval_seconds: int = 10
     watch_symbol: str = "NIFTY"
     watch_timeframe: str = "5m"
 

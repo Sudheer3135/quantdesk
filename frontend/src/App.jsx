@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
-const REFRESH_MS = 60_000;
+const WS_URL = API.replace(/^http/, "ws") + "/ws/signals";
+
+const FALLBACK_POLL_MS = 60_000;   // only used if the socket cannot connect
+const MAX_RECONNECT_MS = 30_000;
 
 const num = (v, d = 2) =>
   v === null || v === undefined ? "—" : Number(v).toLocaleString("en-IN", {
@@ -14,8 +17,160 @@ async function getJSON(path) {
   return res.json();
 }
 
-/* The ledger is the whole point of this screen: every check the engine ran,
-   how far it pushed the decision, and the sentence explaining why. */
+/* Pushed signals over a socket, with polling as a safety net.
+
+   The agent produces one signal every five minutes. Polling on a timer meant
+   most requests returned something already on screen, while a genuinely new
+   signal could sit unseen for up to a minute. */
+function useLiveSignal() {
+  const [signal, setSignal] = useState(null);
+  const [price, setPrice] = useState(null);
+  const [market, setMarket] = useState(null);
+  const [link, setLink] = useState("connecting");   // connecting | live | polling
+  const [updated, setUpdated] = useState(null);
+
+  const socket = useRef(null);
+  const attempts = useRef(0);
+  const pollTimer = useRef(null);
+  const closed = useRef(false);
+
+  const poll = useCallback(async () => {
+    try {
+      const [sig, status, tick] = await Promise.all([
+        getJSON("/signals/live?symbol=NIFTY&timeframe=5m"),
+        getJSON("/market/status").catch(() => null),
+        getJSON("/market/price").catch(() => null),
+      ]);
+      setSignal(sig);
+      if (status) setMarket(status);
+      if (tick) setPrice(tick);
+      setUpdated(new Date());
+    } catch {
+      /* leave the last good signal on screen rather than blanking it */
+    }
+  }, []);
+
+  const startPolling = useCallback(() => {
+    if (pollTimer.current) return;
+    setLink("polling");
+    poll();
+    pollTimer.current = setInterval(poll, FALLBACK_POLL_MS);
+  }, [poll]);
+
+  const stopPolling = useCallback(() => {
+    clearInterval(pollTimer.current);
+    pollTimer.current = null;
+  }, []);
+
+  const connect = useCallback(() => {
+    if (closed.current) return;
+    let ws;
+    try {
+      ws = new WebSocket(WS_URL);
+    } catch {
+      startPolling();
+      return;
+    }
+    socket.current = ws;
+
+    ws.onopen = () => {
+      attempts.current = 0;
+      stopPolling();
+      setLink("live");
+    };
+
+    ws.onmessage = (event) => {
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (msg.market) setMarket(msg.market);
+      // Prices arrive every few seconds, signals every few minutes. Handled
+      // separately so a price tick does not redraw the whole analysis.
+      if (msg.price) {
+        setPrice(msg.price);
+        setUpdated(new Date());
+      }
+      if (msg.signal) {
+        setSignal(msg.signal);
+        setUpdated(new Date());
+      }
+      if (msg.type === "heartbeat") setUpdated(new Date());
+    };
+
+    ws.onclose = () => {
+      if (closed.current) return;
+      // Back off, but keep the last signal visible and fall back to polling
+      // so the dashboard degrades instead of silently freezing.
+      const wait = Math.min(1000 * 2 ** attempts.current, MAX_RECONNECT_MS);
+      attempts.current += 1;
+      if (attempts.current >= 2) startPolling();
+      setTimeout(connect, wait);
+    };
+
+    ws.onerror = () => ws.close();
+  }, [startPolling, stopPolling]);
+
+  useEffect(() => {
+    closed.current = false;
+    connect();
+    return () => {
+      closed.current = true;
+      stopPolling();
+      socket.current?.close();
+    };
+  }, [connect, stopPolling]);
+
+  return { signal, price, market, link, updated, refresh: poll };
+}
+
+/* The live price. Separate from the signal on purpose: the price moves
+   every few seconds, the analysis every five minutes. Flashing the whole
+   dashboard on every tick would make it unreadable. */
+function Ticker({ price, marketOpen }) {
+  const [flash, setFlash] = useState("");
+  const last = useRef(null);
+
+  useEffect(() => {
+    if (!price || price.price === last.current) return;
+    const dir = last.current === null ? ""
+      : price.price > last.current ? "up" : "down";
+    last.current = price.price;
+    if (!dir) return;
+    setFlash(dir);
+    const id = setTimeout(() => setFlash(""), 600);
+    return () => clearTimeout(id);
+  }, [price]);
+
+  if (!price) {
+    return (
+      <div className="ticker">
+        <span className="ticker-price muted">—</span>
+        <span className="ticker-note">waiting for a price</span>
+      </div>
+    );
+  }
+
+  const change = price.change;
+  return (
+    <div className="ticker">
+      <span className={`ticker-price flash-${flash}`}>{num(price.price)}</span>
+      {change !== null && change !== undefined && (
+        <span className={`ticker-change ${change > 0 ? "up" : change < 0 ? "down" : ""}`}>
+          {change > 0 ? "+" : ""}{num(change)}
+        </span>
+      )}
+      <span className="ticker-note">
+        {marketOpen
+          ? `${price.symbol} · polled, a few seconds behind`
+          : `${price.symbol} · last traded before close`}
+      </span>
+    </div>
+  );
+}
+
 function Ledger({ checks }) {
   const widest = Math.max(...checks.map((c) => Math.abs(c.contribution)), 0.01);
   const ordered = [...checks].sort(
@@ -28,82 +183,87 @@ function Ledger({ checks }) {
       <div className="ledger-rail">
         {ordered.map((c) => {
           const pct = (Math.abs(c.contribution) / widest) * 48;
-          const cls = c.contribution > 0 ? "pos" : c.contribution < 0 ? "neg" : "zero";
+          const cls = c.disabled ? "zero"
+            : c.contribution > 0 ? "pos"
+            : c.contribution < 0 ? "neg" : "zero";
           return (
-            <div key={c.name}>
-              <div className="ledger-row">
-                <div className="ledger-name">{c.name.replace(/_/g, " ")}</div>
-                <div className="ledger-bar-track">
-                  <div
-                    className={`ledger-bar ${cls}`}
-                    style={cls === "zero" ? undefined : { width: `${pct}%` }}
-                  />
-                </div>
-                <p className="ledger-reason">{c.reason}</p>
+            <div className="ledger-row" key={c.name}>
+              <div className={`ledger-name${c.disabled ? " muted" : ""}`}>
+                {c.name.replace(/_/g, " ")}
               </div>
+              <div className="ledger-bar-track">
+                <div
+                  className={`ledger-bar ${cls}`}
+                  style={cls === "zero" ? undefined : { width: `${pct}%` }}
+                />
+              </div>
+              <p className={`ledger-reason${c.disabled ? " muted" : ""}`}>
+                {c.reason}
+              </p>
             </div>
           );
         })}
       </div>
       <div className="ledger-scale">
-        <span>bearish pull</span>
-        <span>neutral</span>
-        <span>bullish pull</span>
+        <span>bearish pull</span><span>neutral</span><span>bullish pull</span>
       </div>
     </section>
   );
 }
 
-function StructurePanel({ data }) {
-  if (!data) return null;
-  const pools = data.liquidity_pools || [];
+function PlanPanel({ signal, marketOpen }) {
+  if (signal.action === "HOLD") {
+    return (
+      <div className="panel">
+        <h3>Trade plan</h3>
+        <p className="muted-body">
+          Confidence is under the threshold of{" "}
+          {Math.round((signal.context?.threshold_used ?? 0.35) * 100)}%. No plan
+          is generated, because a setup you cannot describe is a setup you
+          should not take.
+        </p>
+      </div>
+    );
+  }
+  const risk = signal.risk;
   return (
     <div className="panel">
-      <h3>Structure</h3>
+      <h3>Trade plan</h3>
+      {!marketOpen && (
+        <p className="warn-line">
+          Market is closed — this reads the final candle of the session, not a
+          tradeable setup. Overnight gaps will invalidate these levels.
+        </p>
+      )}
       <dl>
-        <div className="kv">
-          <dt>Trend</dt>
-          <dd><span className={`tag ${data.structure.trend}`}>{data.structure.trend}</span></dd>
-        </div>
-        <div className="kv">
-          <dt>Last swing high</dt>
-          <dd>{num(data.structure.last_swing_high?.price)}</dd>
-        </div>
-        <div className="kv">
-          <dt>Last swing low</dt>
-          <dd>{num(data.structure.last_swing_low?.price)}</dd>
-        </div>
-        <div className="kv">
-          <dt>Unfilled gaps</dt>
-          <dd>{data.fair_value_gaps?.length ?? 0}</dd>
-        </div>
+        <div className="kv"><dt>Entry</dt><dd>{num(signal.entry)}</dd></div>
+        <div className="kv"><dt>Stop</dt><dd>{num(signal.stop_loss)}</dd></div>
+        <div className="kv"><dt>Target</dt><dd>{num(signal.target)}</dd></div>
+        <div className="kv"><dt>Reward:risk</dt><dd>1:{num(signal.risk_reward, 2)}</dd></div>
+        {risk && (
+          <>
+            <div className="kv"><dt>Size</dt>
+              <dd>{risk.approved ? `${risk.quantity} (${risk.lots} lots)` : "blocked"}</dd></div>
+            <div className="kv"><dt>Rupees at risk</dt><dd>{num(risk.risk_amount, 0)}</dd></div>
+          </>
+        )}
       </dl>
-      {pools.length > 0 && (
-        <>
-          <p className="eyebrow" style={{ marginTop: 16 }}>Liquidity</p>
-          <ul className="levels">
-            {pools.slice(0, 5).map((p, i) => (
-              <li key={i} className={p.swept ? "swept" : ""}>
-                <span>{p.side}</span>
-                <span>{num(p.level)}</span>
-              </li>
-            ))}
-          </ul>
-        </>
+      {risk && !risk.approved && (
+        <p className="warn-line">Risk manager blocked this: {risk.reasons.join(" ")}</p>
       )}
     </div>
   );
 }
 
 function ChainPanel({ summary, vix }) {
-  if (!summary) return (
-    <div className="panel">
-      <h3>Option chain</h3>
-      <p style={{ color: "var(--muted)", fontSize: 13 }}>
-        No chain loaded. The mock broker supplies one; a live chain needs a Kite session.
-      </p>
-    </div>
-  );
+  if (!summary) {
+    return (
+      <div className="panel">
+        <h3>Option chain</h3>
+        <p className="muted-body">No chain loaded for this signal.</p>
+      </div>
+    );
+  }
   return (
     <div className="panel">
       <h3>Option chain</h3>
@@ -124,93 +284,74 @@ function ChainPanel({ summary, vix }) {
   );
 }
 
-function PlanPanel({ signal }) {
-  if (signal.action === "HOLD") {
-    return (
-      <div className="panel">
-        <h3>Trade plan</h3>
-        <p style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.6, margin: 0 }}>
-          Confidence is under the threshold of{" "}
-          {Math.round((signal.context?.threshold_used ?? 0.35) * 100)}%. No plan is
-          generated, because a setup you cannot describe is a setup you should not take.
-        </p>
-      </div>
-    );
-  }
-  const risk = signal.risk;
+function ContextPanel({ context }) {
+  if (!context) return null;
+  const pools = context.liquidity_pools || [];
   return (
     <div className="panel">
-      <h3>Trade plan</h3>
+      <h3>Structure</h3>
       <dl>
-        <div className="kv"><dt>Entry</dt><dd>{num(signal.entry)}</dd></div>
-        <div className="kv"><dt>Stop</dt><dd>{num(signal.stop_loss)}</dd></div>
-        <div className="kv"><dt>Target</dt><dd>{num(signal.target)}</dd></div>
-        <div className="kv"><dt>Reward:risk</dt><dd>1:{num(signal.risk_reward, 2)}</dd></div>
-        {risk && (
-          <>
-            <div className="kv"><dt>Size</dt>
-              <dd>{risk.approved ? `${risk.quantity} (${risk.lots} lots)` : "blocked"}</dd></div>
-            <div className="kv"><dt>Rupees at risk</dt><dd>{num(risk.risk_amount, 0)}</dd></div>
-          </>
-        )}
+        <div className="kv"><dt>Trend</dt>
+          <dd><span className={`tag ${context.trend}`}>{context.trend}</span></dd></div>
+        <div className="kv"><dt>VWAP</dt><dd>{num(context.vwap)}</dd></div>
+        <div className="kv"><dt>ATR 14</dt><dd>{num(context.atr14)}</dd></div>
+        <div className="kv"><dt>Unfilled gaps</dt>
+          <dd>{(context.unfilled_fvgs || []).length}</dd></div>
+        <div className="kv"><dt>Checks disabled</dt>
+          <dd>{(context.disabled_checks || []).join(", ") || "none"}</dd></div>
       </dl>
-      {risk && !risk.approved && (
-        <p style={{ color: "var(--bear)", fontSize: 12, marginTop: 12, lineHeight: 1.6 }}>
-          Risk manager blocked this: {risk.reasons.join(" ")}
-        </p>
+      {pools.length > 0 && (
+        <>
+          <p className="eyebrow" style={{ marginTop: 16 }}>Liquidity</p>
+          <ul className="levels">
+            {pools.slice(0, 5).map((p, i) => (
+              <li key={i} className={p.swept ? "swept" : ""}>
+                <span>{p.side}</span><span>{num(p.level)}</span>
+              </li>
+            ))}
+          </ul>
+        </>
       )}
     </div>
   );
 }
 
 export default function App() {
-  const [signal, setSignal] = useState(null);
-  const [structure, setStructure] = useState(null);
-  const [vix, setVix] = useState(null);
-  const [error, setError] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [updated, setUpdated] = useState(null);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [sig, str, v] = await Promise.all([
-        getJSON("/signals/live?symbol=NIFTY&timeframe=5m"),
-        getJSON("/market/structure?symbol=NIFTY&interval=5m"),
-        getJSON("/market/vix").catch(() => ({ india_vix: null })),
-      ]);
-      setSignal(sig);
-      setStructure(str);
-      setVix(v.india_vix);
-      setUpdated(new Date());
-      setError(null);
-    } catch (err) {
-      setError(`Could not reach the backend at ${API}. Start it with docker compose up.`);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const { signal, price, market, link, updated, refresh } = useLiveSignal();
+  const [clock, setClock] = useState(new Date());
 
   useEffect(() => {
-    load();
-    const id = setInterval(load, REFRESH_MS);
+    const id = setInterval(() => setClock(new Date()), 1000);
     return () => clearInterval(id);
-  }, [load]);
+  }, []);
+
+  const marketOpen = market?.open ?? false;
+  const ago = updated ? Math.round((clock - updated) / 1000) : null;
 
   return (
     <div className="shell">
       <header className="masthead">
         <h1 className="wordmark">Quant<span>Desk</span></h1>
         <div className="masthead-meta">
-          <span>NIFTY · 5m</span>
-          <span>{updated ? `updated ${updated.toLocaleTimeString("en-IN")}` : "loading"}</span>
-          <button onClick={load} disabled={loading}>
-            {loading ? "reading" : "refresh"}
-          </button>
+          <span className={`pill ${marketOpen ? "on" : "off"}`}>
+            {market ? (marketOpen ? "market open" : market.session) : "…"}
+          </span>
+          <span className={`pill link-${link}`}>
+            <i className="dot" />{link}
+          </span>
+          <span>{ago === null ? "waiting" : `${ago}s ago`}</span>
+          <button onClick={refresh}>refresh</button>
         </div>
       </header>
 
-      {error && <p className="notice error">{error}</p>}
+      <Ticker price={price} marketOpen={marketOpen} />
+
+      {!signal && (
+        <p className="notice">
+          Waiting for the first signal. The agent publishes one every five
+          minutes — if this does not clear, check that the backend is running.
+        </p>
+      )}
 
       {signal && (
         <>
@@ -223,7 +364,7 @@ export default function App() {
             </div>
             <div className="price-row">
               <div>
-                <div className="stat-label">Last</div>
+                <div className="stat-label">Signal price</div>
                 <div className="stat-value">{num(signal.price)}</div>
               </div>
               <div>
@@ -235,27 +376,35 @@ export default function App() {
                 <div className="stat-value">{num(signal.context?.atr14)}</div>
               </div>
               <div>
-                <div className="stat-label">Trend</div>
-                <div className="stat-value">{signal.context?.trend ?? "—"}</div>
+                <div className="stat-label">Signal time</div>
+                <div className="stat-value">
+                  {signal.timestamp
+                    ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
+                        hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
+                      })
+                    : "—"}
+                </div>
               </div>
             </div>
           </section>
 
-          <Ledger checks={signal.checks} />
+          <Ledger checks={signal.checks || []} />
 
           <div className="grid">
-            <PlanPanel signal={signal} />
-            <StructurePanel data={structure} />
-            <ChainPanel summary={signal.context?.option_chain} vix={vix} />
+            <PlanPanel signal={signal} marketOpen={marketOpen} />
+            <ContextPanel context={signal.context} />
+            <ChainPanel
+              summary={signal.context?.option_chain}
+              vix={signal.context?.india_vix}
+            />
           </div>
         </>
       )}
 
       <p className="notice">
-        This is an analysis tool. It reads the market and shows its working — it does
-        not know the future and it is not advice. Every number on this screen comes
-        from a rule you can read in <code>backend/app/analytics</code>. Change the rule,
-        re-run the backtest, and only then change how you trade.
+        This is an analysis tool. It reads the market and shows its working — it
+        does not know the future and it is not advice. Every number here comes
+        from a rule you can read in <code>backend/app/analytics</code>.
       </p>
     </div>
   );

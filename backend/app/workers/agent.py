@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, time, timedelta, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -19,20 +18,11 @@ from ..cache import client as redis_client
 from ..config import get_settings
 from ..db import SessionLocal
 from ..deps import get_broker
+from ..market_hours import is_open as market_is_open
 from ..models import SignalRecord
 from . import archiver
 
 log = logging.getLogger(__name__)
-IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_OPEN, MARKET_CLOSE = time(9, 15), time(15, 30)
-
-
-def market_is_open(now: datetime | None = None) -> bool:
-    now = (now or datetime.now(IST)).astimezone(IST)
-    if now.weekday() >= 5:
-        return False
-    return MARKET_OPEN <= now.time() <= MARKET_CLOSE
-
 
 def tick() -> None:
     s = get_settings()
