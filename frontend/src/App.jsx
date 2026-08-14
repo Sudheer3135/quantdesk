@@ -1,4 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+
+/* Recharts is roughly three quarters of the bundle. Loading it lazily lets
+   the verdict, the ledger and the live price paint immediately — those are
+   what you actually read first — while the charts arrive a beat later. */
+const PriceChart = lazy(() => import("./PriceChart.jsx"));
+const OIProfile = lazy(() => import("./OIProfile.jsx"));
+
+function ChartFallback({ label }) {
+  return (
+    <div className="panel chart-fallback">
+      <h3>{label}</h3>
+      <p className="muted-body">Loading…</p>
+    </div>
+  );
+}
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 const WS_URL = API.replace(/^http/, "ws") + "/ws/signals";
@@ -129,6 +144,30 @@ function useLiveSignal() {
 /* The live price. Separate from the signal on purpose: the price moves
    every few seconds, the analysis every five minutes. Flashing the whole
    dashboard on every tick would make it unreadable. */
+/* Candles and the option chain change on the timeframe, not on every tick,
+   so they get their own slower loop rather than riding the price socket. */
+function useMarketData(intervalMs = 60_000) {
+  const [candles, setCandles] = useState([]);
+  const [chain, setChain] = useState(null);
+
+  const load = useCallback(async () => {
+    const [c, ch] = await Promise.all([
+      getJSON("/market/candles?symbol=NIFTY&interval=5m&days=2").catch(() => null),
+      getJSON("/market/option-chain?symbol=NIFTY").catch(() => null),
+    ]);
+    if (c?.candles) setCandles(c.candles);
+    if (ch) setChain(ch);
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, intervalMs);
+    return () => clearInterval(id);
+  }, [load, intervalMs]);
+
+  return { candles, chain };
+}
+
 function Ticker({ price, marketOpen }) {
   const [flash, setFlash] = useState("");
   const last = useRef(null);
@@ -318,6 +357,7 @@ function ContextPanel({ context }) {
 
 export default function App() {
   const { signal, price, market, link, updated, refresh } = useLiveSignal();
+  const { candles, chain } = useMarketData();
   const [clock, setClock] = useState(new Date());
 
   useEffect(() => {
@@ -344,8 +384,6 @@ export default function App() {
         </div>
       </header>
 
-      <Ticker price={price} marketOpen={marketOpen} />
-
       {!signal && (
         <p className="notice">
           Waiting for the first signal. The agent publishes one every five
@@ -355,48 +393,52 @@ export default function App() {
 
       {signal && (
         <>
-          <section className="verdict">
-            <div>
+          <section className="tape">
+            <div className="tape-price">
+              <Ticker price={price} marketOpen={marketOpen} />
+            </div>
+            <div className={`tape-verdict ${signal.action}`}>
               <div className={`action ${signal.action}`}>{signal.action}</div>
               <div className="confidence-label">
                 {Math.round(signal.confidence * 100)}% confidence
               </div>
             </div>
-            <div className="price-row">
-              <div>
-                <div className="stat-label">Signal price</div>
-                <div className="stat-value">{num(signal.price)}</div>
-              </div>
-              <div>
-                <div className="stat-label">VWAP</div>
-                <div className="stat-value">{num(signal.context?.vwap)}</div>
-              </div>
-              <div>
-                <div className="stat-label">ATR 14</div>
-                <div className="stat-value">{num(signal.context?.atr14)}</div>
-              </div>
-              <div>
-                <div className="stat-label">Signal time</div>
-                <div className="stat-value">
+            <div className="tape-stats">
+              <div><span className="stat-label">VWAP</span>
+                <span className="stat-value">{num(signal.context?.vwap)}</span></div>
+              <div><span className="stat-label">ATR 14</span>
+                <span className="stat-value">{num(signal.context?.atr14)}</span></div>
+              <div><span className="stat-label">Trend</span>
+                <span className="stat-value">{signal.context?.trend ?? "—"}</span></div>
+              <div><span className="stat-label">Signal at</span>
+                <span className="stat-value">
                   {signal.timestamp
                     ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
                         hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
                       })
                     : "—"}
-                </div>
-              </div>
+                </span></div>
             </div>
           </section>
 
+          <div className="desk">
+            <Suspense fallback={<ChartFallback label="Price · VWAP" />}>
+              <PriceChart candles={candles} signal={signal} />
+            </Suspense>
+            <PlanPanel signal={signal} marketOpen={marketOpen} />
+          </div>
+
           <Ledger checks={signal.checks || []} />
 
-          <div className="grid">
-            <PlanPanel signal={signal} marketOpen={marketOpen} />
+          <div className="desk">
+            <Suspense fallback={<ChartFallback label="Open interest" />}>
+              <OIProfile
+                strikes={chain?.strikes}
+                summary={chain?.summary || signal.context?.option_chain}
+                spot={price?.price || signal.price}
+              />
+            </Suspense>
             <ContextPanel context={signal.context} />
-            <ChainPanel
-              summary={signal.context?.option_chain}
-              vix={signal.context?.india_vix}
-            />
           </div>
         </>
       )}

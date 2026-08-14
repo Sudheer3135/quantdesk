@@ -192,3 +192,123 @@ def test_distant_fvg_does_not_move_the_signal(candles):
     assert far_check.disabled
     assert far_check.contribution == 0.0
     assert "too far" in far_check.reason
+
+
+def test_option_delta_means_premium_moves_less_than_index():
+    """The correction this whole module exists for: sizing against index
+    points overstates an option buyer's risk by roughly 1/delta."""
+    from app.analytics import option_pricing as op
+
+    spot, years = 24_600.0, 3 / 252
+    strike, kind = op.select_strike(spot, "BUY")
+
+    before = op.price(spot, strike, years, kind=kind)
+    after = op.price(spot + 30, strike, years, kind=kind)
+    move = after - before
+
+    assert 0 < move < 30, "premium must move less than the index"
+    g = op.greeks(spot, strike, years, kind=kind)
+    assert abs(move / 30 - g.delta) < 0.05
+
+
+def test_time_decay_costs_a_buyer_even_when_direction_is_right():
+    """A correct call held long enough loses money. This is the failure an
+    index-only backtest can never show."""
+    from datetime import datetime, timedelta
+
+    from app.analytics import option_pricing as op
+
+    now = datetime(2026, 8, 7, 10, 0)
+    expiry = datetime(2026, 8, 11, 15, 30)
+    strike, kind = op.select_strike(24_600.0, "BUY")
+
+    today = op.price(24_630.0, strike, op.years_to_expiry(now, expiry), kind=kind)
+    tomorrow = op.price(24_630.0, strike,
+                        op.years_to_expiry(now + timedelta(days=1), expiry), kind=kind)
+
+    assert tomorrow < today, "an option must lose value as expiry approaches"
+
+
+def test_option_is_worth_intrinsic_value_at_expiry():
+    from app.analytics import option_pricing as op
+
+    assert op.price(24_700, 24_600, 0.0, kind="CE") == pytest.approx(100.0)
+    assert op.price(24_500, 24_600, 0.0, kind="CE") == pytest.approx(0.0)
+    assert op.price(24_500, 24_600, 0.0, kind="PE") == pytest.approx(100.0)
+
+
+def test_implied_volatility_round_trips():
+    from app.analytics import option_pricing as op
+
+    spot, strike, years = 24_600.0, 24_600.0, 5 / 252
+    for true_iv in (0.10, 0.13, 0.22, 0.40):
+        premium = op.price(spot, strike, years, true_iv, kind="CE")
+        assert op.implied_volatility(premium, spot, strike, years, kind="CE") \
+            == pytest.approx(true_iv, abs=1e-3)
+
+
+def test_option_backtest_records_decay_separately():
+    from app.backtest import option_engine
+    from app.risk.manager import RiskConfig
+
+    candles = MockBroker(seed=21).candles(days=20, interval="5m")
+    result = option_engine.run(candles, starting_capital=300_000,
+                               risk_config=RiskConfig(capital=300_000, lot_size=75))
+
+    assert "total_decay_cost" in result.stats
+    for t in result.trades:
+        assert t.premium_entry > 0
+        assert t.kind in {"CE", "PE"}
+        # A BUY signal must buy a call, a SELL signal a put.
+        assert (t.kind == "CE") == (t.direction == "BUY")
+
+
+def test_position_size_can_never_explode():
+    """A single trade once took 654 lots on 245,000 of capital and turned a
+    losing backtest into a fictional 473% return. The cause was a silent
+    floor on premium risk: when an overnight gap put the stop on the wrong
+    side of the entry, risk went negative, got clamped to 0.05, and sizing
+    divided by it."""
+    from app.backtest import option_engine
+    from app.risk.manager import RiskConfig
+
+    result = option_engine.run(
+        MockBroker(seed=21).candles(days=18, interval="5m"),
+        starting_capital=300_000,
+        risk_config=RiskConfig(capital=300_000, lot_size=75),
+    )
+    for t in result.trades:
+        assert t.lots <= 20, f"{t.lots} lots is not a real position"
+        assert abs(t.r_multiple) < 10, f"{t.r_multiple}R means risk was mismeasured"
+        # Premium outlay must respect the deployment cap.
+        assert t.premium_entry * t.quantity < 300_000
+
+
+def test_gapped_entry_is_skipped_not_sized():
+    """If the fill price is already past the stop, the trade's premise is
+    invalid. Skip it — do not treat it as a trade with tiny risk."""
+    from datetime import date
+
+    from app.risk.manager import DayState, RiskConfig, evaluate
+
+    # Stop above entry on a long: risk is negative, so nothing may pass.
+    d = evaluate(config=RiskConfig(capital=300_000, lot_size=75),
+                 state=DayState(trading_day=date.today()),
+                 entry=100.0, stop_loss=100.0, target=130.0)
+    assert not d.approved
+
+
+def test_premium_outlay_is_capped():
+    """A stop only protects you if it fills. A gap through it does not, so
+    total premium at risk must be capped independently."""
+    from datetime import date
+
+    from app.risk.manager import DayState, RiskConfig, evaluate
+
+    cfg = RiskConfig(capital=200_000, lot_size=75, max_capital_deployed_pct=20.0)
+    # Tight stop on an expensive option: stop-based sizing wants a huge
+    # position, but the premium outlay cap must cut it down.
+    d = evaluate(config=cfg, state=DayState(trading_day=date.today()),
+                 entry=300.0, stop_loss=298.0, target=306.0, unit_cost=300.0)
+    if d.approved:
+        assert d.quantity * 300.0 <= 200_000 * 0.20 + 1

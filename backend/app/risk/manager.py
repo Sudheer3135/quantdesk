@@ -28,6 +28,11 @@ class RiskConfig:
     lot_size: int = 75          # NIFTY lot size — verify with the exchange circular
     kill_switch: bool = False   # flip to True to block all new entries
 
+    # An option buyer can lose the entire premium. A stop protects you only
+    # if it fills — a gap straight through it does not. So cap how much
+    # capital may sit in open premium regardless of what the stop implies.
+    max_capital_deployed_pct: float = 20.0
+
 
 @dataclass
 class DayState:
@@ -69,6 +74,7 @@ def evaluate(
     stop_loss: float,
     target: float,
     instrument: str = "option",
+    unit_cost: float | None = None,
 ) -> RiskDecision:
     """Decide whether this trade may be taken, and for how many units."""
     reasons: list[str] = []
@@ -89,6 +95,7 @@ def evaluate(
     if state.realised_pnl <= max_daily_loss:
         reasons.append(f"Daily loss limit hit ({state.realised_pnl:.0f}).")
 
+    size_note: str | None = None
     risk_per_unit = abs(entry - stop_loss)
     reward_per_unit = abs(target - entry)
     if risk_per_unit <= 0:
@@ -129,6 +136,31 @@ def evaluate(
         if quantity < 1:
             reasons.append("Position size rounds down to zero units.")
 
+    # `unit_cost` is what one unit actually costs to buy — the option
+    # premium. Stop-based sizing assumes the stop fills; this does not.
+    if unit_cost and quantity:
+        ceiling = config.capital * config.max_capital_deployed_pct / 100
+        outlay = unit_cost * quantity
+        if outlay > ceiling:
+            affordable = int(ceiling / unit_cost)
+            if instrument == "option":
+                lots = affordable // config.lot_size
+                quantity = lots * config.lot_size
+            else:
+                quantity = affordable
+            if quantity < (config.lot_size if instrument == "option" else 1):
+                reasons.append(
+                    f"One lot costs {unit_cost * config.lot_size:.0f}, over the "
+                    f"{config.max_capital_deployed_pct}% deployment cap "
+                    f"({ceiling:.0f})."
+                )
+            else:
+                size_note = (
+                    f"Size cut to {quantity} so premium outlay stays under "
+                    f"{config.max_capital_deployed_pct}% of capital."
+                )
+                risk_amount = risk_per_unit * quantity
+
     if reasons:
         return RiskDecision(False, reasons, quantity, lots,
                             risk_amount, risk_per_unit, round(rr, 2))
@@ -140,7 +172,7 @@ def evaluate(
             f"{risk_per_unit:.2f} per unit.",
             f"Reward:risk 1:{rr:.2f}.",
             f"Trade {state.trades_taken + 1} of {config.max_trades_per_day} today.",
-        ],
+        ] + ([size_note] if size_note else []),
         quantity=quantity,
         lots=lots,
         risk_amount=risk_amount,

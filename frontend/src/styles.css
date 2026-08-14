@@ -23,7 +23,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-.shell { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+.shell { max-width: 1320px; margin: 0 auto; padding: 28px 20px 64px; }
 
 /* ---- header ---- */
 .masthead {
@@ -214,3 +214,77 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) {
   .ticker-price { transition: none; }
 }
+
+/* ============ desk layout ============ */
+
+/* The tape: price, verdict and the numbers you glance at, in one strip. */
+.tape {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) auto minmax(0, 1.2fr);
+  gap: 24px; align-items: center;
+  background: var(--ink-raised); border: 1px solid var(--ink-line);
+  border-radius: 6px; padding: 18px 22px; margin-top: 22px;
+}
+.tape .ticker { margin-top: 0; }
+
+.tape-verdict {
+  padding-left: 24px; border-left: 1px solid var(--ink-line);
+}
+.tape-verdict .action { font-size: 30px; }
+
+.tape-stats {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px;
+}
+.tape-stats > div { display: flex; flex-direction: column; gap: 3px; }
+.tape-stats .stat-value { font-size: 14px; }
+
+/* Chart beside the plan, OI beside the structure. */
+.desk {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
+  gap: 16px; margin-top: 16px; align-items: start;
+}
+
+.panel-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 12px; margin-bottom: 12px;
+}
+.panel-head h3 { margin: 0; }
+.panel-note { font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
+
+.chart-panel { padding-right: 12px; }
+
+/* Chart and bar tooltips */
+.callout {
+  background: var(--ink); border: 1px solid var(--ink-line);
+  border-radius: 4px; padding: 9px 11px; font-size: 12px;
+  box-shadow: 0 8px 24px #0008;
+}
+.callout-time {
+  color: var(--amber); font-size: 11px; letter-spacing: 0.08em;
+  margin-bottom: 6px;
+}
+.callout-row { display: flex; justify-content: space-between; gap: 18px; padding: 1px 0; }
+.callout-row span { color: var(--muted); }
+
+/* Summary strip under the OI profile */
+.chain-strip {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px; margin-top: 14px; padding-top: 14px;
+  border-top: 1px solid var(--ink-line);
+}
+.chain-strip > div { display: flex; flex-direction: column; gap: 3px; }
+.chain-strip span {
+  font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.1em;
+}
+.chain-strip b { font-size: 14px; font-weight: 500; }
+.chain-strip b.up { color: var(--bull); }
+.chain-strip b.down { color: var(--bear); }
+
+@media (max-width: 900px) {
+  .tape { grid-template-columns: 1fr; gap: 16px; }
+  .tape-verdict { padding-left: 0; border-left: none; }
+  .desk { grid-template-columns: 1fr; }
+}
+
+.chart-fallback { min-height: 300px; }
