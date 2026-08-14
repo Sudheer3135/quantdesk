@@ -27,8 +27,14 @@ services:
       redis: {condition: service_healthy}
     volumes:
       - ./backend/app:/srv/app
+      - ./backend/alembic:/srv/alembic
       - ./scripts:/scripts
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Migrations run before the app, never from inside it. A process that
+    # migrates its own schema on boot will happily run three copies of the
+    # same migration when you scale it to three replicas.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
   frontend:
     build: ./frontend

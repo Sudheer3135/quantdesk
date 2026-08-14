@@ -55,13 +55,23 @@ Open `.env`. For the first run change nothing. Two lines matter later:
 docker compose up --build
 ```
 
-First build takes 3–5 minutes. You are looking for:
+First build takes 3–5 minutes. The backend runs `alembic upgrade head`
+before it starts serving, so the schema is always migrated before anything
+touches it. You are looking for:
 
 ```
+backend  | INFO  [alembic.runtime.migration] Running upgrade  -> 0001, Baseline
+backend  | INFO  [alembic.runtime.migration] Running upgrade 0001 -> 0002, Candle provenance
+backend  | INFO  [alembic.runtime.migration] Running upgrade 0002 -> 0003, Option contracts
 backend  | Uvicorn running on http://0.0.0.0:8000
 backend  | Nifty agent scheduled every 5 minutes.
 frontend | Local: http://localhost:5173/
 ```
+
+**Upgrading an install that already has archived candles?** Nothing to do.
+The baseline migration skips tables that already exist and 0002 backfills
+the new provenance columns from the data already in the table. Your history
+survives; there is no stamping step to remember.
 
 Now open:
 
@@ -127,12 +137,41 @@ chain and India VIX from NSE's public endpoints. Seed your own archive with
 the deepest window available:
 
 ```bash
-curl -s -X POST "http://localhost:8000/market/archive/backfill?days=59" \
+curl -s -X POST "http://localhost:8000/data/import/index?days=59" \
   | python3 -m json.tool
 ```
 
-Leave the agent running during market hours and that archive grows every
-five minutes. Details and limits: **[docs/FREE_DATA.md](docs/FREE_DATA.md)**.
+Then check what you own and whether it is any good:
+
+```bash
+curl -s "http://localhost:8000/data/coverage" | python3 -m json.tool
+curl -s "http://localhost:8000/data/quality"  | python3 -m json.tool
+```
+
+The quality report will tell you two things on day one that are worth
+reading rather than skipping: your volume is a placeholder (Yahoo publishes
+none for `^NSEI`, so the volume check contributes nothing), and your option
+history is empty and cannot be backfilled. Both are explained in
+**[docs/FREE_DATA.md](docs/FREE_DATA.md)**.
+
+Leave the agent running during market hours and the archive grows every five
+minutes — index candles *and* an option-chain snapshot. The option side is
+the one that matters most to start early, because unlike index candles there
+is no source to buy the history back from later.
+
+### Backtesting reads the database
+
+```bash
+curl -s -X POST http://localhost:8000/backtest/run \
+  -H 'content-type: application/json' \
+  -d '{"symbol":"NIFTY","timeframe":"5m"}' | python3 -m json.tool
+```
+
+If the archive cannot cover the window, this returns **409 with a coverage
+report and the command that fixes it** — not a shorter backtest. Every
+successful result carries a `dataset` block naming the exact rows it read,
+so two runs can be compared and you can tell a strategy change from a data
+change.
 
 ---
 
@@ -250,13 +289,15 @@ Most platforms that lose money skip steps 2 through 4.
 
 ```
 backend/app/analytics/    the maths — indicators, structure, SMC, options, signals
+backend/app/data/         the historical layer — validation, import, read, quality
 backend/app/risk/         the veto layer — sizing, trade caps, kill switch
-backend/app/backtest/     bar-by-bar simulator with costs and slippage
-backend/app/brokers/      mock and Kite adapters behind one interface
+backend/app/backtest/     bar-by-bar simulator: feed, engines, costs, diagnostics
+backend/app/brokers/      mock, free and Kite adapters behind one interface
 backend/app/api/          FastAPI routes
-backend/app/workers/      the 5-minute agent
+backend/app/workers/      the 5-minute agent and the price ticker
+backend/alembic/          schema migrations
 frontend/src/             the dashboard
-tests/                    twelve tests that pin the maths down
+tests/                    the tests that pin the maths and the data down
 ```
 
 ---

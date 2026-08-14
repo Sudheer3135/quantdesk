@@ -105,7 +105,7 @@ No provider can revoke it, rate-limit it, or start charging for it.
 Seed the archive with the deepest window the free source allows:
 
 ```bash
-curl -s -X POST "http://localhost:8000/market/archive/backfill?symbol=NIFTY&timeframe=5m&days=59" \
+curl -s -X POST "http://localhost:8000/data/import/index?symbol=NIFTY&timeframe=5m&days=59" \
   | python3 -m json.tool
 ```
 
@@ -116,17 +116,46 @@ history you did not save is history you lose.
 Check what you own:
 
 ```bash
-curl -s "http://localhost:8000/market/archive" | python3 -m json.tool
+curl -s "http://localhost:8000/data/coverage" | python3 -m json.tool
 ```
 
 ```json
-{ "symbol": "NIFTY", "timeframe": "5m", "candles": 4425,
-  "sessions": 59, "span_days": 59 }
+{ "symbol": "NIFTY", "timeframe": "5m", "rows": 4425, "sessions": 59,
+  "sources": { "free": 4425 }, "synthetic_volume_rows": 4425 }
+```
+
+And check whether it is any good:
+
+```bash
+curl -s "http://localhost:8000/data/quality" | python3 -m json.tool
 ```
 
 Writes are idempotent — a unique constraint on symbol, timeframe and
 timestamp means overlapping fetches update rows rather than duplicating
-them. Re-run the backfill as often as you like.
+them. Re-run the import as often as you like; it reports `inserted` and
+`updated` separately so a re-run that restates history is visible rather
+than hidden inside a single "written" total.
+
+### Two things the coverage output will tell you
+
+**`synthetic_volume_rows` equal to your row count.** Yahoo publishes no
+volume for `^NSEI`, so the free adapter substitutes a constant to stop VWAP
+dividing by zero. Constant volume is not information: the volume check
+contributes nothing to any signal, the remaining weights renormalise around
+it, and the backtest looks perfectly healthy while running one input short.
+Nothing is broken — but know that you are running a six-check strategy, not
+a seven-check one, until you move to a source that publishes volume.
+
+**Option history starts empty and cannot be backfilled.** NSE publishes a
+live snapshot of the chain, not a tape, and nobody sells the history at a
+price a retail account would pay. The agent captures a snapshot every five
+minutes into `option_candles`, so your option archive grows from the day you
+switch it on and not one day earlier. Until it accumulates, option backtests
+price every trade with Black-Scholes at a constant IV and say so in the
+`assumptions` block of every response.
+
+This is the single strongest argument for starting the agent today rather
+than when the platform feels finished.
 
 **Start this now, even though the platform isn't finished.** The archive is
 the only part of the project that gets more valuable purely from time
@@ -147,8 +176,9 @@ Not useful for: your 5-minute NIFTY strategy, which needs intraday bars.
 
 ## Recommended path
 
-1. **Today** — set `BROKER=free`, run the backfill, leave the agent running.
-   Your archive starts filling. Cost: ₹0.
+1. **Today** — set `BROKER=free`, run the import, leave the agent running.
+   Your index archive starts filling and your option archive starts existing
+   at all. Cost: ₹0.
 2. **This month** — open a free API account (Fyers or Angel One) and write
    the adapter. Deeper history, websocket feed, a real order path when you
    eventually want one. Cost: ₹0 for the API.

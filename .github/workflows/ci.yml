@@ -7,6 +7,23 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+
+    # The write path is the part of this system that can silently corrupt a
+    # dataset, so it is tested against the database it actually runs on and
+    # not only against SQLite. `data/upsert.py` narrows the dialect gap;
+    # this is what proves it closed.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: quant
+          POSTGRES_PASSWORD: quant
+          POSTGRES_DB: quantdesk_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U quant -d quantdesk_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +39,7 @@ jobs:
         env:
           BROKER: mock
           DATABASE_URL: sqlite:///./test.db
+          TEST_DATABASE_URL: postgresql+psycopg://quant:quant@localhost:5432/quantdesk_test
 
   frontend:
     runs-on: ubuntu-latest

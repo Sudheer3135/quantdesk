@@ -4,7 +4,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import backtest, health, journal, market, signals, stream
+from .api import backtest, data, health, journal, market, signals, stream
 from .config import get_settings
 from .db import init_db
 from .workers import agent, ticker
@@ -28,7 +28,7 @@ app.add_middleware(
 )
 
 for router in (health.router, market.router, signals.router,
-               journal.router, backtest.router, stream.router):
+               journal.router, backtest.router, stream.router, data.router):
     app.include_router(router)
 
 _scheduler = None

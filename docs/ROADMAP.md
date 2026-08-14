@@ -17,36 +17,79 @@ This was your items **1**, **2** and **7** (partly): the trading system, the
 
 ---
 
-## Phase 2 — real data (next, and non-negotiable)
+## Phase 2 — real data ✅ built
 
 Everything downstream is worthless on mock candles.
 
-- Connect Kite and pull two years of NIFTY 5-minute history to Postgres.
-- Add a `historical` loader so backtests read from the database, not the API.
-- Re-run the existing backtest on real data and compare it to the mock run.
+What exists now:
 
-**Definition of done:** `POST /backtest/run` returns statistics computed from
-candles that actually happened.
+- **A canonical schema** — `candles` carries provenance (`source`,
+  `session_date`, `ingested_at`, `volume_is_synthetic`, `revision`), and
+  `option_contracts` / `option_candles` / `dataset_versions` are new. Applied
+  by Alembic, which upgrades an existing archive in place rather than asking
+  you to throw it away.
+- **An idempotent importer** (`app/data/importer.py`) that reports what it
+  rejected and why, instead of dropping rows into a log nobody reads.
+- **A validation gate** (`app/data/validation.py`) covering future-dating,
+  weekends, exchange holidays, unclosed bars and structurally impossible
+  candles — reusing the existing guards rather than reimplementing them.
+- **Data-quality diagnostics** at `GET /data/quality`: missing and short
+  sessions, duplicates, impossible prices, bad ticks, synthetic volume,
+  source mix, strike-ladder holes, absurd IV, OI discontinuities.
+- **A database-first backtester.** `/backtest/*` reads stored history and
+  returns **409 with a coverage report** when the archive cannot serve the
+  window, rather than quietly backtesting a shorter one.
+- **Structural look-ahead prevention** (`app/backtest/feed.py`). The engines
+  no longer hold the frame; they hold a feed that will not return a bar the
+  walk has not reached, and hands back the next bar's *open alone*. Proven
+  by a future-poisoning test rather than asserted in a comment.
+- **Itemised F&O costs** (`app/backtest/costs.py`) — brokerage, STT,
+  exchange, SEBI, IPFT, stamp duty, GST, and tick- or spread-based slippage.
+- **A dataset hash on every result**, so two backtests can be compared and
+  you can tell a strategy change from a data change.
+
+**What is still not solved, and cannot be by writing code:** there is no
+free source of historical NIFTY *option* data. NSE publishes a snapshot, not
+a tape. The option tables fill forward from the day the agent starts and no
+earlier, which is why Phase 3's numbers stay partly modelled for months.
+
+**Definition of done:** met — `POST /backtest/run` computes statistics from
+stored candles and names the exact rows it used.
+
+Still worth doing when you have a broker with deeper history: pull two years
+of 5-minute data through the same importer. Nothing about the pipeline
+changes; it is one `POST /data/import/index` with a bigger `days`.
 
 ---
 
 ## Phase 3 — the option buying strategy (your item 4)
 
-The engine currently signals on the *index*. Option buying is a different
-instrument with different maths: theta decays against you every minute, and
-a correct directional call can still lose.
+Partly built ahead of schedule: Black-Scholes pricing, greeks, per-bar decay
+and the option backtester all exist, and now charge itemised F&O costs.
 
-- Model option premium from index moves (delta approximation is enough to
-  start; add theta decay per bar).
-- Encode the rulebook as a named strategy: max 2 trades, 1% risk, 1:2 RR,
-  VWAP + chain + volume + structure confirmation, all four required.
-- Backtest across at least 200 trading days and report the statistics the
-  backtester already computes: expectancy in R, profit factor, max drawdown,
-  worst losing streak.
+What is left, and what blocks it:
+
+- **Real premiums.** The engine prices every trade with Black-Scholes at a
+  constant IV, because there is nothing else to price it with yet. Each
+  trade is tagged `premium_source: "modelled"`. Once `option_candles` has
+  accumulated, switch to observed premiums where they exist and report what
+  fraction of trades used real data. **This is gated on calendar time, not
+  on effort** — it needs months of snapshots, and no amount of work brings
+  that forward.
+- **Encode the rulebook as a named strategy**: max 2 trades, 1% risk, 1:2
+  RR, VWAP + chain + volume + structure confirmation, all four required.
+- **Backtest across at least 200 trading days.** Currently impossible on
+  free data, which caps intraday history near 60 days. The archive is the
+  answer and it fills at one day per day.
 
 **Watch for:** a strategy needing four simultaneous confirmations may take
 almost no trades. Low trade count means the statistics are not trustworthy,
 not that the strategy is selective. Track both.
+
+**Also watch for:** the volume confirmation is inactive on free data, since
+Yahoo publishes no volume for `^NSEI`. A rulebook requiring four
+confirmations where one can never fire is a rulebook requiring three.
+`GET /data/quality` reports this; do not design around it without checking.
 
 ---
 

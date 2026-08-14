@@ -32,6 +32,13 @@ class Settings(BaseSettings):
 
     archive_candles: bool = True
 
+    # Capture an option-chain snapshot on every agent tick. This is the only
+    # way option history ever comes to exist — NSE publishes a live snapshot,
+    # not a tape, and nobody sells the history at a retail price — so a bar
+    # not captured today cannot be recovered tomorrow. Turn this off only if
+    # you are certain you will never backtest options.
+    archive_option_chain: bool = True
+
     agent_interval_minutes: int = 5
     # How often the price ticker polls. Below ~5s you risk being throttled
     # by the free sources, and the data is not tick-level anyway.

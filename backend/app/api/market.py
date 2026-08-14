@@ -4,9 +4,9 @@ from sqlalchemy.orm import Session
 from ..analytics import indicators, options, smc, structure
 from ..cache import get_json, set_json
 from ..config import get_settings
+from ..data import importer, repository
 from ..db import get_db
 from ..deps import get_broker
-from ..workers import archiver
 
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -63,26 +63,32 @@ def vix():
     return {"india_vix": get_broker().india_vix()}
 
 
-@router.get("/archive")
+@router.get("/archive", deprecated=True)
 def archive_coverage(symbol: str = "NIFTY", timeframe: str = "5m",
                      db: Session = Depends(get_db)):
-    """How much history you have actually accumulated.
+    """Deprecated alias for GET /data/coverage.
 
-    Free sources only look back about 60 days. This number grows every day
-    the agent runs, and it is what your long backtests should read from.
+    Kept so existing scripts and bookmarks keep working; stored history
+    lives under /data now.
     """
-    return archiver.coverage(db, symbol, timeframe)
+    return repository.coverage(db, symbol, timeframe).to_dict()
 
 
-@router.post("/archive/backfill")
+@router.post("/archive/backfill", deprecated=True)
 def archive_backfill(symbol: str = "NIFTY", timeframe: str = "5m",
                      days: int = 59, db: Session = Depends(get_db)):
-    """Pull the deepest window the source allows and store it.
+    """Deprecated alias for POST /data/import/index.
 
-    Run this once on day one to seed the archive, then let the agent top it
-    up every five minutes.
+    Routed through the same importer rather than kept as a second write
+    path. Two ways of writing one table means two sets of guards to keep in
+    step, and the one that gets forgotten is the one that corrupts the
+    archive.
     """
     candles = get_broker().candles(symbol, timeframe, days)
-    written = archiver.archive(db, candles, symbol, timeframe,
-                               source=get_settings().broker)
-    return {"written": written, "coverage": archiver.coverage(db, symbol, timeframe)}
+    report = importer.import_index_candles(
+        db, candles, symbol, timeframe, source=get_settings().broker)
+    return {
+        "written": report.write.written,
+        "import": report.to_dict(),
+        "coverage": repository.coverage(db, symbol, timeframe).to_dict(),
+    }

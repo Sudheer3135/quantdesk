@@ -260,29 +260,51 @@ def test_archive_requires_an_explicit_source():
     """`source` defaulted to "free", so the backfill endpoint — which never
     passed it — labelled 19,000 mock candles as real data. The column that
     distinguished trustworthy rows from junk became useless precisely when
-    it mattered. A forgotten argument must fail loudly."""
+    it mattered. A forgotten argument must fail loudly.
+
+    Checked on both the shim and the importer that replaced it: the rule
+    protects the column, not one particular function."""
     import ast
 
     backend = Path(__file__).resolve().parents[1] / "backend"
-    tree = ast.parse((backend / "app/workers/archiver.py").read_text())
+    targets = {
+        "app/workers/archiver.py": "archive",
+        "app/data/importer.py": "import_index_candles",
+    }
 
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "archive")
-    names = [a.arg for a in fn.args.args]
-    # defaults align to the tail of the argument list
-    defaults = dict(zip(names[len(names) - len(fn.args.defaults):],
-                        fn.args.defaults, strict=True))
-    assert "source" not in defaults, "source must not have a default value"
+    for rel, function in targets.items():
+        tree = ast.parse((backend / rel).read_text())
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == function)
+        names = [a.arg for a in fn.args.args]
+        # defaults align to the tail of the argument list
+        defaults = dict(zip(names[len(names) - len(fn.args.defaults):],
+                            fn.args.defaults, strict=True))
+        assert "source" in names, f"{rel}:{function} lost its source argument"
+        assert "source" not in defaults, \
+            f"{rel}:{function} gave source a default value"
 
 
 def test_every_archive_caller_passes_a_source():
     """A signature check only helps if nothing calls it wrongly. This walks
-    the actual call sites."""
+    the actual call sites.
+
+    The caller list is deliberately explicit and asserted non-empty. When
+    the write path moved into `app/data`, a list naming only the old modules
+    would have kept passing while checking nothing at all — and a vacuous
+    test is worse than a deleted one, because it still reads as coverage."""
     import ast
 
     backend = Path(__file__).resolve().parents[1] / "backend"
-    callers = ["app/api/market.py", "app/workers/agent.py"]
+    callers = [
+        "app/api/market.py",
+        "app/api/data.py",
+        "app/workers/agent.py",
+        "app/workers/archiver.py",
+    ]
+    writers = {"archive", "import_index_candles", "import_option_snapshot"}
 
+    seen = 0
     for rel in callers:
         tree = ast.parse((backend / rel).read_text())
         for node in ast.walk(tree):
@@ -290,11 +312,16 @@ def test_every_archive_caller_passes_a_source():
                 continue
             fn = node.func
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
-            if name != "archive":
+            if name not in writers:
                 continue
+            seen += 1
             passed = {kw.arg for kw in node.keywords}
             assert "source" in passed or len(node.args) >= 5, \
-                f"{rel} calls archive() without a source"
+                f"{rel} calls {name}() without a source"
+
+    assert seen >= 3, (
+        f"only found {seen} write call sites — the caller list has gone stale "
+        "and this test is no longer checking anything")
 
 
 def test_market_hours_has_one_definition():

@@ -33,8 +33,11 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from ..analytics import indicators, option_pricing, signal_engine
+from ..analytics import option_pricing, signal_engine
 from ..risk.manager import DayState, RiskConfig, evaluate
+from . import costs as costs_module
+from .costs import CostModel, FlatCostModel, SlippageModel, buy_fill, describe, sell_fill
+from .feed import HistoricalFeed
 
 
 @dataclass
@@ -56,6 +59,15 @@ class OptionTrade:
     decay_cost: float         # premium lost purely to time
     exit_reason: str
     confidence: float
+    # Charges broken out rather than netted into pnl. For a retail option
+    # buyer the dominant line is usually STT on the sell leg, and you cannot
+    # act on that if it is buried inside a single number.
+    costs: dict = field(default_factory=dict)
+    # Whether the premium was observed in the archive or modelled with
+    # Black-Scholes. Until months of snapshots accumulate this reads
+    # "modelled" for every trade, and a result that does not say so invites
+    # being believed.
+    premium_source: str = "modelled"
     # What each check contributed to the decision that opened this trade.
     # Without this you can measure whether the combined score works, but
     # never which part of it is carrying or dragging.
@@ -70,12 +82,16 @@ class OptionBacktestResult:
     trades: list[OptionTrade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
+    assumptions: dict = field(default_factory=dict)
+    dataset: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "trades": [t.to_dict() for t in self.trades],
             "equity_curve": self.equity_curve,
             "stats": self.stats,
+            "assumptions": self.assumptions,
+            "dataset": self.dataset,
         }
 
 
@@ -148,22 +164,39 @@ def run(
     strike_offset: int = 0,
     expiry_weekday: int = 1,
     lot_size: int = 75,
-    cost_per_round_trip: float = 120.0,
-    slippage_points: float = 0.5,
+    cost_per_round_trip: float | None = None,
+    slippage_points: float | None = None,
     warmup: int = 60,
     max_bars_in_trade: int = 24,
     analysis_window: int = 300,
     signal_fn: Callable[[pd.DataFrame], signal_engine.Signal] | None = None,
+    cost_model: CostModel | FlatCostModel | None = None,
+    slippage_model: SlippageModel | None = None,
+    dataset: dict | None = None,
 ) -> OptionBacktestResult:
     """Walk the candles forward, buying options on each approved signal.
 
-    `slippage_points` is charged on the premium, not the index — a couple of
-    ticks on an option is a far larger fraction of its price than the same
-    slippage on a 24,000-point index.
+    Costs are itemised rather than flat here, because this is where turnover
+    is real. A flat rupee charge has the wrong *shape* for options: the
+    statutory charges scale with premium, so one number simultaneously
+    overcharges a cheap out-of-the-money trade and undercharges an expensive
+    in-the-money one. On a strategy whose edge is a fraction of an R, that
+    shape error is enough to flip the sign of the expectancy.
+
+    `cost_per_round_trip` and `slippage_points` are kept as overrides so an
+    older result can be reproduced exactly, but they are no longer the
+    default. See `backtest/costs.py`.
     """
-    df = indicators.enrich(candles)
+    feed = HistoricalFeed(candles, analysis_window=analysis_window)
     cfg = risk_config or RiskConfig(capital=starting_capital, lot_size=lot_size)
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
+
+    costs = cost_model or (
+        FlatCostModel(per_round_trip=cost_per_round_trip)
+        if cost_per_round_trip is not None else CostModel())
+    slip_model = slippage_model or (
+        SlippageModel(ticks=slippage_points / costs_module.TICK_SIZE)
+        if slippage_points is not None else SlippageModel())
 
     equity = starting_capital
     curve: list[float] = [equity]
@@ -171,11 +204,9 @@ def run(
     day_states: dict[date, DayState] = {}
     open_trade: dict | None = None
 
-    ist = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-
-    for i in range(warmup, len(df) - 1):
-        bar, nxt = df.iloc[i], df.iloc[i + 1]
-        moment = ist.iloc[i].to_pydatetime().replace(tzinfo=None)
+    for i in feed.walk(warmup):
+        bar = feed.bar(i)
+        moment = feed.ist(i).to_pydatetime().replace(tzinfo=None)
         state = day_states.setdefault(moment.date(), DayState(trading_day=moment.date()))
 
         # ---- manage an open position ---------------------------------
@@ -195,18 +226,23 @@ def run(
                 index_exit, reason = open_trade["target"], "target"
             elif i - open_trade["entry_index"] >= max_bars_in_trade:
                 index_exit, reason = index_now, "time"
-            elif ist.iloc[i].time().hour >= 15 and ist.iloc[i].time().minute >= 15:
+            elif feed.ist(i).time().hour >= 15 and feed.ist(i).time().minute >= 15:
                 index_exit, reason = index_now, "session end"
 
             if index_exit is not None:
-                premium_exit = option_pricing.price(
+                quoted_exit = option_pricing.price(
                     index_exit, open_trade["strike"], years, iv,
-                    kind=open_trade["kind"]) - slippage_points
-                premium_exit = max(premium_exit, 0.0)
+                    kind=open_trade["kind"])
+                exit_fill = sell_fill(quoted_exit, slip_model)
+                premium_exit = exit_fill.filled
 
                 qty = open_trade["quantity"]
                 gross = (premium_exit - open_trade["premium_entry"]) * qty
-                pnl = gross - cost_per_round_trip
+                charges = costs.round_trip(
+                    buy_price=open_trade["premium_entry"],
+                    sell_price=premium_exit,
+                    quantity=qty)
+                pnl = gross - charges.total
 
                 # What the same index move would have been worth with no
                 # time passing — the difference is the decay bill.
@@ -219,7 +255,7 @@ def run(
                 equity += pnl
                 trades.append(OptionTrade(
                     entry_time=open_trade["entry_time"],
-                    exit_time=bar["timestamp"].isoformat(),
+                    exit_time=feed.timestamp(i).isoformat(),
                     direction=open_trade["direction"],
                     option=f"{open_trade['strike']:.0f} {open_trade['kind']}",
                     strike=open_trade["strike"], kind=open_trade["kind"],
@@ -234,6 +270,8 @@ def run(
                     exit_reason=reason,
                     confidence=open_trade["confidence"],
                     checks=open_trade["checks"],
+                    costs=charges.to_dict(),
+                    premium_source="modelled",
                 ))
                 state.record_close(pnl)
                 curve.append(equity)
@@ -243,9 +281,8 @@ def run(
             continue
 
         # ---- look for a new entry ------------------------------------
-        window = df.iloc[max(0, i + 1 - analysis_window) : i + 1]
         try:
-            sig = signal_fn(window)
+            sig = signal_fn(feed.view(i))
         except Exception:
             continue
         if sig.action == "HOLD" or sig.stop_loss is None:
@@ -256,7 +293,7 @@ def run(
         if years <= 0:
             continue
 
-        entry_index = float(nxt["open"])
+        entry_index = feed.next_open(i)
 
         # The signal's stop was computed on this bar's close, but the fill
         # happens at the next bar's open. Overnight and lunch gaps can move
@@ -273,8 +310,9 @@ def run(
         strike, kind = option_pricing.select_strike(
             entry_index, sig.action, offset=strike_offset)
 
-        entry_premium = option_pricing.price(
-            entry_index, strike, years, iv, kind=kind) + slippage_points
+        quoted_entry = option_pricing.price(entry_index, strike, years, iv, kind=kind)
+        entry_fill = buy_fill(quoted_entry, slip_model)
+        entry_premium = entry_fill.filled
         if entry_premium <= 0:
             continue
 
@@ -314,11 +352,24 @@ def run(
             "stop": sig.stop_loss, "target": sig.target,
             "quantity": decision.quantity, "lots": decision.lots,
             "entry_index": i + 1,
-            "entry_time": nxt["timestamp"].isoformat(),
+            "entry_time": feed.next_timestamp(i).isoformat(),
             "confidence": sig.confidence,
             "checks": {c.name: round(c.contribution, 4) for c in sig.checks},
         }
         state.record_fill()
 
-    return OptionBacktestResult(trades, curve,
-                                compute_stats(trades, curve, starting_capital))
+    return OptionBacktestResult(
+        trades, curve,
+        compute_stats(trades, curve, starting_capital),
+        assumptions=describe(costs, slip_model) | {
+            "iv": iv,
+            "iv_source": "constant — no stored option history to read it from",
+            "strike_offset": strike_offset,
+            "expiry_weekday": expiry_weekday,
+            "lot_size": lot_size,
+            "premium_source": "modelled",
+            "warmup_bars": warmup,
+            "max_bars_in_trade": max_bars_in_trade,
+        },
+        dataset=dataset or {},
+    )

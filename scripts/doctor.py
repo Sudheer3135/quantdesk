@@ -171,21 +171,53 @@ def run_infrastructure() -> None:
 
     @check("candle upsert is idempotent")
     def _():
-        from app.brokers.mock import MockBroker
+        # Bars are built here rather than taken from the mock broker: the
+        # mock steps forward five minutes at a time with no notion of
+        # weekends or session hours, so the validation gate correctly
+        # rejects most of them. Feeding it mock candles would test the
+        # rejector, not the upsert, and report the failure as a duplication
+        # bug — which is exactly the wrong place to go looking.
+        from datetime import datetime, timedelta, timezone
+
+        import pandas as pd
+        from app.data.importer import import_index_candles
+        from app.data.repository import load_index_candles
         from app.db import SessionLocal
-        from app.workers import archiver
-        df = MockBroker(seed=99).candles(days=1).head(20)
+        from app.models import CandleRecord
+
+        # The most recent weekday, at 09:15 IST — a session that has ended.
+        ist = timezone(timedelta(hours=5, minutes=30))
+        day = datetime.now(ist).date() - timedelta(days=1)
+        while day.weekday() >= 5:
+            day -= timedelta(days=1)
+        first = datetime(day.year, day.month, day.day, 9, 15, tzinfo=ist)
+
+        df = pd.DataFrame([{
+            "timestamp": pd.Timestamp(first + timedelta(minutes=5 * i)).tz_convert("UTC"),
+            "open": 24_000.0 + i, "high": 24_010.0 + i,
+            "low": 23_990.0 + i, "close": 24_005.0 + i, "volume": 1000.0 + i,
+        } for i in range(20)])
+
         with SessionLocal() as db:
-            archiver.archive(db, df, "__DOCTOR__", "5m", source="doctor")
-            archiver.archive(db, df, "__DOCTOR__", "5m", source="doctor")
-            back = archiver.load(db, "__DOCTOR__", "5m")
-            from app.models import CandleRecord
+            first_write = import_index_candles(db, df, "__DOCTOR__", "5m", "doctor")
+            second_write = import_index_candles(db, df, "__DOCTOR__", "5m", "doctor")
+            back = load_index_candles(db, "__DOCTOR__", "5m")
             db.query(CandleRecord).filter(CandleRecord.symbol == "__DOCTOR__").delete()
             db.commit()
-        if len(back) != len(df):
+
+        if first_write.write.inserted == 0:
             raise RuntimeError(
-                f"wrote {len(df)} rows twice but read back {len(back)} — "
-                "the upsert is duplicating instead of updating")
+                "the validation gate rejected every test bar, so this check "
+                f"proved nothing: {first_write.rejection.to_dict()['by_reason']}")
+        if len(back) != first_write.write.inserted:
+            raise RuntimeError(
+                f"inserted {first_write.write.inserted} rows, wrote the same "
+                f"batch again, and read back {len(back)} — the upsert is "
+                "duplicating instead of updating")
+        if second_write.write.inserted:
+            raise RuntimeError(
+                f"the second identical write inserted {second_write.write.inserted} "
+                "new rows; it should have updated in place")
         return f"{len(back)} rows after two identical writes (correct)"
 
     @check("redis reachable")
@@ -250,7 +282,7 @@ def run_api(base: str) -> None:
         return
 
     for path in ("/health", "/health/broker", "/signals/live",
-                 "/market/structure", "/market/archive"):
+                 "/market/structure", "/data/coverage"):
         @check(f"GET {path}")
         def _(p=path):
             r = httpx.get(f"{base}{p}", timeout=60)

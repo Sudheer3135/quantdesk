@@ -4,6 +4,11 @@ Bar-by-bar, no lookahead. At bar i the engine may only see candles 0..i.
 Entries fill at the next bar's open, which is the earliest a real order
 could realistically be placed after a signal on a closed candle.
 
+That rule used to be a convention this file was careful about. It is now
+enforced by `HistoricalFeed`, which will not hand over a bar the walk has
+not reached and returns the next bar's *open alone* rather than the whole
+row. See `backtest/feed.py` for why one number instead of one row matters.
+
 Costs are charged on both legs so the equity curve is net, not gross.
 """
 from __future__ import annotations
@@ -15,8 +20,10 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-from ..analytics import indicators, signal_engine
+from ..analytics import signal_engine
 from ..risk.manager import DayState, RiskConfig, evaluate
+from .costs import CostModel, FlatCostModel, SlippageModel, describe
+from .feed import HistoricalFeed
 
 
 @dataclass
@@ -43,13 +50,47 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
+    # What the run assumed and what it read. A result without these cannot
+    # be compared against another result, because nothing records whether
+    # the difference was the strategy, the costs, or the data.
+    assumptions: dict = field(default_factory=dict)
+    dataset: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "trades": [t.to_dict() for t in self.trades],
             "equity_curve": self.equity_curve,
             "stats": self.stats,
+            "assumptions": self.assumptions,
+            "dataset": self.dataset,
         }
+
+
+def _annualisation(trades: list[Trade]) -> tuple[float, str]:
+    """How many trade-returns a year, for annualising a trade-indexed curve.
+
+    Returns the scaling factor and a plain description of where it came
+    from, because a Sharpe ratio whose basis is undocumented invites being
+    compared against numbers computed on a completely different one.
+
+    A single trade, or trades spanning less than a week, cannot support an
+    annual figure at all — the honest answer there is to refuse to scale
+    rather than to extrapolate one week into a year.
+    """
+    if len(trades) < 2:
+        return 1.0, "too few trades to annualise"
+
+    first = pd.Timestamp(trades[0].entry_time)
+    last = pd.Timestamp(trades[-1].exit_time)
+    days = (last - first).total_seconds() / 86400
+    if days < 7:
+        return 1.0, f"span of {days:.1f} days is too short to annualise"
+
+    years = days / 365.25
+    per_year = len(trades) / years
+    return per_year, (
+        f"{len(trades)} trades over {days:.0f} days "
+        f"({per_year:.0f} trades/year)")
 
 
 def compute_stats(trades: list[Trade], equity: list[float], starting_capital: float) -> dict:
@@ -78,11 +119,21 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         best_win_streak = max(best_win_streak, cur_w)
         worst_loss_streak = max(worst_loss_streak, cur_l)
 
+    # The equity curve gains a point per *trade*, not per day — nothing is
+    # appended on a bar where nothing closed. Annualising those returns by
+    # √252 therefore treated every trade as if it took exactly one day,
+    # which inflates the ratio for a strategy holding 20 minutes and
+    # deflates it for one holding a week. Either way the published number
+    # was not comparable to anything, including its own previous runs.
+    #
+    # The fix is to scale by the rate trades actually arrived at.
     returns = np.diff(curve) / curve[:-1] if len(curve) > 1 else np.array([0.0])
-    sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252)) \
+    periods_per_year, basis = _annualisation(trades)
+
+    sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(periods_per_year)) \
         if len(returns) > 1 and np.std(returns) > 0 else 0.0
     downside = returns[returns < 0]
-    sortino = float(np.mean(returns) / np.std(downside) * np.sqrt(252)) \
+    sortino = float(np.mean(returns) / np.std(downside) * np.sqrt(periods_per_year)) \
         if len(downside) > 1 and np.std(downside) > 0 else 0.0
 
     return {
@@ -103,6 +154,10 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         "max_drawdown_pct": round(max_dd, 2),
         "sharpe": round(sharpe, 2),
         "sortino": round(sortino, 2),
+        # Without this, the ratio above is a number with no units. Two runs
+        # over different holding periods produce Sharpes that cannot be
+        # compared, and nothing in the output would say so.
+        "sharpe_basis": basis,
         "best_win_streak": best_win_streak,
         "worst_loss_streak": worst_loss_streak,
         "final_equity": round(float(curve[-1]), 2),
@@ -120,23 +175,28 @@ def run(
     signal_fn: Callable[[pd.DataFrame], signal_engine.Signal] | None = None,
     max_bars_in_trade: int = 24,
     analysis_window: int = 300,
+    cost_model: CostModel | FlatCostModel | None = None,
+    slippage_model: SlippageModel | None = None,
+    dataset: dict | None = None,
 ) -> BacktestResult:
     """Walk the candles forward and simulate the rulebook.
 
-    cost_per_round_trip is a flat rupee charge covering brokerage, STT,
-    exchange fees, GST and stamp duty for both legs. A flat figure is used
-    rather than a percentage of index turnover because in Indian F&O the
-    charges scale with premium and lot count, not with the index level.
-    Replace it with your own number from a real contract note.
+    Costs default to a flat rupee charge per round trip, which is the right
+    shape here and only here: this engine trades index points, so there is
+    no premium turnover to charge a percentage against. The option engine,
+    where turnover is real, uses the itemised `CostModel` instead. Pass
+    `cost_model` to override either.
 
     analysis_window caps how many bars each signal call sees. Structure
     detection is O(n) per call, so an uncapped window makes the whole
     backtest O(n squared). 300 bars is four sessions of 5-minute data,
     which is more history than any of the checks actually use.
     """
-    df = indicators.enrich(candles)
+    feed = HistoricalFeed(candles, analysis_window=analysis_window)
     cfg = risk_config or RiskConfig(capital=starting_capital)
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
+    costs = cost_model or FlatCostModel(per_round_trip=cost_per_round_trip)
+    slip_model = slippage_model or SlippageModel(index_pct=slippage_pct)
 
     equity = starting_capital
     curve: list[float] = [equity]
@@ -145,12 +205,10 @@ def run(
     day_states: dict[date, DayState] = {}
     open_trade: dict | None = None
 
-    ist = df["timestamp"].dt.tz_convert("Asia/Kolkata")
-
-    for i in range(warmup, len(df) - 1):
-        bar = df.iloc[i]
-        nxt = df.iloc[i + 1]
-        today = ist.iloc[i].date()
+    for i in feed.walk(warmup):
+        bar = feed.bar(i)
+        moment = feed.ist(i)
+        today = moment.date()
         state = day_states.setdefault(today, DayState(trading_day=today))
 
         # ---- manage an open trade on this bar -------------------------
@@ -169,21 +227,25 @@ def run(
                 exit_price, reason = open_trade["target"], "target"
             elif i - open_trade["entry_index"] >= max_bars_in_trade:
                 exit_price, reason = float(bar["close"]), "time"
-            elif ist.iloc[i].time().hour >= 15 and ist.iloc[i].time().minute >= 15:
+            elif moment.time().hour >= 15 and moment.time().minute >= 15:
                 exit_price, reason = float(bar["close"]), "session end"
 
             if exit_price is not None:
                 qty = open_trade["quantity"]
                 direction = 1 if open_trade["side"] == "BUY" else -1
-                slip = exit_price * slippage_pct / 100 * direction
+                slip = slip_model.index_points(exit_price) * direction
                 fill = exit_price - slip
                 gross = (fill - open_trade["entry"]) * direction * qty
-                pnl = gross - cost_per_round_trip
+                charges = costs.round_trip(
+                    buy_price=min(open_trade["entry"], fill),
+                    sell_price=max(open_trade["entry"], fill),
+                    quantity=qty)
+                pnl = gross - charges.total
                 equity += pnl
                 risk_unit = abs(open_trade["entry"] - open_trade["stop"]) * qty
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
-                    exit_time=bar["timestamp"].isoformat(),
+                    exit_time=feed.timestamp(i).isoformat(),
                     side=open_trade["side"],
                     entry=round(open_trade["entry"], 2),
                     exit=round(fill, 2),
@@ -203,10 +265,10 @@ def run(
             continue
 
         # ---- look for a new entry using only bars up to i -------------
-        start = max(0, i + 1 - analysis_window)
-        window = df.iloc[start : i + 1]
+        # `feed.view(i)` cannot return bar i+1 or later. That is the whole
+        # guarantee this engine rests on.
         try:
-            sig = signal_fn(window)
+            sig = signal_fn(feed.view(i))
         except Exception:
             continue
         if sig.action == "HOLD" or sig.stop_loss is None:
@@ -221,7 +283,9 @@ def run(
             continue
 
         direction = 1 if sig.action == "BUY" else -1
-        entry_fill = float(nxt["open"]) + float(nxt["open"]) * slippage_pct / 100 * direction
+        # The only permitted look forward, and it is one number wide.
+        next_open = feed.next_open(i)
+        entry_fill = next_open + slip_model.index_points(next_open) * direction
         shift = entry_fill - sig.entry
         open_trade = {
             "side": sig.action,
@@ -230,9 +294,19 @@ def run(
             "target": sig.target + shift,
             "quantity": decision.quantity,
             "entry_index": i + 1,
-            "entry_time": nxt["timestamp"].isoformat(),
+            "entry_time": feed.next_timestamp(i).isoformat(),
             "confidence": sig.confidence,
         }
         state.record_fill()
 
-    return BacktestResult(trades, curve, compute_stats(trades, curve, starting_capital))
+    return BacktestResult(
+        trades, curve,
+        compute_stats(trades, curve, starting_capital),
+        assumptions=describe(costs, slip_model) | {
+            "warmup_bars": warmup,
+            "analysis_window": analysis_window,
+            "max_bars_in_trade": max_bars_in_trade,
+            "stop_fills_first_when_both_touched": True,
+        },
+        dataset=dataset or {},
+    )

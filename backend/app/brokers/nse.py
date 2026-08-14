@@ -247,6 +247,13 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
 
     chain = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
 
+    # Which expiry these strikes actually describe. A caller passing None
+    # asks for the nearest one and until now had no way to learn what it
+    # got. That is fine for a live reading and unacceptable for an archive:
+    # a snapshot filed under a guessed expiry silently merges two different
+    # contracts into one premium series, and the result looks plausible.
+    chain.attrs["expiry"] = chosen
+
     if not spot:                       # fall back to the ATM crossover
         diff = (chain["call_ltp"] - chain["put_ltp"]).abs()
         spot = float(chain.loc[diff.idxmin(), "strike"])
