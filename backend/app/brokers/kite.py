@@ -93,7 +93,16 @@ class KiteBroker(Broker):
     def quote(self, symbol: str = "NIFTY") -> dict:
         key = f"NSE:{'NIFTY 50' if symbol.upper() == 'NIFTY' else symbol.upper()}"
         data = self.kite.quote([key])[key]
-        return {"last_price": float(data["last_price"]), "raw": data}
+        # Kite stamps each quote with the exchange's own timestamp. That is
+        # the one number that lets the desk tell a live price from a frozen
+        # feed, so pass it through rather than re-deriving it from our clock.
+        stamped = data.get("timestamp") or data.get("last_trade_time")
+        return {
+            "last_price": float(data["last_price"]),
+            "source": "kite",
+            "source_time": stamped.isoformat() if hasattr(stamped, "isoformat") else stamped,
+            "raw": data,
+        }
 
     def india_vix(self) -> float | None:
         try:

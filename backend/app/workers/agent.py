@@ -25,35 +25,6 @@ from ..models import SignalRecord
 log = logging.getLogger(__name__)
 
 
-def _capture_option_chain(db, settings) -> None:
-    """Store one option-chain snapshot.
-
-    This is the only mechanism by which option history comes to exist. NSE
-    publishes a live snapshot rather than a tape, and nobody sells the
-    history at a price a retail account would pay — so a bar not captured
-    now is a bar that can never be recovered. That asymmetry is the reason
-    this runs on every tick.
-
-    It refuses to file a snapshot whose expiry it cannot name. Guessing
-    would merge two different contracts into one series, and the resulting
-    premium history would look perfectly plausible.
-    """
-    broker = get_broker()
-    if not hasattr(broker, "chain_with_spot"):
-        return
-
-    chain, spot = broker.chain_with_spot(settings.watch_symbol)
-    expiry = chain.attrs.get("expiry")
-    if not expiry:
-        log.debug("chain carried no expiry label; skipping snapshot")
-        return
-
-    importer.import_option_snapshot(
-        db, chain, underlying=settings.watch_symbol, expiry=expiry,
-        spot=spot, source=settings.broker,
-        timeframe=settings.watch_timeframe, lot_size=settings.lot_size)
-
-
 def tick() -> None:
     s = get_settings()
     if s.environment == "prod" and not market_is_open():
@@ -71,12 +42,10 @@ def tick() -> None:
         except Exception:
             log.exception("candle archiving failed")
 
-    if s.archive_option_chain and market_is_open():
-        try:
-            with SessionLocal() as db:
-                _capture_option_chain(db, s)
-        except Exception:
-            log.exception("option chain snapshot failed")
+    # The option chain is captured by `workers.option_collector`, not here.
+    # It has to poll faster than the bar width to build a bar with a real
+    # range, and the agent's cadence is the strategy's timeframe and should
+    # not be driven by a data-collection need.
 
     try:
         sig = build_signal(s.watch_symbol, s.watch_timeframe)

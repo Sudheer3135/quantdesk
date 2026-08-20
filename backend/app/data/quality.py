@@ -24,13 +24,16 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..market_calendar import is_provisional, is_session
 from ..models import CandleRecord, OptionCandle, OptionContract
+from . import oi_classifier
+from . import option_coverage as option_coverage_lib
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +50,10 @@ MAX_PLAUSIBLE_IV = 2.0
 MIN_PLAUSIBLE_IV = 0.01
 
 
+INDEX = "index"
+OPTIONS = "options"
+
+
 @dataclass
 class Finding:
     check: str
@@ -55,6 +62,12 @@ class Finding:
     count: int = 0
     detail: dict = field(default_factory=dict)
     samples: list = field(default_factory=list)
+    # Which dataset this is a statement about. Index and option data are
+    # collected by different mechanisms, fail in different ways, and are
+    # fit for different purposes — the index archive backfills from Yahoo,
+    # the option archive cannot be rebuilt at all. Rolling them into one
+    # verdict meant a 22% option day marked complete index candles unusable.
+    domain: str = INDEX
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -386,21 +399,18 @@ def abnormal_iv(db: Session, underlying: str = "NIFTY") -> list[Finding]:
     return findings
 
 
-def oi_discontinuities(db: Session, underlying: str = "NIFTY",
-                       jump_multiple: float = 10.0) -> list[Finding]:
-    """Open interest that moves in ways open interest does not move.
+def _oi_changes(db: Session, underlying: str) -> list[oi_classifier.OIChange]:
+    """Every consecutive pair of observations, with the context to judge it.
 
-    OI is a stock, not a flow: it accumulates and decays across a session.
-    A mid-session reset to zero, or a single-bar change many times the
-    typical one, means a dropped or malformed capture rather than a real
-    positioning shift.
-
-    Expiry boundaries are excluded — OI genuinely collapses to nothing when
-    a contract expires, and flagging that would be flagging the calendar.
+    Interval volume is derived here rather than stored: NSE publishes
+    `totalTradedVolume` cumulatively for the session, so the contracts
+    traded between two bars is the difference between them. That figure is
+    what makes the physical test in `oi_classifier` possible at all.
     """
     rows = db.execute(
         select(OptionCandle.contract_id, OptionCandle.timestamp,
-               OptionCandle.open_interest, OptionCandle.session_date,
+               OptionCandle.open_interest, OptionCandle.volume,
+               OptionCandle.session_date, OptionCandle.underlying_close,
                OptionContract.expiry_date, OptionContract.strike,
                OptionContract.option_type)
         .join(OptionContract, OptionCandle.contract_id == OptionContract.id)
@@ -415,63 +425,254 @@ def oi_discontinuities(db: Session, underlying: str = "NIFTY",
     for row in rows:
         per_contract[row.contract_id].append(row)
 
-    # Negative open interest is checked over every row, not inside the
-    # pairwise loop below. A contract with a single stored bar has no pairs,
-    # so a pairwise-only check would silently never examine the first bar of
-    # any contract — which, on a young archive, is most of them.
-    negatives = [
-        {"timestamp": str(row.timestamp), "strike": row.strike,
-         "type": row.option_type, "open_interest": row.open_interest}
-        for row in rows if row.open_interest < 0
-    ]
-
-    resets, jumps = [], []
+    changes: list[oi_classifier.OIChange] = []
     for series in per_contract.values():
-        deltas = []
+        deltas = [abs(b.open_interest - a.open_interest)
+                  for a, b in zip(series, series[1:], strict=False)]
+        typical = sorted(deltas)[len(deltas) // 2] if deltas else 0.0
+
         for previous, current in zip(series, series[1:], strict=False):
-            if current.open_interest < 0 or previous.open_interest < 0:
-                continue
             same_session = previous.session_date == current.session_date
-            expiring = current.session_date == current.expiry_date
-            if (same_session and not expiring
-                    and previous.open_interest > 0 and current.open_interest == 0):
-                resets.append({"timestamp": str(current.timestamp),
-                               "strike": current.strike,
-                               "type": current.option_type})
-            deltas.append((abs(current.open_interest - previous.open_interest),
-                           current, expiring))
 
-        if len(deltas) < 5:
-            continue
-        magnitudes = sorted(d[0] for d in deltas)
-        median = magnitudes[len(magnitudes) // 2]
-        if median <= 0:
-            continue
-        for magnitude, current, expiring in deltas:
-            if not expiring and magnitude > median * jump_multiple:
-                jumps.append({"timestamp": str(current.timestamp),
-                              "strike": current.strike,
-                              "type": current.option_type,
-                              "change": magnitude})
+            interval_volume = None
+            if (same_session and current.volume is not None
+                    and previous.volume is not None):
+                interval_volume = current.volume - previous.volume
 
-    findings = []
-    if negatives:
+            moneyness = None
+            if current.underlying_close:
+                moneyness = ((current.strike - current.underlying_close)
+                             / current.underlying_close * 100)
+
+            changes.append(oi_classifier.OIChange(
+                strike=current.strike,
+                option_type=current.option_type,
+                timestamp=str(current.timestamp),
+                oi=current.open_interest,
+                previous_oi=previous.open_interest,
+                delta_oi=current.open_interest - previous.open_interest,
+                interval_volume=interval_volume,
+                typical_move=typical,
+                observations=len(series),
+                same_session=same_session,
+                expiring=current.session_date == current.expiry_date,
+                moneyness_pct=moneyness,
+            ))
+    return changes
+
+
+def oi_discontinuities(db: Session, underlying: str = "NIFTY") -> list[Finding]:
+    """Open interest that contradicts the volume that would have produced it.
+
+    Classification lives in `data/oi_classifier.py`; the reasoning is in
+    that module's docstring. In short: open interest can only move when
+    contracts are traded, so a move larger than the interval's volume is
+    arithmetically impossible, while a move of any size backed by matching
+    volume is just a busy market.
+
+    Every finding here is informational. Heavy trading at the money on
+    expiry day is the most ordinary thing an option market does, and a
+    check that can mark a dataset unusable for it would be worse than no
+    check — so nothing in this function escalates above `warning`, and
+    nothing it reports gates a backtest.
+    """
+    changes = _oi_changes(db, underlying)
+    if not changes:
+        return []
+
+    buckets: dict[str, list] = defaultdict(list)
+    for change in changes:
+        verdict = oi_classifier.classify(change)
+        if verdict.reportable:
+            buckets[verdict.classification].append((change, verdict))
+
+    def sample(entries, limit=10):
+        return [{"timestamp": c.timestamp, "strike": c.strike,
+                 "type": c.option_type, "delta_oi": c.delta_oi,
+                 "interval_volume": c.interval_volume, "reason": v.reason}
+                for c, v in entries[:limit]]
+
+    findings: list[Finding] = []
+
+    anomalies = buckets.get(oi_classifier.ANOMALY, [])
+    if anomalies:
         findings.append(Finding(
-            "negative_open_interest", "error",
-            f"{len(negatives)} bar(s) hold negative open interest, which "
-            "cannot happen.", count=len(negatives), samples=negatives[:10]))
-    if resets:
+            "oi_anomaly", "warning",
+            f"{len(anomalies)} open-interest change(s) contradict the traded "
+            "volume in the same interval — open interest cannot move without "
+            "trades, so these are evidence of a data problem rather than of "
+            "market activity.",
+            count=len(anomalies),
+            detail={"classification": oi_classifier.ANOMALY},
+            samples=sample(anomalies)))
+
+    busy = buckets.get(oi_classifier.HIGH_ACTIVITY, [])
+    if busy:
         findings.append(Finding(
-            "oi_reset_mid_session", "error",
-            f"{len(resets)} contract-bars drop to zero open interest mid-session "
-            "without expiring. That is a dropped capture, not a market event.",
-            count=len(resets), samples=resets[:10]))
-    if jumps:
+            "oi_high_activity", "info",
+            f"{len(busy)} large open-interest move(s), each fully supported "
+            "by trading volume. Normal market behaviour, reported for "
+            "visibility rather than as a problem.",
+            count=len(busy),
+            detail={"classification": oi_classifier.HIGH_ACTIVITY},
+            samples=sample(busy, 5)))
+
+    unknown = buckets.get(oi_classifier.INSUFFICIENT_EVIDENCE, [])
+    if unknown:
         findings.append(Finding(
-            "oi_discontinuity", "warning",
-            f"{len(jumps)} open-interest change(s) exceed {jump_multiple:g}× the "
-            "typical bar-to-bar change for that contract.",
-            count=len(jumps), samples=jumps[:10]))
+            "oi_insufficient_evidence", "info",
+            f"{len(unknown)} open-interest change(s) could not be judged — "
+            "too few observations for the contract, too little liquidity, or "
+            "a move below one lot. Not a finding about the data, a statement "
+            "about what this check can currently see.",
+            count=len(unknown),
+            detail={"classification": oi_classifier.INSUFFICIENT_EVIDENCE},
+            samples=sample(unknown, 5)))
+
+    return findings
+
+
+def option_snapshot_coverage(
+    db: Session,
+    underlying: str = "NIFTY",
+    timeframe: str | None = None,
+    poll_seconds: int | None = None,
+    min_backtest_pct: float | None = None,
+) -> list[Finding]:
+    """Whether the collector actually ran, session by session.
+
+    The one diagnostic whose absence has already cost data: on 17-Aug-2026
+    collection stopped at 12:50 IST, index candles backfilled from Yahoo as
+    normal, every other check stayed green, and nothing reported the
+    two-hour-forty hole in an archive that cannot be rebuilt.
+
+    Severity is graded because partial coverage and no coverage are
+    different problems. A session missing a few polls is a warning; one
+    below the minimum usable for backtesting is an error, and that
+    threshold is configurable because nothing has derived it yet.
+    """
+    settings = get_settings()
+    timeframe = timeframe or settings.watch_timeframe
+    poll_seconds = poll_seconds or settings.option_snapshot_interval_seconds
+    min_backtest_pct = (min_backtest_pct if min_backtest_pct is not None
+                        else settings.option_coverage_min_backtest_pct)
+
+    minutes = TIMEFRAME_MINUTES.get(timeframe)
+    if not minutes:
+        return [Finding("option_snapshot_coverage", "info",
+                        f"unknown timeframe {timeframe!r}; coverage not assessed")]
+
+    rows = db.execute(
+        select(OptionCandle.session_date, OptionCandle.timestamp,
+               OptionContract.expiry_date, func.max(OptionCandle.samples))
+        .join(OptionContract, OptionCandle.contract_id == OptionContract.id)
+        .where(OptionContract.underlying == underlying,
+               OptionCandle.timeframe == timeframe)
+        .group_by(OptionCandle.session_date, OptionCandle.timestamp,
+                  OptionContract.expiry_date)
+    ).all()
+
+    if not rows:
+        return [Finding(
+            "option_snapshot_coverage", "info",
+            "No option snapshots stored, so collector coverage cannot be "
+            "assessed. This is not a report that the collector was down — "
+            "there is simply nothing to measure yet.")]
+
+    # A bucket's poll count is the most any contract in it recorded: one
+    # poll writes every strike, so the maximum is the number of polls that
+    # landed there, while individual strikes come and go from the ladder.
+    polls: dict[date, dict] = defaultdict(dict)
+    per_expiry: dict[date, dict] = defaultdict(lambda: defaultdict(dict))
+    for session_date, timestamp, expiry, samples in rows:
+        if session_date is None or timestamp is None:
+            continue
+        moment = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+        current = polls[session_date].get(moment, 0)
+        polls[session_date][moment] = max(current, samples or 0)
+        per_expiry[expiry][session_date][moment] = max(
+            per_expiry[expiry][session_date].get(moment, 0), samples or 0)
+
+    observed_days = sorted(polls)
+    sessions = option_coverage_lib.assessable_sessions(observed_days[0], observed_days[-1])
+
+    assessments = [
+        option_coverage_lib.assess_session(day, polls.get(day, {}), minutes, poll_seconds)
+        for day in sessions
+    ]
+    if not assessments:
+        return [Finding(
+            "option_snapshot_coverage", "info",
+            "Option snapshots exist but none fall on an assessable trading "
+            "session — nothing to measure.")]
+
+    by_severity: dict[str, list] = defaultdict(list)
+    for assessment in assessments:
+        by_severity[assessment.severity(min_backtest_pct)].append(assessment)
+
+    findings: list[Finding] = []
+
+    critical = by_severity.get("error", [])
+    if critical:
+        findings.append(Finding(
+            "option_coverage_critical", "error",
+            f"{len(critical)} trading session(s) hold less than "
+            f"{min_backtest_pct:g}% of the option snapshots they should. "
+            "Option history cannot be backfilled, so these gaps are "
+            "permanent and any option backtest covering them is running on "
+            "data that was never captured.",
+            count=len(critical),
+            detail={"min_backtest_coverage_pct": min_backtest_pct},
+            samples=[a.to_dict() for a in critical[:10]]))
+
+    partial = by_severity.get("warning", [])
+    if partial:
+        findings.append(Finding(
+            "option_coverage_incomplete", "warning",
+            f"{len(partial)} trading session(s) are missing some option "
+            "snapshots. Usable, but the bars in those windows aggregate "
+            "fewer observations than they should.",
+            count=len(partial),
+            samples=[a.to_dict() for a in partial[:10]]))
+
+    # Per-expiry, because a ladder can roll mid-session and leave one
+    # contract series far thinner than the session total suggests.
+    expiry_rows = []
+    for expiry, sessions_for_expiry in sorted(per_expiry.items()):
+        expected = sum(option_coverage_lib.expected_polls_for(day, minutes, poll_seconds)
+                       for day in sessions_for_expiry)
+        seen = sum(sum(buckets.values()) for buckets in sessions_for_expiry.values())
+        expiry_rows.append({
+            "expiry": expiry.isoformat() if expiry else None,
+            "sessions": len(sessions_for_expiry),
+            "observed_polls": seen,
+            "expected_polls": expected,
+            "coverage_pct": round(min(100.0, seen / expected * 100), 1) if expected else 0.0,
+        })
+
+    total_expected = sum(a.expected_polls for a in assessments)
+    total_observed = sum(a.observed_polls for a in assessments)
+    findings.append(Finding(
+        "option_snapshot_coverage", "info",
+        f"{total_observed:,} of {total_expected:,} expected one-minute "
+        f"snapshots captured across {len(assessments)} assessed session(s).",
+        count=total_observed,
+        detail={
+            "coverage_pct": round(min(100.0, total_observed / total_expected * 100), 1)
+            if total_expected else 0.0,
+            "assessed_from": sessions[0].isoformat(),
+            "assessed_to": sessions[-1].isoformat(),
+            "poll_interval_seconds": poll_seconds,
+            "bar_minutes": minutes,
+            "by_expiry": expiry_rows,
+            "note": (
+                "Sessions outside the assessed window are not evaluated. "
+                "Before the first stored snapshot there is no basis for "
+                "saying whether the collector should have been running, and "
+                "assuming it was would invent an outage."),
+        },
+        samples=[a.to_dict() for a in assessments[-5:]]))
+
     return findings
 
 
@@ -511,38 +712,140 @@ def option_coverage(db: Session, underlying: str = "NIFTY") -> list[Finding]:
 
 # ---------------------------------------------------------------- report
 
+def index_coverage_pct(db: Session, symbol: str, timeframe: str) -> tuple[float, int, int]:
+    """How complete the index archive is, as a percentage of expected bars.
+
+    Measured over the trading sessions between the first and last stored
+    candle. A session that is entirely absent counts against coverage —
+    that is the point — while weekends and exchange holidays are excluded
+    because nothing was ever expected on them.
+
+    Per-session counts are capped at the expected bar count: Yahoo returns
+    a 15:30 bar in addition to the 75 five-minute buckets, and letting that
+    push a session past 100% would quietly offset a genuinely short day
+    elsewhere.
+    """
+    rows = db.execute(
+        select(CandleRecord.session_date, func.count(CandleRecord.id))
+        .where(CandleRecord.symbol == symbol, CandleRecord.timeframe == timeframe)
+        .group_by(CandleRecord.session_date)
+    ).all()
+    counts = {d: c for d, c in rows if d is not None}
+    if not counts:
+        return 0.0, 0, 0
+
+    per_session = expected_bars(timeframe)
+    if not per_session:
+        return 0.0, 0, 0
+
+    sessions = [d for d in option_coverage_lib.assessable_sessions(
+        min(counts), max(counts))]
+    if not sessions:
+        return 0.0, 0, 0
+
+    expected = len(sessions) * per_session
+    observed = sum(min(counts.get(day, 0), per_session) for day in sessions)
+    return round(min(100.0, observed / expected * 100), 1), observed, expected
+
+
+def _domain_verdict(errors: int, warnings: int) -> str:
+    return "unusable" if errors else "usable with caveats" if warnings else "clean"
+
+
 def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
-           include_options: bool = True) -> dict:
-    """Every diagnostic, worst first."""
+           include_options: bool = True,
+           index_min_backtest_pct: float | None = None,
+           option_min_backtest_pct: float | None = None) -> dict:
+    """Every diagnostic, worst first, reported separately per dataset.
+
+    Index and option readiness are different questions with different
+    answers, and merging them was actively misleading: a 22%-covered option
+    day marked a complete, clean index archive as unusable. Nothing about
+    the index candles had changed.
+
+    The top-level verdict names both rather than collapsing to the worse of
+    the two, so neither can hide behind the other.
+    """
+    settings = get_settings()
+    index_min = (index_min_backtest_pct if index_min_backtest_pct is not None
+                 else settings.index_coverage_min_backtest_pct)
+    option_min = (option_min_backtest_pct if option_min_backtest_pct is not None
+                  else settings.option_coverage_min_backtest_pct)
+
     findings: list[Finding] = []
-    findings += missing_candles(db, symbol, timeframe)
-    findings += duplicate_candles(db, symbol, timeframe)
-    findings += impossible_prices(db, symbol, timeframe)
-    findings += price_jumps(db, symbol, timeframe)
-    findings += synthetic_volume(db, symbol, timeframe)
-    findings += source_mix(db, symbol, timeframe)
+    for finding in (missing_candles(db, symbol, timeframe)
+                    + duplicate_candles(db, symbol, timeframe)
+                    + impossible_prices(db, symbol, timeframe)
+                    + price_jumps(db, symbol, timeframe)
+                    + synthetic_volume(db, symbol, timeframe)
+                    + source_mix(db, symbol, timeframe)):
+        finding.domain = INDEX
+        findings.append(finding)
 
     if include_options:
-        findings += option_coverage(db, symbol)
-        findings += missing_option_strikes(db, symbol)
-        findings += abnormal_iv(db, symbol)
-        findings += oi_discontinuities(db, symbol)
+        for finding in (option_coverage(db, symbol)
+                        + option_snapshot_coverage(db, symbol)
+                        + missing_option_strikes(db, symbol)
+                        + abnormal_iv(db, symbol)
+                        + oi_discontinuities(db, symbol)):
+            finding.domain = OPTIONS
+            findings.append(finding)
 
     rank = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (rank.get(f.severity, 3), -f.count))
 
+    def block(domain: str, coverage: float, minimum: float) -> dict:
+        mine = [f for f in findings if f.domain == domain]
+        errors = sum(1 for f in mine if f.severity == "error")
+        warnings = sum(1 for f in mine if f.severity == "warning")
+        return {
+            "verdict": _domain_verdict(errors, warnings),
+            "coverage": coverage,
+            "errors": errors,
+            "warnings": warnings,
+            # Two conditions, both necessary. No errors means nothing in the
+            # data is known to be wrong; the coverage floor means there is
+            # enough of it to measure anything with. A clean archive of four
+            # sessions passes the first and fails the second.
+            "backtest_eligible": errors == 0 and coverage >= minimum,
+            "min_coverage_pct": minimum,
+            "findings": [f.to_dict() for f in mine],
+        }
+
+    index_pct, index_observed, index_expected = index_coverage_pct(db, symbol, timeframe)
+    index_block = block(INDEX, index_pct, index_min)
+    index_block["observed_bars"] = index_observed
+    index_block["expected_bars"] = index_expected
+
+    option_pct = 0.0
+    for finding in findings:
+        if finding.check == "option_snapshot_coverage":
+            option_pct = finding.detail.get("coverage_pct", 0.0)
+    options_block = block(OPTIONS, option_pct, option_min) if include_options else None
+
     errors = sum(1 for f in findings if f.severity == "error")
     warnings = sum(1 for f in findings if f.severity == "warning")
 
-    return {
+    summary = f"index {index_block['verdict']}"
+    if options_block:
+        summary += f"; options {options_block['verdict']}"
+
+    result = {
         "symbol": symbol,
         "timeframe": timeframe,
-        "verdict": (
-            "unusable" if errors else
-            "usable with caveats" if warnings else
-            "clean"
-        ),
+        # Names both. A single worst-of verdict would say "unusable" on a
+        # day the index archive is complete, which is the exact confusion
+        # this split exists to remove.
+        "verdict": summary,
+        "backtest_eligible": {
+            "index": index_block["backtest_eligible"],
+            "options": options_block["backtest_eligible"] if options_block else False,
+        },
         "errors": errors,
         "warnings": warnings,
+        "index": index_block,
         "findings": [f.to_dict() for f in findings],
     }
+    if options_block:
+        result["options"] = options_block
+    return result

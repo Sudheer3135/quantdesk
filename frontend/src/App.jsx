@@ -21,6 +21,34 @@ const WS_URL = API.replace(/^http/, "ws") + "/ws/signals";
 const FALLBACK_POLL_MS = 60_000;   // only used if the socket cannot connect
 const MAX_RECONNECT_MS = 30_000;
 
+/* Mirrors LIVE_SECONDS / DELAYED_SECONDS in backend/app/workers/ticker.py.
+   Both ends classify the same way so the dashboard and the API never
+   disagree about what "stale" means. */
+const LIVE_SECONDS = 15;
+const DELAYED_SECONDS = 60;
+
+function classifyAge(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "unknown";
+  if (seconds <= LIVE_SECONDS) return "live";
+  if (seconds <= DELAYED_SECONDS) return "delayed";
+  return "stale";
+}
+
+function formatAge(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "—";
+  if (seconds < 0) return "just now";          /* clock skew overshoot */
+  if (seconds < 1) return "just now";
+  if (seconds < 60) return `${Math.floor(seconds)}s ago`;
+  const m = Math.floor(seconds / 60);
+  const rest = Math.floor(seconds % 60);
+  return `${m}m ${String(rest).padStart(2, "0")}s ago`;
+}
+
+const AGE_LABEL = {
+  live: "Data live", delayed: "Data delayed",
+  stale: "Data stale", unknown: "Data age unknown",
+};
+
 const num = (v, d = 2) =>
   v === null || v === undefined ? "—" : Number(v).toLocaleString("en-IN", {
     minimumFractionDigits: d, maximumFractionDigits: d,
@@ -42,12 +70,31 @@ function useLiveSignal() {
   const [price, setPrice] = useState(null);
   const [market, setMarket] = useState(null);
   const [link, setLink] = useState("connecting");   // connecting | live | polling
-  const [updated, setUpdated] = useState(null);
+  const [skewMs, setSkewMs] = useState(0);
 
   const socket = useRef(null);
   const attempts = useRef(0);
   const pollTimer = useRef(null);
   const closed = useRef(false);
+
+  /* How far this browser's clock sits from the server's.
+
+     Data age is the gap between two clocks — the exchange's, which stamps
+     the price, and this one, which renders it. A laptop several minutes off
+     would otherwise report a perfectly live feed as badly stale, or worse,
+     a frozen one as current. Every frame the server sends carries its own
+     send time, so the offset is measurable rather than assumed, and every
+     age below is corrected by it. */
+  const noteServerClock = useCallback((serverIso) => {
+    if (!serverIso) return;
+    const server = new Date(serverIso).getTime();
+    if (Number.isNaN(server)) return;
+    setSkewMs((previous) => {
+      const observed = Date.now() - server;
+      /* Ignore sub-second wobble; it is network jitter, not clock drift. */
+      return Math.abs(observed - previous) > 1000 ? observed : previous;
+    });
+  }, []);
 
   const poll = useCallback(async () => {
     try {
@@ -57,13 +104,12 @@ function useLiveSignal() {
         getJSON("/market/price").catch(() => null),
       ]);
       setSignal(sig);
-      if (status) setMarket(status);
-      if (tick) setPrice(tick);
-      setUpdated(new Date());
+      if (status) { setMarket(status); noteServerClock(status.server_time); }
+      if (tick && tick.price !== null && tick.price !== undefined) setPrice(tick);
     } catch {
       /* leave the last good signal on screen rather than blanking it */
     }
-  }, []);
+  }, [noteServerClock]);
 
   const startPolling = useCallback(() => {
     if (pollTimer.current) return;
@@ -101,18 +147,23 @@ function useLiveSignal() {
       } catch {
         return;
       }
-      if (msg.market) setMarket(msg.market);
+      if (msg.market) {
+        setMarket(msg.market);
+        noteServerClock(msg.market.server_time);
+      }
       // Prices arrive every few seconds, signals every few minutes. Handled
       // separately so a price tick does not redraw the whole analysis.
-      if (msg.price) {
+      //
+      // Note what is deliberately absent: a heartbeat does not touch the
+      // price. It used to refresh a shared "last updated" clock, so a dead
+      // ticker still read as "3s ago" — the socket was alive, so the screen
+      // claimed the data was too. Age now comes from the price's own
+      // source timestamp, and nothing but a new price can make it younger.
+      if (msg.price && msg.price.price !== null && msg.price.price !== undefined) {
         setPrice(msg.price);
-        setUpdated(new Date());
+        noteServerClock(msg.price.at);
       }
-      if (msg.signal) {
-        setSignal(msg.signal);
-        setUpdated(new Date());
-      }
-      if (msg.type === "heartbeat") setUpdated(new Date());
+      if (msg.signal) setSignal(msg.signal);
     };
 
     ws.onclose = () => {
@@ -126,7 +177,7 @@ function useLiveSignal() {
     };
 
     ws.onerror = () => ws.close();
-  }, [startPolling, stopPolling]);
+  }, [startPolling, stopPolling, noteServerClock]);
 
   useEffect(() => {
     closed.current = false;
@@ -138,7 +189,7 @@ function useLiveSignal() {
     };
   }, [connect, stopPolling]);
 
-  return { signal, price, market, link, updated, refresh: poll };
+  return { signal, price, market, link, skewMs, refresh: poll };
 }
 
 /* The live price. Separate from the signal on purpose: the price moves
@@ -203,49 +254,162 @@ function Ticker({ price, marketOpen }) {
       )}
       <span className="ticker-note">
         {marketOpen
-          ? `${price.symbol} · polled, a few seconds behind`
+          ? `${price.symbol} · polled from ${price.source ?? "source"}`
           : `${price.symbol} · last traded before close`}
       </span>
     </div>
   );
 }
 
-function Ledger({ checks }) {
-  const widest = Math.max(...checks.map((c) => Math.abs(c.contribution)), 0.01);
-  const ordered = [...checks].sort(
-    (a, b) => Math.abs(b.contribution) - Math.abs(a.contribution)
+/* How far behind the market the number above actually is.
+
+   Separate from the signal's timestamp on purpose. The price and the
+   analysis are two different clocks, and the dashboard used to imply they
+   were one: a five-minute-old signal sat beside a live price under a single
+   "updated" label, so whichever was staler was the one you could not see. */
+function DataAge({ seconds, price }) {
+  const state = classifyAge(seconds);
+  if (!price) {
+    return (
+      <p className="data-age age-unknown">
+        <i className="dot" />Waiting for the first price
+      </p>
+    );
+  }
+  return (
+    <p className={`data-age age-${state}`}>
+      <i className="dot" />
+      <span className="data-age-label">{AGE_LABEL[state]}</span>
+      <span className="data-age-value">{formatAge(seconds)}</span>
+      {state === "unknown" && (
+        <span className="data-age-note">source gave no timestamp</span>
+      )}
+    </p>
   );
+}
+
+function Ledger({ checks, context, confidence, action }) {
+  const live = checks.filter((c) => !c.disabled);
+
+  // Bars are scaled against the largest *weight*, not the largest observed
+  // contribution. Scaling to the observed maximum made a bar's length mean
+  // something different on every refresh — a 0.05 nudge filled the row on a
+  // quiet reading and looked identical to a maxed-out 0.22. Against a fixed
+  // ceiling, length means the same thing today as it did yesterday.
+  const ceiling = Math.max(...checks.map((c) => c.weight ?? 0), 0.01);
+
+  const ordered = [...checks].sort((a, b) => {
+    if (a.disabled !== b.disabled) return a.disabled ? 1 : -1;
+    return Math.abs(b.contribution) - Math.abs(a.contribution);
+  });
+
+  // The same arithmetic the engine does, shown rather than asserted. A
+  // disabled check contributes nothing and its weight is shared out, which
+  // is why the sum is rescaled instead of simply averaged.
+  const sum = live.reduce((total, c) => total + c.contribution, 0);
+  const scale = context?.weight_scale ?? 1;
+  const liveWeight = scale ? 1 / scale : 1;
+  const net = sum * scale;
+  const threshold = context?.threshold_used;
+  const disabled = checks.filter((c) => c.disabled);
+
+  const signed = (v) => `${v > 0 ? "+" : v < 0 ? "\u2212" : " "}${Math.abs(v).toFixed(3)}`;
 
   return (
     <section className="ledger">
-      <p className="eyebrow">Why this call</p>
+      <div className="ledger-head">
+        <p className="eyebrow">Why this call</p>
+        <p className="ledger-head-net">
+          <span className="dim">net</span> {signed(net)}
+          <span className="dim"> → </span>
+          {Math.round(Math.min(Math.abs(net), 1) * 100)}% confidence
+        </p>
+      </div>
+
+      <div className="ledger-legend">
+        <span><i className="swatch cap" /> weight available</span>
+        <span><i className="swatch neg" /> bearish pull</span>
+        <span><i className="swatch pos" /> bullish pull</span>
+      </div>
+
       <div className="ledger-rail">
         {ordered.map((c) => {
-          const pct = (Math.abs(c.contribution) / widest) * 48;
-          const cls = c.disabled ? "zero"
-            : c.contribution > 0 ? "pos"
-            : c.contribution < 0 ? "neg" : "zero";
+          const weight = c.weight ?? 0;
+          const capHalf = (weight / ceiling) * 50;
+          const fill = (Math.abs(c.contribution) / ceiling) * 50;
+          const dir = c.contribution > 0 ? "pos" : c.contribution < 0 ? "neg" : "flat";
           return (
-            <div className="ledger-row" key={c.name}>
-              <div className={`ledger-name${c.disabled ? " muted" : ""}`}>
-                {c.name.replace(/_/g, " ")}
+            <div className={`ledger-row${c.disabled ? " is-off" : ""}`} key={c.name}>
+              <div className="ledger-name">{c.name.replace(/_/g, " ")}</div>
+
+              <div className="ledger-nums">
+                <span className={`ledger-contrib ${dir}`}>
+                  {c.disabled ? "\u2014\u2014\u2014\u2014" : signed(c.contribution)}
+                </span>
+                <span className="ledger-weight">of {weight.toFixed(2)}</span>
               </div>
-              <div className="ledger-bar-track">
-                <div
-                  className={`ledger-bar ${cls}`}
-                  style={cls === "zero" ? undefined : { width: `${pct}%` }}
+
+              <div className="ledger-plot">
+                <span className="ledger-zero" />
+                <span
+                  className="ledger-cap"
+                  style={{ left: `${50 - capHalf}%`, width: `${capHalf * 2}%` }}
                 />
+                {!c.disabled && dir !== "flat" && (
+                  <span
+                    className={`ledger-bar ${dir}`}
+                    style={dir === "pos"
+                      ? { left: "50%", width: `${fill}%` }
+                      : { right: "50%", width: `${fill}%` }}
+                  />
+                )}
               </div>
-              <p className={`ledger-reason${c.disabled ? " muted" : ""}`}>
-                {c.reason}
-              </p>
+
+              <p className="ledger-reason">{c.reason}</p>
             </div>
           );
         })}
       </div>
-      <div className="ledger-scale">
-        <span>bearish pull</span><span>neutral</span><span>bullish pull</span>
+
+      <div className="ledger-axis">
+        <span />
+        <span />
+        <span className="ledger-axis-scale">
+          <span>−{ceiling.toFixed(2)}</span>
+          <span>0</span>
+          <span>+{ceiling.toFixed(2)}</span>
+        </span>
       </div>
+
+      <dl className="ledger-maths">
+        <div><dt>sum of contributions</dt><dd>{signed(sum)}</dd></div>
+        <div>
+          <dt>
+            ÷ live weight {liveWeight.toFixed(2)}
+            {disabled.length > 0 && (
+              <span className="dim">
+                {" "}· {disabled.map((c) => c.name.replace(/_/g, " ")).join(", ")}
+                {disabled.length === 1 ? " is" : " are"} unavailable, weight shared out
+              </span>
+            )}
+          </dt>
+          <dd>× {scale.toFixed(3)}</dd>
+        </div>
+        <div className="ledger-maths-total">
+          <dt>= net</dt>
+          <dd>{signed(net)}</dd>
+        </div>
+        {threshold !== undefined && threshold !== null && (
+          <div>
+            <dt>
+              {Math.abs(net) >= threshold
+                ? `above the ${Math.round(threshold * 100)}% threshold`
+                : `below the ${Math.round(threshold * 100)}% threshold`}
+            </dt>
+            <dd>{action ?? ""}</dd>
+          </div>
+        )}
+      </dl>
     </section>
   );
 }
@@ -356,17 +520,33 @@ function ContextPanel({ context }) {
 }
 
 export default function App() {
-  const { signal, price, market, link, updated, refresh } = useLiveSignal();
+  const { signal, price, market, link, skewMs, refresh } = useLiveSignal();
   const { candles, chain } = useMarketData();
-  const [clock, setClock] = useState(new Date());
+  const [clock, setClock] = useState(() => Date.now());
 
+  /* Drives the age counter. It ticks on its own so a price that stops
+     arriving visibly gets older, instead of freezing at whatever it said
+     when the last frame landed. */
   useEffect(() => {
-    const id = setInterval(() => setClock(new Date()), 1000);
+    const id = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
   const marketOpen = market?.open ?? false;
-  const ago = updated ? Math.round((clock - updated) / 1000) : null;
+
+  /* Age of the price on screen, in seconds, measured between absolute
+     instants and corrected for this browser's clock offset. Never derived
+     from the rendered HH:MM string — that would fold in the timezone
+     conversion and quietly report a 5.5-hour error as fresh data. */
+  const priceAge = price?.source_time
+    ? (clock - skewMs - new Date(price.source_time).getTime()) / 1000
+    : null;
+
+  const signalTime = signal?.timestamp
+    ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
+        hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
+      })
+    : "—";
 
   return (
     <div className="shell">
@@ -379,48 +559,63 @@ export default function App() {
           <span className={`pill link-${link}`}>
             <i className="dot" />{link}
           </span>
-          <span>{ago === null ? "waiting" : `${ago}s ago`}</span>
+          <span className={`pill age-${classifyAge(priceAge)}`}>
+            {price ? formatAge(priceAge) : "waiting"}
+          </span>
+          {/* The desk updates itself; this is here for a forced re-read,
+              not because anything requires clicking it. */}
           <button onClick={refresh}>refresh</button>
         </div>
       </header>
+
+      {/* The tape renders whether or not a signal exists yet. The price is
+          live market data and the signal is a five-minute decision; gating
+          the former on the latter meant a working feed showed nothing at
+          all until the agent's first tick. */}
+      <section className="tape">
+        <div className="tape-price">
+          <p className="eyebrow">Current price</p>
+          <Ticker price={price} marketOpen={marketOpen} />
+          <DataAge seconds={priceAge} price={price} />
+        </div>
+        {signal ? (
+          <div className={`tape-verdict ${signal.action}`}>
+            <div className={`action ${signal.action}`}>{signal.action}</div>
+            <div className="confidence-label">
+              {Math.round(signal.confidence * 100)}% confidence
+            </div>
+          </div>
+        ) : (
+          <div className="tape-verdict">
+            <div className="action">—</div>
+            <div className="confidence-label">awaiting first signal</div>
+          </div>
+        )}
+        <div className="tape-stats">
+          <div><span className="stat-label">VWAP</span>
+            <span className="stat-value">{num(signal?.context?.vwap)}</span></div>
+          <div><span className="stat-label">ATR 14</span>
+            <span className="stat-value">{num(signal?.context?.atr14)}</span></div>
+          <div><span className="stat-label">Trend</span>
+            <span className="stat-value">{signal?.context?.trend ?? "—"}</span></div>
+          {/* The decision time, which is not the price time. A signal taken
+              at 10:20 stays stamped 10:20 while the price above keeps
+              moving — that gap is real and the desk should show it. */}
+          <div><span className="stat-label">Last signal</span>
+            <span className="stat-value">{signalTime}</span></div>
+        </div>
+      </section>
 
       {!signal && (
         <p className="notice">
           Waiting for the first signal. The agent publishes one every five
           minutes — if this does not clear, check that the backend is running.
+          The price above updates independently and is already live.
         </p>
       )}
 
       {signal && (
         <>
-          <section className="tape">
-            <div className="tape-price">
-              <Ticker price={price} marketOpen={marketOpen} />
-            </div>
-            <div className={`tape-verdict ${signal.action}`}>
-              <div className={`action ${signal.action}`}>{signal.action}</div>
-              <div className="confidence-label">
-                {Math.round(signal.confidence * 100)}% confidence
-              </div>
-            </div>
-            <div className="tape-stats">
-              <div><span className="stat-label">VWAP</span>
-                <span className="stat-value">{num(signal.context?.vwap)}</span></div>
-              <div><span className="stat-label">ATR 14</span>
-                <span className="stat-value">{num(signal.context?.atr14)}</span></div>
-              <div><span className="stat-label">Trend</span>
-                <span className="stat-value">{signal.context?.trend ?? "—"}</span></div>
-              <div><span className="stat-label">Signal at</span>
-                <span className="stat-value">
-                  {signal.timestamp
-                    ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
-                        hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
-                      })
-                    : "—"}
-                </span></div>
-            </div>
-          </section>
-
           <div className="desk">
             <Suspense fallback={<ChartFallback label="Price · VWAP" />}>
               <PriceChart candles={candles} signal={signal} />
@@ -428,7 +623,12 @@ export default function App() {
             <PlanPanel signal={signal} marketOpen={marketOpen} />
           </div>
 
-          <Ledger checks={signal.checks || []} />
+          <Ledger
+            checks={signal.checks || []}
+            context={signal.context}
+            confidence={signal.confidence}
+            action={signal.action}
+          />
 
           <div className="desk">
             <Suspense fallback={<ChartFallback label="Open interest" />}>

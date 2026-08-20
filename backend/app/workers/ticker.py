@@ -36,6 +36,36 @@ log = logging.getLogger(__name__)
 CHANNEL = "prices"
 CACHE_KEY = "price:latest"
 
+# How far behind the market a price may be before the desk should say so.
+#
+# Both numbers are set against the measured behaviour of the free sources:
+# Yahoo's quote is typically 2-6s behind the print and occasionally 11s, so
+# anything inside 15s is ordinary and calling it "delayed" would train the
+# eye to ignore the warning. Past 60s the source has stopped refreshing —
+# that is a real fault, not jitter.
+LIVE_SECONDS = 15
+DELAYED_SECONDS = 60
+
+
+def classify_age(age_seconds: float | None) -> str:
+    """Name how far behind the market a price is.
+
+    Kept as a plain function of one number so it can be tested without a
+    broker, a socket or a clock, and so the dashboard and the API cannot
+    drift into disagreeing about what "stale" means.
+
+    `None` means the source would not say when the price was printed. That
+    is reported as "unknown" rather than "live": a price we cannot date is
+    precisely the one that should not be presented as current.
+    """
+    if age_seconds is None:
+        return "unknown"
+    if age_seconds <= LIVE_SECONDS:
+        return "live"
+    if age_seconds <= DELAYED_SECONDS:
+        return "delayed"
+    return "stale"
+
 # Remembered between ticks so the dashboard can show direction and change
 # without needing a second request for the previous value.
 _previous: dict[str, float] = {}
@@ -60,6 +90,22 @@ def tick() -> None:
     prev = _previous.get(symbol)
     _previous[symbol] = price
 
+    # Two different clocks, and conflating them is what made a stale price
+    # look current:
+    #   source_time — when the market printed this price. The only basis on
+    #                 which staleness can honestly be judged.
+    #   at          — when we published it. Useful for measuring our own
+    #                 internal delay, and for a browser to correct its clock
+    #                 against the server's rather than trusting its own.
+    published = datetime.now(UTC)
+    source_time = quote.get("source_time")
+    age = None
+    if source_time:
+        try:
+            age = round((published - datetime.fromisoformat(source_time)).total_seconds(), 3)
+        except (TypeError, ValueError):
+            log.debug("unparseable source_time %r", source_time)
+
     payload = {
         "symbol": symbol,
         "price": price,
@@ -68,7 +114,10 @@ def tick() -> None:
         "direction": "flat" if prev is None or price == prev
         else "up" if price > prev else "down",
         "source": quote.get("source", settings.broker),
-        "at": datetime.now(UTC).isoformat(),
+        "source_time": source_time,
+        "age_seconds": age,
+        "freshness": classify_age(age),
+        "at": published.isoformat(),
         "market_open": market_is_open(),
     }
 

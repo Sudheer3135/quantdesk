@@ -61,7 +61,8 @@ def test_a_complete_archive_is_clean(db):
 
     report = quality.report(db, include_options=False)
     assert report["errors"] == 0
-    assert report["verdict"] in {"clean", "usable with caveats"}
+    assert report["index"]["verdict"] in {"clean", "usable with caveats"}
+    assert report["index"]["backtest_eligible"] is True
 
 
 def test_a_missing_trading_day_is_an_error(db):
@@ -128,7 +129,7 @@ def test_a_high_below_the_low_is_an_error(db):
 
     found = findings(quality.report(db, include_options=False), "impossible_prices")
     assert found and found[0]["severity"] == "error"
-    assert quality.report(db, include_options=False)["verdict"] == "unusable"
+    assert quality.report(db, include_options=False)["index"]["verdict"] == "unusable"
 
 
 def test_a_close_outside_the_range_is_an_error(db):
@@ -261,44 +262,56 @@ def test_an_absurd_stored_iv_is_an_error(db):
     assert found and found[0]["severity"] == "error"
 
 
-def test_negative_open_interest_is_an_error(db):
+def test_negative_open_interest_is_an_anomaly(db):
+    """Impossible whatever the volume, and caught even on a contract with
+    almost no history behind it."""
     import_option_snapshot(db, chain(), underlying="NIFTY", expiry="18-Jun-2026",
                            spot=24_450.0, source="free", captured_at=MOMENT)
-    bar = db.scalars(select(OptionCandle)).first()
+    import_option_snapshot(db, chain(), underlying="NIFTY", expiry="18-Jun-2026",
+                           spot=24_450.0, source="free",
+                           captured_at=MOMENT + timedelta(minutes=6))
+    bar = db.scalars(select(OptionCandle).order_by(OptionCandle.timestamp.desc())).first()
     bar.open_interest = -5.0
     db.commit()
 
-    found = findings(quality.report(db), "negative_open_interest")
-    assert found and found[0]["severity"] == "error"
+    found = findings(quality.report(db), "oi_anomaly")
+    assert found, "negative open interest must be reported"
+    assert found[0]["severity"] == "warning"
+    assert any("negative" in s["reason"] for s in found[0]["samples"])
 
 
-def test_oi_dropping_to_zero_mid_session_is_an_error(db):
-    """Open interest accumulates and decays; it does not vanish at noon.
-    A reset means a dropped capture, not a market event."""
-    for step in range(4):
+def test_oi_collapsing_without_the_volume_to_explain_it_is_an_anomaly(db):
+    """Open interest accumulates and decays; it does not vanish at noon on
+    almost no trading. Volume is grown realistically across the snapshots so
+    the interval volume is a real number rather than a fixture artifact —
+    it simply is not large enough to account for the collapse."""
+    for step in range(6):
         import_option_snapshot(
-            db, chain(), underlying="NIFTY", expiry="18-Jun-2026", spot=24_450.0,
-            source="free", captured_at=MOMENT + timedelta(minutes=6 * step))
+            db, chain(volume=400_000.0 + step * 500), underlying="NIFTY",
+            expiry="18-Jun-2026", spot=24_450.0, source="free",
+            captured_at=MOMENT + timedelta(minutes=6 * step))
 
     contract = db.scalars(select(OptionContract)).first()
     bars = db.scalars(
         select(OptionCandle)
         .where(OptionCandle.contract_id == contract.id)
         .order_by(OptionCandle.timestamp)).all()
-    bars[2].open_interest = 0.0
+    bars[3].open_interest = 0.0
     db.commit()
 
-    found = findings(quality.report(db), "oi_reset_mid_session")
-    assert found and found[0]["severity"] == "error"
+    found = findings(quality.report(db), "oi_anomaly")
+    assert found, "a collapse unsupported by volume must be reported"
+    assert found[0]["severity"] == "warning"
 
 
-def test_expiry_day_oi_collapse_is_not_flagged(db):
-    """OI genuinely goes to nothing when a contract expires. Flagging that
-    would be flagging the calendar."""
+def test_expiry_day_oi_collapse_backed_by_volume_is_not_an_anomaly(db):
+    """OI genuinely goes to nothing when a contract expires, and that
+    unwinding is accompanied by heavy trading. Flagging it would be
+    flagging the calendar."""
     expiry_day = MOMENT.date()
-    for step in range(4):
+    for step in range(6):
         import_option_snapshot(
-            db, chain(), underlying="NIFTY",
+            db, chain(volume=400_000.0 + step * 900_000), underlying="NIFTY",
             expiry=expiry_day.strftime("%d-%b-%Y"), spot=24_450.0,
             source="free", captured_at=MOMENT + timedelta(minutes=6 * step))
 
@@ -307,10 +320,40 @@ def test_expiry_day_oi_collapse_is_not_flagged(db):
         select(OptionCandle)
         .where(OptionCandle.contract_id == contract.id)
         .order_by(OptionCandle.timestamp)).all()
-    bars[2].open_interest = 0.0
+    bars[3].open_interest = 0.0
     db.commit()
 
-    assert not findings(quality.report(db), "oi_reset_mid_session")
+    anomalies = findings(quality.report(db), "oi_anomaly")
+    reasons = " ".join(s["reason"] for f in anomalies for s in f["samples"])
+    assert "zero mid-session" not in reasons
+
+
+def test_high_volume_oi_moves_are_reported_as_activity_not_problems(db):
+    """The 229 false warnings this redesign exists to remove. Large OI
+    moves matched by large volume are the market working."""
+    for step in range(6):
+        import_option_snapshot(
+            db, chain(oi=900_000.0 - step * 60_000, volume=400_000.0 + step * 900_000),
+            underlying="NIFTY", expiry="18-Jun-2026", spot=24_450.0,
+            source="free", captured_at=MOMENT + timedelta(minutes=6 * step))
+
+    report = quality.report(db)
+    assert not findings(report, "oi_anomaly"), "supported moves must not be anomalies"
+
+
+def test_the_oi_diagnostic_never_marks_the_dataset_unusable(db):
+    """Explicit requirement: this check is informational. A busy expiry day
+    must never gate a backtest."""
+    for step in range(6):
+        import_option_snapshot(
+            db, chain(oi=900_000.0 - step * 200_000, volume=400_000.0 + step * 100),
+            underlying="NIFTY", expiry="18-Jun-2026", spot=24_450.0,
+            source="free", captured_at=MOMENT + timedelta(minutes=6 * step))
+
+    report = quality.report(db)
+    oi_findings = [f for f in report["findings"] if f["check"].startswith("oi_")]
+    assert oi_findings, "test premise: expected some OI findings"
+    assert all(f["severity"] != "error" for f in oi_findings)
 
 
 # ---- the report -------------------------------------------------------
@@ -327,10 +370,10 @@ def test_findings_are_ordered_worst_first(db):
 
 def test_the_verdict_reflects_the_worst_finding(db):
     full_session(db, date(2026, 6, 16), real_volume=False)
-    assert quality.report(db, include_options=False)["verdict"] == "usable with caveats"
+    assert quality.report(db, include_options=False)["index"]["verdict"] == "usable with caveats"
 
     raw_candle(db, date(2026, 6, 17), high=1.0, low=99_999.0)
-    assert quality.report(db, include_options=False)["verdict"] == "unusable"
+    assert quality.report(db, include_options=False)["index"]["verdict"] == "unusable"
 
 
 def test_an_empty_database_does_not_crash_any_diagnostic(db):

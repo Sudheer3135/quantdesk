@@ -6,7 +6,7 @@ the default, on purpose.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -74,7 +74,15 @@ class MockBroker(Broker):
         })
 
     def quote(self, symbol: str = "NIFTY") -> dict:
-        return {"last_price": float(self.candles(symbol).iloc[-1]["close"])}
+        last = self.candles(symbol).iloc[-1]
+        return {
+            "last_price": float(last["close"]),
+            "source": "mock",
+            # Simulated data is generated as of now, so it is honestly
+            # current. Reporting it keeps every broker's quote the same
+            # shape, so the ticker never has to special-case one of them.
+            "source_time": datetime.now(UTC).isoformat(),
+        }
 
     def option_chain(self, symbol: str = "NIFTY", expiry: str | None = None) -> pd.DataFrame:
         spot = self.quote(symbol)["last_price"]

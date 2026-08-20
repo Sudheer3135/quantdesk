@@ -45,9 +45,19 @@ HOLIDAYS: dict[int, frozenset[date]] = {
         date(2025, 10, 2), date(2025, 10, 21), date(2025, 10, 22),
         date(2025, 11, 5), date(2025, 12, 25),
     }),
+    # Entries carrying a "verified" note were checked line-by-line against
+    # the NSE F&O trading-holiday circular on the date given. The rest are
+    # transcribed and still listed in PROVISIONAL_YEARS below.
     2026: frozenset({
         date(2026, 1, 26), date(2026, 3, 4), date(2026, 3, 26),
         date(2026, 4, 3), date(2026, 4, 14), date(2026, 5, 1),
+        # Verified against the NSE F&O 2026 circular on 17-Aug-2026.
+        # Both were absent from this list, so the archive reported two
+        # clean sessions as an outage and the whole dataset as unusable —
+        # a missing holiday and a missing day of data are indistinguishable
+        # from the data alone.
+        date(2026, 5, 28),      # Bakri Id       — verified 17-Aug-2026
+        date(2026, 6, 26),      # Muharram       — verified 17-Aug-2026
         date(2026, 8, 15), date(2026, 10, 2), date(2026, 11, 10),
         date(2026, 12, 25),
     }),
@@ -56,7 +66,15 @@ HOLIDAYS: dict[int, frozenset[date]] = {
 # Years transcribed but not yet checked line-by-line against the NSE
 # circular. Findings derived from these carry a caveat rather than being
 # presented as fact. Removing a year from this set is an assertion that
-# somebody actually verified it.
+# somebody actually verified it, in full — not that some of its dates were
+# confirmed.
+#
+# 2026 stays here on purpose. Two of its entries (28-May and 26-Jun) were
+# confirmed against the circular on 17-Aug-2026; the remaining eight were
+# not, and a year is only as trustworthy as its least-checked date. The
+# caveat costs one info-level finding and nothing else: `is_holiday` still
+# answers True or False for 2026, so a genuinely missing session is still
+# reported as an error rather than excused.
 PROVISIONAL_YEARS: frozenset[int] = frozenset({2026})
 
 VERIFIED_THROUGH = date(2025, 12, 31)

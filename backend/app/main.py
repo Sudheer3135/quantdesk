@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api import backtest, data, health, journal, market, signals, stream
 from .config import get_settings
 from .db import init_db
-from .workers import agent, ticker
+from .workers import agent, option_collector, ticker
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
@@ -39,9 +39,13 @@ def on_startup():
     global _scheduler
     init_db()
     _scheduler = agent.start()
-    # Share one scheduler: the agent runs every few minutes, the price
-    # ticker every few seconds.
+    # Share one scheduler. Three jobs, three different reasons:
+    #   agent            — every few minutes, the strategy's timeframe
+    #   ticker           — every few seconds, so the tape looks alive
+    #   option_collector — faster than the bar width, so option bars have a
+    #                      range instead of a single sampled price
     ticker.start(_scheduler)
+    option_collector.start(_scheduler)
 
 
 @app.on_event("shutdown")

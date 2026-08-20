@@ -7,16 +7,26 @@ from ..config import get_settings
 from ..data import importer, repository
 from ..db import get_db
 from ..deps import get_broker
+from .serialization import jsonable_records
 
 router = APIRouter(prefix="/market", tags=["market"])
 
 
 @router.get("/candles")
 def candles(symbol: str = "NIFTY", interval: str = "5m", days: int = Query(5, ge=1, le=60)):
+    """Enriched candles.
+
+    Indicator columns are null wherever the reading is unavailable — most
+    often `rvol`, which is NaN for the whole series when the source
+    publishes no volume. Null is the honest answer: substituting a neutral
+    number would be indistinguishable from a real neutral reading.
+    """
     df = indicators.enrich(get_broker().candles(symbol, interval, days))
-    df = df.tail(500).copy()
-    df["timestamp"] = df["timestamp"].astype(str)
-    return {"symbol": symbol, "interval": interval, "candles": df.to_dict(orient="records")}
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "candles": jsonable_records(df.tail(500)),
+    }
 
 
 @router.get("/structure")
@@ -52,7 +62,10 @@ def option_chain(symbol: str = "NIFTY", expiry: str | None = None):
     payload = {
         "symbol": symbol,
         "summary": options.summarise(chain, spot).to_dict(),
-        "strikes": chain.to_dict(orient="records"),
+        # Same guard as the candle endpoint. NSE returns no IV for untraded
+        # strikes, and a chain wide enough to include them would otherwise
+        # 500 on the same NaN.
+        "strikes": jsonable_records(chain),
     }
     set_json(f"chain:{symbol}:{expiry}", payload, ttl=45)
     return payload

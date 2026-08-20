@@ -64,43 +64,136 @@ body {
 .stat-value { font-size: 17px; font-weight: 500; }
 
 /* ---- the ledger: the signature element ---- */
+/*
+ * The zero line used to be drawn at 50% of the rail, which included the
+ * 132px name column, while the bars pivoted at 50% of their own track.
+ * The two axes were about 70px apart, so a purely bearish check rendered a
+ * bar that visibly crossed into bullish territory. Every row was readable
+ * and every row was wrong.
+ *
+ * Now the plot is one grid column and the zero line lives inside it, so the
+ * line, the bars and the axis labels cannot drift apart — they share a box.
+ */
 .ledger { margin-top: 30px; }
-.ledger-rail {
-  position: relative; border-left: 1px solid var(--ink-line);
-  border-right: 1px solid var(--ink-line);
+
+.ledger-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 16px; margin-bottom: 10px;
 }
-.ledger-rail::before {
-  content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
-  width: 1px; background: var(--ink-line);
+.ledger-head-net { margin: 0; font-size: 12px; color: var(--paper); }
+.ledger-head-net .dim { color: var(--muted); }
+
+.ledger-legend {
+  display: flex; gap: 18px; padding: 0 0 10px 2px;
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted);
+}
+.ledger-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 14px; height: 6px; border-radius: 1px; }
+.swatch.cap { background: var(--ink-line); }
+.swatch.pos { background: var(--bull); }
+.swatch.neg { background: var(--bear); }
+
+.ledger-rail { border-top: 1px solid var(--ink-line); }
+
+/* One shared grid for every row and for the axis beneath them. */
+.ledger-row,
+.ledger-axis {
+  display: grid;
+  grid-template-columns: 116px 104px 1fr;
+  gap: 14px; align-items: center;
 }
 .ledger-row {
-  display: grid; grid-template-columns: 132px 1fr;
-  gap: 14px; align-items: center; padding: 9px 0;
+  padding: 10px 0 11px;
   border-bottom: 1px solid var(--ink-line);
 }
-.ledger-row:last-child { border-bottom: none; }
-.ledger-name { font-size: 12px; color: var(--muted); padding-left: 12px; }
-.ledger-bar-track {
-  position: relative; height: 20px;
-  display: flex; align-items: center;
+.ledger-name {
+  font-size: 12px; color: var(--paper); opacity: 0.85;
+}
+
+.ledger-nums {
+  display: flex; flex-direction: column; gap: 1px;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.ledger-contrib { letter-spacing: 0.02em; }
+.ledger-contrib.pos { color: var(--bull); }
+.ledger-contrib.neg { color: var(--bear); }
+.ledger-contrib.flat { color: var(--muted); }
+.ledger-weight { color: var(--muted); font-size: 10px; }
+
+/* The plot. Half the width represents the largest weight in the set, so a
+ * full-length bar means a check exerted the most influence any single check
+ * could. */
+.ledger-plot { position: relative; height: 16px; }
+.ledger-zero {
+  position: absolute; left: 50%; top: -10px; bottom: -11px;
+  width: 1px; background: var(--ink-line);
+}
+.ledger-cap {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  height: 3px; border-radius: 1px;
+  background: var(--ink-line);
 }
 .ledger-bar {
-  position: absolute; height: 8px; border-radius: 1px;
+  position: absolute; top: 50%; transform: translateY(-50%);
+  height: 9px; border-radius: 1px;
   transition: width 240ms ease;
 }
-.ledger-bar.pos { left: 50%; background: var(--bull); }
-.ledger-bar.neg { right: 50%; background: var(--bear); }
-.ledger-bar.zero { left: calc(50% - 2px); width: 4px; background: var(--ink-line); }
+.ledger-bar.pos { background: var(--bull); }
+.ledger-bar.neg { background: var(--bear); }
 
 .ledger-reason {
-  grid-column: 2; font-size: 12px; color: var(--paper);
-  opacity: 0.72; padding: 0 0 2px 0; line-height: 1.5;
+  grid-column: 3; margin: 6px 0 0;
+  font-size: 12px; color: var(--paper); opacity: 0.68; line-height: 1.5;
 }
-.ledger-scale {
+
+.ledger-row.is-off .ledger-name,
+.ledger-row.is-off .ledger-reason { opacity: 0.38; }
+.ledger-row.is-off .ledger-cap { opacity: 0.4; }
+
+.ledger-axis { padding: 7px 0 0; }
+.ledger-axis-scale {
   display: flex; justify-content: space-between;
-  font-size: 10px; color: var(--muted); letter-spacing: 0.1em;
-  text-transform: uppercase; padding: 6px 12px 0;
+  font-size: 10px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
+
+/* The arithmetic, shown rather than asserted: these rows are how the bars
+ * above become the confidence figure in the header. */
+.ledger-maths {
+  margin: 14px 0 0; padding: 12px 14px;
+  border-left: 2px solid var(--ink-line);
+  font-size: 11px; color: var(--muted);
+}
+.ledger-maths > div {
+  display: flex; justify-content: space-between; gap: 16px; padding: 3px 0;
+}
+.ledger-maths dt { margin: 0; }
+.ledger-maths dd { margin: 0; font-variant-numeric: tabular-nums; color: var(--paper); opacity: 0.8; }
+.ledger-maths .dim { color: var(--muted); opacity: 0.75; }
+.ledger-maths-total {
+  border-top: 1px solid var(--ink-line); margin-top: 4px; padding-top: 6px !important;
+}
+.ledger-maths-total dt, .ledger-maths-total dd { color: var(--paper); opacity: 1; }
+
+@media (max-width: 720px) {
+  .ledger-row, .ledger-axis { grid-template-columns: 96px 88px 1fr; gap: 10px; }
+  .ledger-reason { grid-column: 1 / -1; }
+}
+
+/* ---- chart annotations ---- */
+/* The colour and fade grammar on the OI profile encodes something real, and
+   a reader cannot infer it from the picture. Spelling it out costs two lines
+   and removes the impression that the chart renders inconsistently. */
+.chart-legend {
+  margin: 0 0 10px; font-size: 11px; line-height: 1.55;
+  color: var(--muted);
+}
+.chart-caption {
+  margin: 8px 0 0; font-size: 11px; line-height: 1.5;
+  color: var(--muted);
+}
+.chart-caption b { color: var(--paper); font-weight: 500; }
 
 /* ---- panels ---- */
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 30px; }
@@ -205,6 +298,39 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 .ticker-change.up { color: var(--bull); }
 .ticker-change.down { color: var(--bear); }
 .ticker-note { font-size: 12px; color: var(--muted); }
+
+/* ---- data age ----
+
+   Three states, deliberately different in colour and not only in text. A
+   stale price is a fault you should catch out of the corner of your eye,
+   not something you have to read a number to discover. */
+.data-age {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 8px 0 0; font-size: 12px;
+}
+.data-age .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; align-self: center; flex: none;
+}
+.data-age-label { text-transform: uppercase; letter-spacing: 0.08em; }
+.data-age-value { color: var(--muted); }
+.data-age-note { color: var(--muted); font-style: italic; }
+
+.age-live    { color: var(--bull); }
+.age-delayed { color: var(--amber); }
+.age-stale   { color: var(--bear); }
+.age-unknown { color: var(--muted); }
+
+.pill.age-live    { color: var(--bull); border-color: currentColor; }
+.pill.age-delayed { color: var(--amber); border-color: currentColor; }
+.pill.age-stale   { color: var(--bear); border-color: currentColor; }
+.pill.age-unknown { color: var(--muted); }
+
+/* Only the live state pulses. A frozen feed should look frozen. */
+.data-age.age-live .dot { animation: pulse 2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .data-age.age-live .dot { animation: none; }
+}
 
 /* A brief tint on each tick — enough to see the market is alive, short
    enough not to become a strobe on a fast-moving day. */

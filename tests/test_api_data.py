@@ -21,8 +21,11 @@ from app.data.importer import import_index_candles
 from app.db import get_db
 from test_importer import session_bars
 
-# Weekdays in June 2026, avoiding weekends.
-TRADING_DAYS = [16, 17, 18, 19, 22, 23, 24, 25, 26]
+# Real trading sessions in June 2026 — weekdays, and 26-Jun excluded
+# because it is Muharram, a verified NSE holiday. The validation gate
+# rejects candles dated on a holiday, so a fixture that lists one silently
+# stores fewer sessions than it appears to and every count drifts by one.
+TRADING_DAYS = [16, 17, 18, 19, 22, 23, 24, 25]
 
 
 @pytest.fixture
@@ -172,8 +175,15 @@ def test_coverage_on_an_empty_archive_says_what_to_run(client):
 def test_quality_reports_a_verdict(client, db):
     seed(db)
     body = client.get("/data/quality").json()
-    assert body["verdict"] in {"clean", "usable with caveats", "unusable"}
     assert isinstance(body["findings"], list)
+    # Readiness is reported per dataset: index candles and option snapshots
+    # are collected differently, fail differently, and are fit for
+    # different purposes.
+    for domain in ("index", "options"):
+        block = body[domain]
+        assert block["verdict"] in {"clean", "usable with caveats", "unusable"}
+        assert isinstance(block["backtest_eligible"], bool)
+    assert body["verdict"].startswith("index ")
 
 
 def test_an_option_import_without_an_expiry_is_refused(client):

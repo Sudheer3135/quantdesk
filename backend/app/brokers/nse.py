@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -29,6 +30,9 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 BASE = "https://www.nseindia.com"
+
+# NSE stamps its payloads in IST without an offset.
+IST = timezone(timedelta(hours=5, minutes=30))
 
 HEADERS = {
     "User-Agent": (
@@ -259,6 +263,30 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
         spot = float(chain.loc[diff.idxmin(), "strike"])
 
     return chain, spot
+
+
+def parse_nse_timestamp(raw: str | None) -> str | None:
+    """Turn NSE's `"20-Aug-2026 10:34"` into an absolute UTC instant.
+
+    NSE stamps its payloads in IST with minute resolution and no offset, so
+    the string alone is ambiguous the moment it crosses a timezone. Parsing
+    it here — once, next to the payload it came from — means everything
+    downstream compares absolute instants instead of re-deriving a timezone
+    from a display string.
+
+    Minute resolution is the honest limit: a price stamped 10:34 was printed
+    somewhere in that minute, so an age derived from it can be up to 60s
+    optimistic. That is a reason to prefer a source with a finer timestamp,
+    not a reason to invent precision here.
+    """
+    if not raw:
+        return None
+    try:
+        naive = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M")
+    except (ValueError, TypeError):
+        log.debug("could not parse NSE timestamp %r", raw)
+        return None
+    return naive.replace(tzinfo=IST).astimezone(UTC).isoformat()
 
 
 def parse_index_value(payload: dict, name: str) -> float | None:
