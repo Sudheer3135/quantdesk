@@ -20,7 +20,7 @@ endpoint was already right and stayed right.
 import ast
 import json
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import pytest
@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from app.analytics.signal_engine import Signal
 from app.api import signals as signals_api
 from app.config import get_settings
+from app.data import repository
 from app.db import get_db
 from app.market_hours import IST, trading_date
 from app.models import TradeRecord
@@ -92,11 +93,28 @@ def a_hold():
     )
 
 
-def closed_trade(pnl, minutes_ago=30):
+def closed_trade(pnl, order=0):
+    """A trade closed earlier on today's IST trading day.
+
+    Anchored to IST midnight of the current trading date, not to
+    `now - N minutes`. The daily limits count by IST *trading date*, so a
+    relative offset silently lands on yesterday whenever the suite runs in
+    the first hour of an IST day — and CI does exactly that: its Test step
+    ran at 19:19 UTC, which is 00:49 IST. A loss dated sixty minutes earlier
+    fell onto the previous day, the streak counted one instead of two,
+    nothing tripped, and the assertion failed with `'approved' == 'blocked'`
+    and no hint that the clock was responsible.
+
+    Anchoring forward from midnight keeps every row on today's date at any
+    hour the suite happens to run. `order` only sequences them: the
+    consecutive-loss walk reads closed trades newest-first, so a streak
+    needs distinct, increasing timestamps.
+    """
+    midnight = datetime.combine(trading_date(), time(0, 0), tzinfo=IST)
     return TradeRecord(
         symbol="NIFTY", side="BUY", quantity=75,
         entry=24_200.0, stop_loss=24_190.0, status="closed", pnl=pnl,
-        created_at=datetime.now(UTC) - timedelta(minutes=minutes_ago),
+        created_at=(midnight + timedelta(seconds=order)).astimezone(UTC),
     )
 
 
@@ -133,6 +151,37 @@ def published(db, monkeypatch):
         return sent["payload"]
 
     return run
+
+
+# ---- the helper's own contract -----------------------------------------
+
+def test_seeded_trades_always_land_on_the_day_they_claim(monkeypatch):
+    """Why CI went red on a green suite.
+
+    `closed_trade` used to date rows as `now - N minutes`. Run in the first
+    hour of an IST day — CI's Test step ran at 19:19 UTC, which is 00:49
+    IST — a row sixty minutes back fell onto *yesterday*, vanished from
+    today's journal, and the limit it was there to trip measured against a
+    short count. The suite passed at every hour I happened to run it.
+
+    The date is faked rather than the clock: patching `datetime` globally to
+    reproduce this hangs a suite that contains real sleeps. Anchoring is the
+    property under test, and it is testable directly.
+    """
+    for pretend_today in (date(2026, 8, 22), date(2026, 1, 1), date(2026, 12, 31)):
+        monkeypatch.setitem(globals(), "trading_date", lambda d=pretend_today: d)
+        for order in range(3):
+            row = closed_trade(-100.0, order=order)
+            assert row.created_at.astimezone(IST).date() == pretend_today
+
+
+def test_seeded_trades_are_ordered_so_a_streak_can_be_read():
+    """`day_state_from_trades` walks closed trades newest-first, so rows
+    sharing a timestamp make the streak order undefined."""
+    rows = [closed_trade(-100.0, order=i) for i in range(3)]
+    stamps = [r.created_at for r in rows]
+    assert stamps == sorted(stamps)
+    assert len(set(stamps)) == 3
 
 
 # ---- the regression ---------------------------------------------------
@@ -172,8 +221,9 @@ def test_the_kill_switch_reaches_the_websocket_path(published, monkeypatch):
 
 
 def test_the_daily_trade_cap_reaches_the_websocket_path(db, published):
-    db.add_all([closed_trade(500.0), closed_trade(300.0)])   # cap is 2
-    db.commit()
+    db.add_all([closed_trade(500.0, order=1), closed_trade(300.0, order=2)])
+    db.commit()                                              # cap is 2
+    assert len(repository.todays_trades(db, trading_date())) == 2
 
     risk = published(a_buy())["risk"]
 
@@ -194,9 +244,13 @@ def test_the_open_position_cap_reaches_the_websocket_path(db, published):
 
 
 def test_the_consecutive_loss_rule_reaches_the_websocket_path(db, published):
-    db.add_all([closed_trade(-800.0, minutes_ago=60),
-                closed_trade(-700.0, minutes_ago=30)])
+    db.add_all([closed_trade(-800.0, order=1), closed_trade(-700.0, order=2)])
     db.commit()
+
+    # The premise, asserted before the verdict. Without it a journal that
+    # lost a row to the IST date boundary reports itself as a risk-logic
+    # failure rather than as the clock problem it is.
+    assert len(repository.todays_trades(db, trading_date())) == 2
 
     risk = published(a_buy())["risk"]
 
@@ -212,8 +266,9 @@ def test_the_daily_loss_limit_reaches_the_websocket_path(db, published, monkeypa
     monkeypatch.setenv("MAX_CONSECUTIVE_LOSSES", "10")
     get_settings.cache_clear()
 
-    db.add(closed_trade(-4_000.0))          # limit is 3% of 100,000
+    db.add(closed_trade(-4_000.0, order=1))    # limit is 3% of 100,000
     db.commit()
+    assert len(repository.todays_trades(db, trading_date())) == 1
 
     risk = published(a_buy())["risk"]
 
@@ -288,7 +343,7 @@ def test_ensure_tolerates_no_signal_at_all():
 def test_both_routes_produce_the_same_decision(db, published, monkeypatch):
     """The point of the shared step. Same journal, same signal, same answer —
     so the socket and its fallback cannot tell the desk different things."""
-    db.add_all([closed_trade(-900.0), open_trade()])
+    db.add_all([closed_trade(-900.0, order=1), open_trade()])
     db.commit()
 
     signal = a_buy()
