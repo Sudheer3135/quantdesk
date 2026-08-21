@@ -10,18 +10,20 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from ..brokers.base import UnknownSymbol
 from ..config import get_settings
 from ..data import dataset as dataset_module
 from ..data import importer, quality, repository
 from ..db import get_db
 from ..deps import get_broker
+from ..security import require_api_key
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["data"])
 
 
-@router.post("/import/index")
+@router.post("/import/index", dependencies=[Depends(require_api_key)])
 def import_index(
     symbol: str = "NIFTY",
     timeframe: str = "5m",
@@ -42,6 +44,10 @@ def import_index(
     settings = get_settings()
     try:
         candles = get_broker().candles(symbol, timeframe, days)
+    except UnknownSymbol:
+        # The caller named something we do not carry. Let it reach the 422
+        # handler instead of being relabelled as an upstream failure.
+        raise
     except Exception as exc:
         raise HTTPException(502, f"could not load candles: {exc}") from exc
 
@@ -53,7 +59,7 @@ def import_index(
     }
 
 
-@router.post("/import/options")
+@router.post("/import/options", dependencies=[Depends(require_api_key)])
 def import_options(
     symbol: str = "NIFTY",
     expiry: str | None = None,
@@ -78,6 +84,10 @@ def import_options(
         else:
             chain = broker.option_chain(symbol, expiry)
             spot = broker.quote(symbol)["last_price"]
+    except UnknownSymbol:
+        # The caller named something we do not carry. Let it reach the 422
+        # handler instead of being relabelled as an upstream failure.
+        raise
     except Exception as exc:
         raise HTTPException(502, f"could not load option chain: {exc}") from exc
 

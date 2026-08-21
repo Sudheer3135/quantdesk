@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from ..cache import client as redis_client
+from ..cache import publish
 from ..config import get_settings
 from ..deps import get_broker
 from ..market_hours import is_open as market_is_open
@@ -121,11 +121,9 @@ def tick() -> None:
         "market_open": market_is_open(),
     }
 
-    r = redis_client()
-    if r:
-        blob = json.dumps(payload)
-        r.setex(CACHE_KEY, 120, blob)
-        r.publish(CHANNEL, blob)
+    # Never raises: a Redis outage costs this tick's publish and nothing
+    # more, and the connection heals itself on a later one.
+    publish(CHANNEL, json.dumps(payload), cache_key=CACHE_KEY, ttl=120)
 
 
 def start(scheduler: BackgroundScheduler | None = None) -> BackgroundScheduler:

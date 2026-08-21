@@ -21,7 +21,11 @@ services:
   backend:
     build: ./backend
     env_file: .env
-    ports: ["8000:8000"]
+    # Loopback by default. The API has no authentication on its read
+    # endpoints, so publishing it on every interface put the desk on the
+    # local network for anyone who scanned for it. Set BIND_HOST=0.0.0.0 in
+    # .env to expose it deliberately.
+    ports: ["${BIND_HOST:-127.0.0.1}:8000:8000"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
@@ -38,10 +42,16 @@ services:
 
   frontend:
     build: ./frontend
-    ports: ["5173:5173"]
+    ports: ["${BIND_HOST:-127.0.0.1}:5173:5173"]
     depends_on: [backend]
     environment:
       VITE_API_URL: http://localhost:8000
+      # The live-price socket requires the same key as the write endpoints.
+      # Without this the browser's handshake is rejected, the dashboard
+      # silently falls back to its slow HTTP poll, and the price goes stale
+      # while everything else looks healthy. Empty when no key is set, which
+      # is the correct value for a desk running open on localhost.
+      VITE_API_KEY: ${API_KEY:-}
     volumes:
       - ./frontend/src:/app/src
 

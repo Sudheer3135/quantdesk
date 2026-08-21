@@ -30,6 +30,18 @@ class Settings(BaseSettings):
     min_risk_reward: float = 2.0
     lot_size: int = 75
 
+    # The rest of the risk rulebook. These existed only as RiskConfig
+    # defaults, which meant the README documented a kill switch nobody could
+    # reach without editing code. A limit you cannot configure is a limit you
+    # cannot turn on when you need it most.
+    max_daily_loss_pct: float = 3.0
+    max_consecutive_losses: int = 2
+    max_open_positions: int = 1
+    max_capital_deployed_pct: float = 20.0
+
+    # Blocks every new entry while true. Flip it in .env and restart.
+    kill_switch: bool = False
+
     archive_candles: bool = True
 
     # Capture an option-chain snapshot on every agent tick. This is the only
@@ -79,6 +91,12 @@ class Settings(BaseSettings):
     watch_timeframe: str = "5m"
 
     cors_origins: str = "http://localhost:5173"
+
+    # Shared secret for the endpoints that write to the database. Unset
+    # means the write endpoints are open, which is tolerable on localhost
+    # and a startup failure when ENVIRONMENT=prod. Supply it through the
+    # environment only — a key with a default value is not a key.
+    api_key: str | None = None
 
 
 @lru_cache

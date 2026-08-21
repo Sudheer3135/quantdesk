@@ -38,7 +38,19 @@ def jsonable_records(df: pd.DataFrame) -> list[dict]:
     out = df.copy()
     for column in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[column]):
-            out[column] = out[column].astype(str)
+            # ISO 8601 with the "T" separator, not pandas' `str()` repr.
+            # That repr is space-separated ("2026-08-19 03:45:00+00:00"),
+            # and ECMA-262 only defines `Date.parse` for the ISO form — the
+            # space form is implementation-defined. V8 happens to accept it,
+            # so the browser looked fine while the contract was not, and an
+            # engine that declines it yields `Invalid Date`, whose epoch is
+            # NaN. A chart sorting on NaN does not raise; it silently keeps
+            # whatever order the array arrived in.
+            #
+            # `isoformat()` also keeps the UTC offset, so the full instant
+            # survives the hop and the client can convert it to IST itself.
+            out[column] = out[column].map(
+                lambda ts: ts.isoformat() if pd.notna(ts) else None)
 
     # Replace before the object cast: comparing against inf is only
     # meaningful while the column is still numeric.

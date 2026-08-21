@@ -1,22 +1,58 @@
 """FastAPI application entry point."""
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .api import backtest, data, health, journal, market, signals, stream
+from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
+from .security import verify_startup
 from .workers import agent, option_collector, ticker
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Start the background jobs, then stop them.
+
+    Replaces the `@app.on_event` hooks, which are deprecated and removed in
+    current FastAPI — and therefore blocked the upgrade that carries the
+    Starlette security fixes. The scheduler is a local rather than a module
+    global now, so its lifetime is visibly tied to the application's.
+    """
+    # Before anything else. A production deployment with no key is a
+    # misconfiguration, and one that fails loudly here gets fixed rather
+    # than shipped.
+    verify_startup()
+    init_db()
+
+    # Share one scheduler. Three jobs, three different reasons:
+    #   agent            — every few minutes, the strategy's timeframe
+    #   ticker           — every few seconds, so the tape looks alive
+    #   option_collector — faster than the bar width, so option bars have a
+    #                      range instead of a single sampled price
+    scheduler = agent.start()
+    ticker.start(scheduler)
+    option_collector.start(scheduler)
+
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+
+
 app = FastAPI(
     title=settings.app_name,
     version="0.1.0",
     description="AI-assisted market analysis for NIFTY. Analysis tool, not advice.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -31,27 +67,15 @@ for router in (health.router, market.router, signals.router,
                journal.router, backtest.router, stream.router, data.router):
     app.include_router(router)
 
-_scheduler = None
 
+@app.exception_handler(UnknownSymbol)
+async def unknown_symbol(request: Request, exc: UnknownSymbol) -> JSONResponse:
+    """An unsupported symbol is the caller's mistake, not a server fault.
 
-@app.on_event("startup")
-def on_startup():
-    global _scheduler
-    init_db()
-    _scheduler = agent.start()
-    # Share one scheduler. Three jobs, three different reasons:
-    #   agent            — every few minutes, the strategy's timeframe
-    #   ticker           — every few seconds, so the tape looks alive
-    #   option_collector — faster than the bar width, so option bars have a
-    #                      range instead of a single sampled price
-    ticker.start(_scheduler)
-    option_collector.start(_scheduler)
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    if _scheduler:
-        _scheduler.shutdown(wait=False)
+    Registered centrally so every endpoint taking a `symbol` answers the
+    same way, and so adding one later cannot forget to.
+    """
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.get("/")

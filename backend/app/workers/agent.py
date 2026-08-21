@@ -14,13 +14,14 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from ..api.signals import build_signal
-from ..cache import client as redis_client
+from ..cache import publish
 from ..config import get_settings
 from ..data import importer
 from ..db import SessionLocal
 from ..deps import get_broker
 from ..market_hours import is_open as market_is_open
 from ..models import SignalRecord
+from ..risk import live as risk_live
 
 log = logging.getLogger(__name__)
 
@@ -55,21 +56,42 @@ def tick() -> None:
 
     log.info("\n%s", sig.explain())
 
+    payload = sig.to_dict()
+    payload["explanation"] = sig.explain()
+
     with SessionLocal() as db:
+        # The same assembly `/signals/live` uses. This route publishes the
+        # signal the dashboard actually renders, and until audit finding H-4
+        # it carried no risk block — so the kill switch, the trade cap, the
+        # loss limit and the position cap were all invisible on screen.
+        #
+        # Decided before the row is written, so the stored signal and the
+        # published one carry the same verdict rather than two evaluations
+        # taken a moment apart.
+        risk_live.attach(db, payload, sig)
+
         db.add(SignalRecord(
             symbol=sig.symbol, timeframe=sig.timeframe, action=sig.action,
             confidence=sig.confidence, price=sig.price, entry=sig.entry,
             stop_loss=sig.stop_loss, target=sig.target,
             checks=[c.to_dict() for c in sig.checks], context=sig.context,
+            risk=payload["risk"],
         ))
         db.commit()
 
-    r = redis_client()
-    if r:
-        payload = sig.to_dict()
-        payload["explanation"] = sig.explain()
-        r.setex("signal:latest", 900, json.dumps(payload, default=str))
-        r.publish("signals", json.dumps(payload, default=str))
+    publish_signal(payload)
+
+
+def publish_signal(payload: dict) -> None:
+    """Fan a signal out to the dashboard, refusing one that skipped risk.
+
+    The guard is the point. A missing risk block is silent — the dashboard
+    renders the trade plan and simply omits the line saying it was refused —
+    so nothing downstream would report the regression this replaces.
+    """
+    risk_live.assert_evaluated(payload)
+    publish("signals", json.dumps(payload, default=str),
+            cache_key="signal:latest", ttl=900)
 
 
 def start() -> BackgroundScheduler:

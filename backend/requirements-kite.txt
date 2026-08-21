@@ -1,0 +1,17 @@
+# Zerodha Kite adapter — install only if you set BROKER=kite.
+#
+# Kept out of requirements.txt deliberately. kiteconnect hard-pins
+# `autobahn[twisted]==19.11.2`, which carries PYSEC-2020-25 (redirect header
+# injection) and has no fixed release compatible with that pin — the latest
+# kiteconnect (5.2.1) pins the same version. Installing it by default put a
+# six-year-old vulnerable dependency into every image, including the
+# overwhelming majority that run BROKER=free and never import it.
+#
+# `app/brokers/kite.py` imports kiteconnect lazily and raises a clear message
+# if it is missing, so the free and mock paths are unaffected by its absence.
+#
+#   pip install -r backend/requirements-kite.txt
+#
+# Accept the autobahn advisory knowingly, or use a broker with a maintained
+# SDK. Do not add this to the default image to make an error message go away.
+kiteconnect==5.2.1

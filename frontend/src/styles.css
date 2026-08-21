@@ -320,17 +320,36 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 .age-delayed { color: var(--amber); }
 .age-stale   { color: var(--bear); }
 .age-unknown { color: var(--muted); }
+/* Not an alarm. The closing print is the freshest reading that exists once
+   the session is over, so it is styled like information, not like a fault. */
+.age-closed  { color: var(--muted); }
 
 .pill.age-live    { color: var(--bull); border-color: currentColor; }
 .pill.age-delayed { color: var(--amber); border-color: currentColor; }
 .pill.age-stale   { color: var(--bear); border-color: currentColor; }
 .pill.age-unknown { color: var(--muted); }
+.pill.age-closed  { color: var(--muted); }
 
 /* Only the live state pulses. A frozen feed should look frozen. */
 .data-age.age-live .dot { animation: pulse 2s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) {
   .data-age.age-live .dot { animation: none; }
 }
+
+/* ---- session clock ---- */
+.session-clock {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  margin: 6px 0 0; font-size: 12px; color: var(--muted);
+}
+.session-state {
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--paper);
+}
+.session-open .session-state { color: var(--bull); }
+.session-pre-open .session-state { color: var(--amber); }
+.session-closed .session-state { color: var(--muted); }
+.session-countdown { color: var(--paper); font-variant-numeric: tabular-nums; }
+.session-reason, .session-next { color: var(--muted); }
+.session-note { font-style: italic; opacity: 0.75; }
 
 /* A brief tint on each tick — enough to see the market is alive, short
    enough not to become a strobe on a fast-moving day. */
@@ -414,3 +433,37 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 }
 
 .chart-fallback { min-height: 300px; }
+/* The risk verdict on the trade plan. Loud on purpose: this is the line that
+   says whether the desk's own rules allow the trade in front of you, and its
+   absence was audit finding H-4. */
+.risk-verdict {
+  display: flex; align-items: baseline; gap: 10px;
+  margin: 0 0 14px; padding: 8px 12px;
+  border: 1px solid currentColor; border-radius: 4px;
+  font-family: var(--mono, ui-monospace, monospace); font-size: 13px;
+  letter-spacing: 0.06em;
+}
+.risk-verdict .risk-label {
+  text-transform: uppercase; font-size: 11px; letter-spacing: 0.1em;
+  opacity: 0.75;
+}
+.risk-verdict b { font-weight: 600; margin-left: auto; }
+.risk-approved       { color: var(--bull); }
+.risk-blocked        { color: var(--bear); }
+.risk-not-applicable { color: var(--muted); }
+.risk-unevaluated,
+.risk-missing        { color: var(--amber); }
+
+/* The stored verdict, beside the live one. Muted until they disagree — at
+   which point the difference is the most important thing on the panel. */
+.risk-history {
+  margin: -8px 0 12px; font-size: 12.5px; color: var(--muted);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.risk-history-changed { color: var(--amber); }
+
+/* What a refused trade would have risked. Deliberately not in the figures
+   list: it is an explanation, not exposure. */
+.risk-potential {
+  margin: 0 0 8px; font-size: 12.5px; color: var(--muted); font-style: italic;
+}

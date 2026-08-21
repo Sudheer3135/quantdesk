@@ -28,17 +28,22 @@ from app.workers.ticker import DELAYED_SECONDS, LIVE_SECONDS, classify_age
 
 
 class FakeRedis:
-    """Records publishes in order, with the moment each one happened."""
+    """Stands in for `cache.publish`, recording what was sent and when.
+
+    Matches that function's signature rather than a raw Redis client: the
+    ticker no longer talks to Redis directly, it goes through the helper
+    that survives an outage (see cache.py and audit finding M-1).
+    """
 
     def __init__(self):
         self.published: list[tuple[str, dict, datetime]] = []
         self.stored: dict[str, tuple[int, dict]] = {}
 
-    def setex(self, key, ttl, blob):
-        self.stored[key] = (ttl, json.loads(blob))
-
-    def publish(self, channel, blob):
+    def publish(self, channel, blob, cache_key=None, ttl=120):
         self.published.append((channel, json.loads(blob), datetime.now(UTC)))
+        if cache_key:
+            self.stored[cache_key] = (ttl, json.loads(blob))
+        return True
 
 
 class StubBroker:
@@ -68,7 +73,7 @@ def rig(monkeypatch):
     broker = StubBroker()
     redis = FakeRedis()
     monkeypatch.setattr(ticker, "get_broker", lambda: broker)
-    monkeypatch.setattr(ticker, "redis_client", lambda: redis)
+    monkeypatch.setattr(ticker, "publish", redis.publish)
     monkeypatch.setattr(ticker, "market_is_open", lambda: True)
     ticker._previous.clear()
     return broker, redis

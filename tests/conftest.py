@@ -31,7 +31,29 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
+from app.config import get_settings  # noqa: E402
 from app.models import Base  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings(monkeypatch):
+    """Stop the developer's .env from leaking into the suite.
+
+    `Settings` reads `.env` from the repo root, so a local API_KEY made the
+    auth tests assert against a key they never set, and closed the websocket
+    on tests that had nothing to do with authentication. Environment
+    variables outrank the file, so setting them here neutralises it; a test
+    that wants a key sets its own and wins over this.
+
+    Only the settings this suite is sensitive to are pinned. BROKER is left
+    alone because CI and local development deliberately differ, and every
+    test that cares already states which one it wants.
+    """
+    monkeypatch.setenv("API_KEY", "")
+    monkeypatch.setenv("ENVIRONMENT", "dev")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 # Set TEST_DATABASE_URL to a scratch Postgres and every database test runs
 # against both backends. CI does this; locally it is opt-in, because

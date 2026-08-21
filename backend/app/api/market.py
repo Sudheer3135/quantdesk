@@ -2,11 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..analytics import indicators, options, smc, structure
+from ..brokers.base import UnknownSymbol
 from ..cache import get_json, set_json
 from ..config import get_settings
 from ..data import importer, repository
 from ..db import get_db
 from ..deps import get_broker
+from ..security import require_api_key
+from ..symbols import validate as validate_symbol
 from .serialization import jsonable_records
 
 router = APIRouter(prefix="/market", tags=["market"])
@@ -21,6 +24,7 @@ def candles(symbol: str = "NIFTY", interval: str = "5m", days: int = Query(5, ge
     publishes no volume. Null is the honest answer: substituting a neutral
     number would be indistinguishable from a real neutral reading.
     """
+    symbol = validate_symbol(symbol)
     df = indicators.enrich(get_broker().candles(symbol, interval, days))
     return {
         "symbol": symbol,
@@ -31,6 +35,7 @@ def candles(symbol: str = "NIFTY", interval: str = "5m", days: int = Query(5, ge
 
 @router.get("/structure")
 def market_structure(symbol: str = "NIFTY", interval: str = "5m", days: int = 5):
+    symbol = validate_symbol(symbol)
     df = indicators.enrich(get_broker().candles(symbol, interval, days))
     state = structure.analyse(df)
     price = float(df["close"].iloc[-1])
@@ -49,6 +54,7 @@ def market_structure(symbol: str = "NIFTY", interval: str = "5m", days: int = 5)
 
 @router.get("/option-chain")
 def option_chain(symbol: str = "NIFTY", expiry: str | None = None):
+    symbol = validate_symbol(symbol)
     broker = get_broker()
     cached = get_json(f"chain:{symbol}:{expiry}")
     if cached:
@@ -56,6 +62,10 @@ def option_chain(symbol: str = "NIFTY", expiry: str | None = None):
     try:
         chain = broker.option_chain(symbol, expiry)
         spot = broker.quote(symbol)["last_price"]
+    except UnknownSymbol:
+        # The caller named something we do not carry. Let it reach the 422
+        # handler instead of being relabelled as an upstream failure.
+        raise
     except Exception as exc:
         raise HTTPException(502, f"could not load option chain: {exc}") from exc
 
@@ -87,7 +97,7 @@ def archive_coverage(symbol: str = "NIFTY", timeframe: str = "5m",
     return repository.coverage(db, symbol, timeframe).to_dict()
 
 
-@router.post("/archive/backfill", deprecated=True)
+@router.post("/archive/backfill", deprecated=True, dependencies=[Depends(require_api_key)])
 def archive_backfill(symbol: str = "NIFTY", timeframe: str = "5m",
                      days: int = 59, db: Session = Depends(get_db)):
     """Deprecated alias for POST /data/import/index.

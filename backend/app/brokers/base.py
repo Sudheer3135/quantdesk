@@ -10,6 +10,16 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 
+class UnknownSymbol(ValueError):
+    """Raised for a symbol this platform does not support.
+
+    A distinct type rather than a bare ValueError because the API layer has
+    to tell "you asked for something we do not carry" (the caller's mistake,
+    422) apart from "the upstream feed fell over" (not their mistake, 502).
+    Conflating them is how a typo starts looking like an outage.
+    """
+
+
 class Broker(ABC):
     name: str = "base"
 

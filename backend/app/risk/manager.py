@@ -11,6 +11,7 @@ Defaults follow the rulebook:
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from math import floor
@@ -64,6 +65,47 @@ class RiskDecision:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def day_state_from_trades(trading_day: date, todays: Sequence, open_now: Sequence) -> DayState:
+    """Rebuild today's risk state from the trade journal.
+
+    The live API used to construct a blank DayState on every request, so
+    every daily limit — the trade cap, the loss limit, the consecutive-loss
+    rule, the open-position cap — was measured against zero and could never
+    trip. The rules were real; nothing ever gave them today's numbers.
+
+    Deliberately a pure function over two lists so it can be tested without
+    a database, and so the risk layer keeps knowing nothing about SQL.
+
+    `todays` is every trade opened on this trading day. `open_now` is every
+    trade still open regardless of when it was opened — a position carried
+    overnight occupies a slot today, and counting only today's would let it
+    be ignored the morning it matters.
+    """
+    closed = sorted(
+        (t for t in todays if getattr(t, "status", None) == "closed"),
+        key=lambda t: getattr(t, "created_at", None) or trading_day,
+    )
+
+    realised = sum((getattr(t, "pnl", None) or 0.0) for t in closed)
+
+    # Walk backwards from the most recent close; stop at the first result
+    # that was not a loss. A break-even trade ends a losing streak.
+    streak = 0
+    for trade in reversed(closed):
+        if (getattr(trade, "pnl", None) or 0.0) < 0:
+            streak += 1
+        else:
+            break
+
+    return DayState(
+        trading_day=trading_day,
+        trades_taken=len(todays),
+        realised_pnl=float(realised),
+        consecutive_losses=streak,
+        open_positions=len(open_now),
+    )
 
 
 def evaluate(

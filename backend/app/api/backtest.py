@@ -31,6 +31,7 @@ from ..data import repository
 from ..db import get_db
 from ..deps import get_broker
 from ..risk.manager import RiskConfig
+from ..security import require_api_key
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
@@ -110,7 +111,7 @@ def load_candles(db: Session, payload: BacktestIn) -> tuple:
     return candles, block
 
 
-@router.post("/run")
+@router.post("/run", dependencies=[Depends(require_api_key)])
 def run_backtest(payload: BacktestIn, db: Session = Depends(get_db)):
     """Backtest the strategy on the index itself."""
     candles, block = load_candles(db, payload)
@@ -134,7 +135,7 @@ class OptionBacktestIn(BacktestIn):
     slippage_points: float | None = None
 
 
-@router.post("/options")
+@router.post("/options", dependencies=[Depends(require_api_key)])
 def run_option_backtest(payload: OptionBacktestIn, db: Session = Depends(get_db)):
     """Backtest the strategy as an option buyer.
 
@@ -163,7 +164,7 @@ def run_option_backtest(payload: OptionBacktestIn, db: Session = Depends(get_db)
     return result.to_dict()
 
 
-@router.post("/diagnose")
+@router.post("/diagnose", dependencies=[Depends(require_api_key)])
 def diagnose(payload: OptionBacktestIn, db: Session = Depends(get_db)):
     """Run the option backtest, then break the trades apart to show where
     the money went.
@@ -183,7 +184,7 @@ class StopSweepIn(OptionBacktestIn):
     multiples: list[float] = [0.8, 1.2, 1.6, 2.0, 2.5]
 
 
-@router.post("/stop-sweep")
+@router.post("/stop-sweep", dependencies=[Depends(require_api_key)])
 def stop_sweep(payload: StopSweepIn, db: Session = Depends(get_db)):
     """Test one specific idea: is the stop too tight?
 

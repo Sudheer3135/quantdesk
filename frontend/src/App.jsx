@@ -16,9 +16,21 @@ function ChartFallback({ label }) {
 }
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
-const WS_URL = API.replace(/^http/, "ws") + "/ws/signals";
+
+/* Set VITE_API_KEY when the backend has API_KEY set. Reads stay open, so
+   this is only needed for the live socket; leaving it unset is correct for
+   a localhost desk running without a key. */
+const API_KEY = import.meta.env.VITE_API_KEY || "";
+const WS_URL = API.replace(/^http/, "ws") + "/ws/signals"
+  + (API_KEY ? `?key=${encodeURIComponent(API_KEY)}` : "");
 
 const FALLBACK_POLL_MS = 60_000;   // only used if the socket cannot connect
+/* The price gets its own, much faster fallback. /market/price is a Redis
+   read costing about 50ms and touches no broker, whereas /signals/live
+   rebuilds a signal from the feed — which is why the poll above is slow.
+   Sharing one timer meant a dropped socket left the price as stale as the
+   analysis, so a working feed still read "delayed 44s ago". */
+const PRICE_POLL_MS = 5_000;
 const MAX_RECONNECT_MS = 30_000;
 
 /* Mirrors LIVE_SECONDS / DELAYED_SECONDS in backend/app/workers/ticker.py.
@@ -27,26 +39,106 @@ const MAX_RECONNECT_MS = 30_000;
 const LIVE_SECONDS = 15;
 const DELAYED_SECONDS = 60;
 
-function classifyAge(seconds) {
+/* Freshness is a claim about the *feed*, and a feed can only be behind while
+   it is supposed to be producing. Outside the session there is nothing newer
+   than the closing print to be behind by, so the age counter was measuring
+   the length of the night: it read "557m 37s ago" at 00:48 and would have
+   reached four figures by Monday, in the same alarm colour the desk uses for
+   a genuinely broken ticker. An alarm that cannot clear is not an alarm.
+
+   So the classification takes the session with it. While the market is open
+   the thresholds below apply unchanged — that detection is the whole point
+   of the live-price work and it is untouched. While it is shut, the reading
+   is "closed", and what gets shown is the fixed instant of the last print
+   rather than a stopwatch running away from it. */
+export function classifyAge(seconds, sessionLive = true) {
   if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "unknown";
+  if (!sessionLive) return "closed";
   if (seconds <= LIVE_SECONDS) return "live";
   if (seconds <= DELAYED_SECONDS) return "delayed";
   return "stale";
 }
 
-function formatAge(seconds) {
+export function formatAge(seconds) {
   if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "—";
   if (seconds < 0) return "just now";          /* clock skew overshoot */
   if (seconds < 1) return "just now";
   if (seconds < 60) return `${Math.floor(seconds)}s ago`;
   const m = Math.floor(seconds / 60);
-  const rest = Math.floor(seconds % 60);
-  return `${m}m ${String(rest).padStart(2, "0")}s ago`;
+  if (m < 60) {
+    const rest = Math.floor(seconds % 60);
+    return `${m}m ${String(rest).padStart(2, "0")}s ago`;
+  }
+  // Past an hour the seconds are noise and the minutes stop being legible:
+  // nobody reads "557m" as nine and a quarter hours.
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, "0")}m ago`;
 }
 
+/* The clock time of an absolute instant, in IST. Used where a fixed moment
+   says more than an elapsed count — which, once the session is over, is
+   everywhere. */
+export function formatClock(iso) {
+  if (!iso) return "—";
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return "—";
+  return new Date(ms).toLocaleTimeString("en-IN", {
+    timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+/* Session copy. The state itself is decided by the backend and only
+   formatted here — the dashboard used to have no say in it and must keep
+   none, or the two disagree on a holiday. */
+const SESSION_LABEL = {
+  open: "Market open", "pre-open": "Pre-open", closed: "Market closed",
+};
+
+const CLOSED_BECAUSE = {
+  weekend: "Weekend", holiday: "Exchange holiday",
+  "before-open": "Opens later today", "after-close": "Session finished",
+};
+
+function formatCountdown(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "—";
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h >= 1) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m >= 1) return `${m}m`;
+  return `${s}s`;
+}
+
+/* The risk verdict, as the backend reported it. `missing` is not a state the
+   backend sends — it is what the dashboard shows if a payload ever arrives
+   without a decision, so the absence is loud instead of invisible. */
+const RISK_MISSING = "missing";
+
+/* "1 lots" read as a typo every time. */
+const plural = (quantity, lots) =>
+  `${quantity} (${lots} ${lots === 1 ? "lot" : "lots"})`;
+
+/* Clock time of an absolute instant, in IST. Used to date the stored
+   verdict, so "at signal" names a moment rather than a vague past. */
+const clockIST = (iso) => {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toLocaleTimeString("en-IN", {
+    timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit",
+  });
+};
+const RISK_VERDICT = {
+  approved: "APPROVED",
+  blocked: "BLOCKED",
+  unevaluated: "NOT EVALUATED",
+  "not-applicable": "NO TRADE",
+  [RISK_MISSING]: "NOT REPORTED",
+};
+
 const AGE_LABEL = {
-  live: "Data live", delayed: "Data delayed",
-  stale: "Data stale", unknown: "Data age unknown",
+  live: "Data live", delayed: "Data delayed", stale: "Data stale",
+  closed: "Last print", unknown: "Data age unknown",
 };
 
 const num = (v, d = 2) =>
@@ -69,12 +161,18 @@ function useLiveSignal() {
   const [signal, setSignal] = useState(null);
   const [price, setPrice] = useState(null);
   const [market, setMarket] = useState(null);
+  /* The risk verdict as of *now*, which is not the same thing as the verdict
+     the signal was published with. The journal moves between agent ticks:
+     open a position at 10:01 and the 10:00 approval is stale by 10:02. The
+     backend recomputes this on connect and on every heartbeat. */
+  const [riskNow, setRiskNow] = useState(null);
   const [link, setLink] = useState("connecting");   // connecting | live | polling
   const [skewMs, setSkewMs] = useState(0);
 
   const socket = useRef(null);
   const attempts = useRef(0);
   const pollTimer = useRef(null);
+  const priceTimer = useRef(null);
   const closed = useRef(false);
 
   /* How far this browser's clock sits from the server's.
@@ -104,6 +202,9 @@ function useLiveSignal() {
         getJSON("/market/price").catch(() => null),
       ]);
       setSignal(sig);
+      /* The polled endpoint builds a signal from scratch, so its verdict was
+         computed for this request — current by construction. */
+      if (sig?.risk) setRiskNow(sig.risk);
       if (status) { setMarket(status); noteServerClock(status.server_time); }
       if (tick && tick.price !== null && tick.price !== undefined) setPrice(tick);
     } catch {
@@ -111,16 +212,30 @@ function useLiveSignal() {
     }
   }, [noteServerClock]);
 
+  /* Price only. Cheap enough to run at the ticker's own cadence. */
+  const pollPrice = useCallback(async () => {
+    try {
+      const tick = await getJSON("/market/price");
+      if (tick && tick.price !== null && tick.price !== undefined) setPrice(tick);
+    } catch {
+      /* keep the last price and let its age keep climbing */
+    }
+  }, []);
+
   const startPolling = useCallback(() => {
     if (pollTimer.current) return;
     setLink("polling");
     poll();
+    pollPrice();
     pollTimer.current = setInterval(poll, FALLBACK_POLL_MS);
-  }, [poll]);
+    priceTimer.current = setInterval(pollPrice, PRICE_POLL_MS);
+  }, [poll, pollPrice]);
 
   const stopPolling = useCallback(() => {
     clearInterval(pollTimer.current);
+    clearInterval(priceTimer.current);
     pollTimer.current = null;
+    priceTimer.current = null;
   }, []);
 
   const connect = useCallback(() => {
@@ -163,7 +278,14 @@ function useLiveSignal() {
         setPrice(msg.price);
         noteServerClock(msg.price.at);
       }
-      if (msg.signal) setSignal(msg.signal);
+      if (msg.signal) {
+        setSignal(msg.signal);
+        /* A signal that has just arrived was judged moments ago, so its own
+           verdict is the current one until the next heartbeat says
+           otherwise. */
+        if (msg.risk_now === undefined && msg.signal.risk) setRiskNow(msg.signal.risk);
+      }
+      if (msg.risk_now !== undefined) setRiskNow(msg.risk_now);
     };
 
     ws.onclose = () => {
@@ -189,7 +311,7 @@ function useLiveSignal() {
     };
   }, [connect, stopPolling]);
 
-  return { signal, price, market, link, skewMs, refresh: poll };
+  return { signal, price, market, riskNow, link, skewMs, refresh: poll };
 }
 
 /* The live price. Separate from the signal on purpose: the price moves
@@ -261,14 +383,59 @@ function Ticker({ price, marketOpen }) {
   );
 }
 
+/* The session clock.
+
+   Everything shown here comes straight off /market/status: the state, the
+   next boundary and its direction. The countdown is recomputed against that
+   absolute instant on every tick, so it falls toward the boundary rather
+   than climbing away from a stale reading — which is what a midnight
+   "pre-open" was doing. */
+function SessionClock({ market, secondsToBoundary }) {
+  if (!market) {
+    return (
+      <p className="session-clock">
+        <span className="session-state">…</span>
+      </p>
+    );
+  }
+  const state = market.session ?? "closed";
+  const verb = market.boundary_direction === "closes" ? "Closes" : "Opens";
+  const nextOpen = market.next_open
+    ? new Date(market.next_open).toLocaleString("en-IN", {
+        weekday: "short", hour: "2-digit", minute: "2-digit",
+        timeZone: "Asia/Kolkata",
+      })
+    : null;
+
+  return (
+    <p className={`session-clock session-${state}`}>
+      <span className="session-state">{SESSION_LABEL[state] ?? state}</span>
+      {state !== "open" && market.reason && (
+        <span className="session-reason">{CLOSED_BECAUSE[market.reason] ?? market.reason}</span>
+      )}
+      {state !== "open" && nextOpen && (
+        <span className="session-next">Next session {nextOpen}</span>
+      )}
+      <span className="session-countdown">
+        {verb} in {formatCountdown(secondsToBoundary)}
+      </span>
+      {market.calendar_provisional && (
+        <span className="session-note" title="The 2026 NSE holiday list is transcribed but unverified.">
+          provisional calendar
+        </span>
+      )}
+    </p>
+  );
+}
+
 /* How far behind the market the number above actually is.
 
    Separate from the signal's timestamp on purpose. The price and the
    analysis are two different clocks, and the dashboard used to imply they
    were one: a five-minute-old signal sat beside a live price under a single
    "updated" label, so whichever was staler was the one you could not see. */
-function DataAge({ seconds, price }) {
-  const state = classifyAge(seconds);
+function DataAge({ seconds, price, sessionLive }) {
+  const state = classifyAge(seconds, sessionLive);
   if (!price) {
     return (
       <p className="data-age age-unknown">
@@ -280,7 +447,11 @@ function DataAge({ seconds, price }) {
     <p className={`data-age age-${state}`}>
       <i className="dot" />
       <span className="data-age-label">{AGE_LABEL[state]}</span>
-      <span className="data-age-value">{formatAge(seconds)}</span>
+      <span className="data-age-value">
+        {/* A fixed instant once the session is over. The number stops
+            moving because the thing it describes stopped moving. */}
+        {state === "closed" ? `${formatClock(price.source_time)} IST` : formatAge(seconds)}
+      </span>
       {state === "unknown" && (
         <span className="data-age-note">source gave no timestamp</span>
       )}
@@ -414,7 +585,7 @@ function Ledger({ checks, context, confidence, action }) {
   );
 }
 
-function PlanPanel({ signal, marketOpen }) {
+function PlanPanel({ signal, marketOpen, riskNow }) {
   if (signal.action === "HOLD") {
     return (
       <div className="panel">
@@ -428,31 +599,79 @@ function PlanPanel({ signal, marketOpen }) {
       </div>
     );
   }
-  const risk = signal.risk;
+
+  /* Two verdicts, and the difference between them is the point.
+
+     `signal.risk` is what the desk decided when it published this plan.
+     `riskNow` is what it would decide about the same levels against today's
+     journal as it stands. They diverge the moment a position is opened, and
+     a browser that reconnects replays a signal up to fifteen minutes old —
+     so presenting the stored verdict as the live one would tell you a trade
+     is approved after you have already taken the position that blocks it.
+
+     The loud badge is the current one, because that is the one you act on.
+     Neither is inferred here; the backend decides both. */
+  const atSignal = signal.risk;
+  const live = riskNow ?? null;
+  const shown = live ?? atSignal;
+  const state = shown?.state ?? RISK_MISSING;
+  const approved = state === "approved";
+  const stale = Boolean(live && atSignal && live.state !== atSignal.state);
+
   return (
     <div className="panel">
       <h3>Trade plan</h3>
+
+      <p className={`risk-verdict risk-${state}`}>
+        <span className="risk-label">{live ? "Risk now" : "Risk at signal"}</span>
+        <b>{RISK_VERDICT[state] ?? RISK_VERDICT[RISK_MISSING]}</b>
+      </p>
+
+      {atSignal && (
+        <p className={`risk-history${stale ? " risk-history-changed" : ""}`}>
+          At signal {clockIST(atSignal.evaluated_at) ?? "—"}:{" "}
+          {RISK_VERDICT[atSignal.state] ?? RISK_VERDICT[RISK_MISSING]}
+          {stale && " — the journal has moved since"}
+        </p>
+      )}
+
       {!marketOpen && (
         <p className="warn-line">
           Market is closed — this reads the final candle of the session, not a
           tradeable setup. Overnight gaps will invalidate these levels.
         </p>
       )}
+
       <dl>
         <div className="kv"><dt>Entry</dt><dd>{num(signal.entry)}</dd></div>
         <div className="kv"><dt>Stop</dt><dd>{num(signal.stop_loss)}</dd></div>
         <div className="kv"><dt>Target</dt><dd>{num(signal.target)}</dd></div>
         <div className="kv"><dt>Reward:risk</dt><dd>1:{num(signal.risk_reward, 2)}</dd></div>
-        {risk && (
+        {shown?.evaluated && (
           <>
             <div className="kv"><dt>Size</dt>
-              <dd>{risk.approved ? `${risk.quantity} (${risk.lots} lots)` : "blocked"}</dd></div>
-            <div className="kv"><dt>Rupees at risk</dt><dd>{num(risk.risk_amount, 0)}</dd></div>
+              <dd>{approved ? plural(shown.quantity, shown.lots) : "blocked"}</dd></div>
+            {/* A refused trade has no money on the table. What the sizing
+                would have been is shown below as what it is, rather than
+                reported here as exposure. */}
+            <div className="kv"><dt>Rupees at risk</dt>
+              <dd>{num(shown.rupees_at_risk ?? 0, 0)}</dd></div>
           </>
         )}
       </dl>
-      {risk && !risk.approved && (
-        <p className="warn-line">Risk manager blocked this: {risk.reasons.join(" ")}</p>
+
+      {!approved && shown?.evaluated && shown.potential?.rupees_at_risk > 0 && (
+        <p className="risk-potential">
+          Had it been allowed: {plural(shown.potential.quantity, shown.potential.lots)},
+          risking {num(shown.potential.rupees_at_risk, 0)}.
+        </p>
+      )}
+
+      {!approved && shown?.reasons?.length > 0 && (
+        <p className="warn-line">
+          {shown.evaluated ? "Risk manager blocked this: " : ""}
+          {shown.reasons.join(" ")}
+        </p>
       )}
     </div>
   );
@@ -520,7 +739,7 @@ function ContextPanel({ context }) {
 }
 
 export default function App() {
-  const { signal, price, market, link, skewMs, refresh } = useLiveSignal();
+  const { signal, price, market, riskNow, link, skewMs, refresh } = useLiveSignal();
   const { candles, chain } = useMarketData();
   const [clock, setClock] = useState(() => Date.now());
 
@@ -542,6 +761,25 @@ export default function App() {
     ? (clock - skewMs - new Date(price.source_time).getTime()) / 1000
     : null;
 
+  /* Is the feed supposed to be producing right now? Only the backend's
+     session decides — never `Date.now()` here, which would put the desk back
+     in the business of guessing the market clock for itself.
+
+     Unknown means "assume it is", so a status request that has not landed
+     yet cannot silence a real staleness alarm. The test for "known" is the
+     `session` field, not the object: a failed status fetch still resolves to
+     a bodyless payload, and treating that as "not open" would suppress the
+     alarm exactly when the backend is in trouble. */
+  const sessionLive = market?.session ? market.session === "open" : true;
+  const ageState = classifyAge(priceAge, sessionLive);
+
+  /* Seconds to the next session boundary, recomputed on every tick against
+     the absolute instant the backend supplied. Falls as time passes; it
+     cannot drift or climb, because nothing here accumulates. */
+  const secondsToBoundary = market?.next_boundary
+    ? Math.max(0, (new Date(market.next_boundary).getTime() - (clock - skewMs)) / 1000)
+    : null;
+
   const signalTime = signal?.timestamp
     ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
         hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
@@ -554,13 +792,15 @@ export default function App() {
         <h1 className="wordmark">Quant<span>Desk</span></h1>
         <div className="masthead-meta">
           <span className={`pill ${marketOpen ? "on" : "off"}`}>
-            {market ? (marketOpen ? "market open" : market.session) : "…"}
+            {market ? (SESSION_LABEL[market.session] ?? market.session) : "…"}
           </span>
           <span className={`pill link-${link}`}>
             <i className="dot" />{link}
           </span>
-          <span className={`pill age-${classifyAge(priceAge)}`}>
-            {price ? formatAge(priceAge) : "waiting"}
+          <span className={`pill age-${ageState}`}>
+            {!price ? "waiting"
+              : ageState === "closed" ? formatClock(price.source_time)
+              : formatAge(priceAge)}
           </span>
           {/* The desk updates itself; this is here for a forced re-read,
               not because anything requires clicking it. */}
@@ -576,7 +816,8 @@ export default function App() {
         <div className="tape-price">
           <p className="eyebrow">Current price</p>
           <Ticker price={price} marketOpen={marketOpen} />
-          <DataAge seconds={priceAge} price={price} />
+          <DataAge seconds={priceAge} price={price} sessionLive={sessionLive} />
+          <SessionClock market={market} secondsToBoundary={secondsToBoundary} />
         </div>
         {signal ? (
           <div className={`tape-verdict ${signal.action}`}>
@@ -620,7 +861,7 @@ export default function App() {
             <Suspense fallback={<ChartFallback label="Price · VWAP" />}>
               <PriceChart candles={candles} signal={signal} />
             </Suspense>
-            <PlanPanel signal={signal} marketOpen={marketOpen} />
+            <PlanPanel signal={signal} marketOpen={marketOpen} riskNow={riskNow} />
           </div>
 
           <Ledger

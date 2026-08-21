@@ -20,11 +20,14 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from ..cache import get_json
 from ..config import get_settings
+from ..db import SessionLocal
 from ..market_hours import status as market_status
+from ..risk import live as risk_live
+from ..security import key_is_valid
 from ..workers.ticker import classify_age
 
 log = logging.getLogger(__name__)
@@ -99,8 +102,10 @@ class Hub:
                     if message.get("channel") == PRICE_CHANNEL:
                         await self.broadcast({"type": "price", "price": payload})
                     else:
-                        await self.broadcast({"type": "signal", "signal": payload,
-                                              "market": market_status()})
+                        await self.broadcast({
+                            "type": "signal",
+                            "signal": risk_live.ensure(payload),
+                            "market": market_status()})
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -119,8 +124,42 @@ class Hub:
 hub = Hub()
 
 
+async def _current_risk(signal_payload: dict | None) -> dict | None:
+    """Today's risk verdict for the levels in a published signal.
+
+    Off the event loop: the journal read is synchronous SQLAlchemy, and
+    blocking the loop would stall every other socket on this process.
+
+    Never raises. A database that is briefly unavailable should cost the
+    desk its "risk now" line, not its price feed — and a missing verdict is
+    rendered as missing rather than as approval.
+    """
+    if not signal_payload:
+        return None
+
+    def read() -> dict | None:
+        with SessionLocal() as db:
+            return risk_live.current(db, signal_payload)
+
+    try:
+        return await asyncio.to_thread(read)
+    except Exception as exc:
+        log.warning("could not compute current risk: %s", exc)
+        return None
+
+
 @router.websocket("/ws/signals")
-async def stream_signals(ws: WebSocket) -> None:
+async def stream_signals(ws: WebSocket, key: str | None = Query(default=None)) -> None:
+    # Browsers cannot set headers on a websocket handshake, so the key comes
+    # as a query parameter here rather than in X-API-Key. The socket is
+    # read-only, so this is about not broadcasting the desk to the network,
+    # not about protecting a write.
+    #
+    # 1008 is "policy violation" — the close code a client can act on,
+    # rather than dropping the connection and looking like a network fault.
+    if not key_is_valid(key):
+        await ws.close(code=1008, reason="invalid or missing key")
+        return
     await hub.connect(ws)
     try:
         # Send the last known signal immediately so a browser that connects
@@ -131,18 +170,35 @@ async def stream_signals(ws: WebSocket) -> None:
             # minutes after the last tick must be told the price is two
             # minutes old, not handed the age it had when it was published.
             snapshot_price = snapshot_price | _aged(snapshot_price.get("source_time"))
+        # A cached signal can outlive the deploy that started attaching risk
+        # decisions. `ensure` labels one that has none rather than letting it
+        # through unmarked — see audit finding H-4.
+        snapshot_signal = risk_live.ensure(get_json("signal:latest"))
         await ws.send_json({
             "type": "snapshot",
-            "signal": get_json("signal:latest"),
+            "signal": snapshot_signal,
             "price": snapshot_price,
             "market": market_status(),
+            # The signal's own verdict was true when it was published, which
+            # may have been fifteen minutes ago — the cache TTL. The journal
+            # moves in between: open a position and the old verdict is stale
+            # without anything on screen saying so. This is the same question
+            # asked of today's journal, now.
+            "risk_now": await _current_risk(snapshot_signal),
         })
 
         while True:
             # A periodic beat keeps proxies from closing an idle socket and
             # lets the dashboard show a live clock between signals.
             await asyncio.sleep(HEARTBEAT_SECONDS)
-            await ws.send_json({"type": "heartbeat", "market": market_status()})
+            # Risk state changes when a trade is recorded, not when a bar
+            # closes, so it rides the heartbeat rather than the signal. Worst
+            # case the desk's "risk now" is one beat old.
+            await ws.send_json({
+                "type": "heartbeat",
+                "market": market_status(),
+                "risk_now": await _current_risk(get_json("signal:latest")),
+            })
     except WebSocketDisconnect:
         pass
     except Exception as exc:

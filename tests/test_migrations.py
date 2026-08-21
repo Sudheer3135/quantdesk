@@ -135,6 +135,19 @@ def test_real_volume_is_not_flagged_as_synthetic(url):
     engine.dispose()
 
 
+def head_revision() -> str:
+    """The newest revision in the chain, read from the scripts themselves."""
+    from alembic.script import ScriptDirectory
+    return ScriptDirectory.from_config(make_config("sqlite://")).get_current_head()
+
+
+def test_the_head_lookup_finds_a_real_revision():
+    """Guard against the guard: a helper that returned None would make the
+    assertion below pass against a database that migrated nowhere."""
+    head = head_revision()
+    assert head and head.isdigit(), head
+
+
 def test_upgrade_survives_a_database_built_by_create_all(url):
     """`init_db()` calls `Base.metadata.create_all`, so a deployment that
     starts the app before running migrations arrives at 0001 with tables
@@ -151,7 +164,9 @@ def test_upgrade_survives_a_database_built_by_create_all(url):
     engine = create_engine(url)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "0003"
+    # Derived, not hardcoded. A pinned number turns "we added a migration"
+    # into a test failure that says nothing about migrations working.
+    assert version == head_revision()
     engine.dispose()
 
 

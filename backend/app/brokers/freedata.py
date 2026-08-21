@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 import pandas as pd
 from curl_cffi import requests as curl_requests
 
-from .base import Broker
+from .base import Broker, UnknownSymbol
 from .nse import NSEClient, parse_index_value, parse_nse_timestamp, parse_option_chain
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,30 @@ YAHOO_SYMBOLS = {
     "SENSEX": "^BSESN",
     "INDIAVIX": "^INDIAVIX",
 }
+
+def resolve_yahoo_symbol(symbol: str) -> str:
+    """Map a platform symbol to its Yahoo ticker, or refuse it.
+
+    This used to be `YAHOO_SYMBOLS.get(symbol.upper(), symbol)` — a lookup
+    with a passthrough default, which reads like an allowlist and is not
+    one. Anything unrecognised went straight into the outbound URL, so
+    `?symbol=AAPL` fetched Apple and the API became a free proxy to Yahoo
+    running on this machine's IP.
+
+    The returned value is percent-encoded even though every entry in the map
+    is already URL-safe. The encoding is not what makes this safe — the
+    allowlist is — but it means a future entry containing a slash or a
+    question mark cannot silently reshape the request.
+    """
+    from ..symbols import validate
+    ticker = YAHOO_SYMBOLS.get(validate(symbol))
+    if ticker is None:
+        raise UnknownSymbol(
+            f"{symbol!r} is a supported symbol but this adapter has no Yahoo "
+            f"mapping for it. Carried here: {', '.join(sorted(YAHOO_SYMBOLS))}."
+        )
+    return quote(ticker, safe="")
+
 
 # Yahoo's own caps. Asking for more silently returns less, which is worse
 # than an error, so we clamp and warn instead.
@@ -61,7 +86,7 @@ class FreeDataBroker(Broker):
 
     # ---- candles --------------------------------------------------------
     def candles(self, symbol: str = "NIFTY", interval: str = "5m", days: int = 5) -> pd.DataFrame:
-        ticker = YAHOO_SYMBOLS.get(symbol.upper(), symbol)
+        ticker = resolve_yahoo_symbol(symbol)
         yf_interval = INTERVAL_MAP.get(interval, interval)
 
         cap = MAX_DAYS.get(yf_interval, 59)
@@ -123,7 +148,7 @@ class FreeDataBroker(Broker):
         The response is about 7 KB, against roughly 300 rows for a candle
         fetch, so this is the cheaper call as well as the fresher one.
         """
-        ticker = YAHOO_SYMBOLS.get(symbol.upper(), symbol)
+        ticker = resolve_yahoo_symbol(symbol)
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
                f"?range=1d&interval=1m")
         response = curl_requests.get(url, impersonate="chrome120",

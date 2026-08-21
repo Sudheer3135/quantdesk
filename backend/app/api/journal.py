@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import TradeRecord
+from ..security import require_api_key
 
 router = APIRouter(prefix="/journal", tags=["journal"])
 
@@ -30,7 +31,7 @@ class TradeClose(BaseModel):
     score: int | None = Field(default=None, ge=1, le=100)
 
 
-@router.post("")
+@router.post("", dependencies=[Depends(require_api_key)])
 def open_trade(payload: TradeIn, db: Session = Depends(get_db)):
     trade = TradeRecord(**payload.model_dump(), status="open")
     db.add(trade)
@@ -38,7 +39,7 @@ def open_trade(payload: TradeIn, db: Session = Depends(get_db)):
     return {"id": trade.id, "status": trade.status}
 
 
-@router.post("/{trade_id}/close")
+@router.post("/{trade_id}/close", dependencies=[Depends(require_api_key)])
 def close_trade(trade_id: int, payload: TradeClose, db: Session = Depends(get_db)):
     trade = db.get(TradeRecord, trade_id)
     if not trade:

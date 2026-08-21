@@ -21,7 +21,8 @@ import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..models import CandleRecord
+from ..market_hours import trading_date
+from ..models import CandleRecord, TradeRecord
 
 log = logging.getLogger(__name__)
 
@@ -259,3 +260,43 @@ def _to_datetime(value: datetime | date, end_of_day: bool = False) -> datetime:
     if end_of_day:
         stamp = stamp + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
     return stamp.to_pydatetime()
+
+
+# --------------------------------------------------------------------------
+# the trade journal, read back for risk
+# --------------------------------------------------------------------------
+
+# How far back to scan for today's trades. The journal records a handful of
+# rows a day, so this covers well over a year while keeping the query bounded.
+TRADE_SCAN_LIMIT = 500
+
+
+def todays_trades(db: Session, day: date | None = None,
+                  limit: int = TRADE_SCAN_LIMIT) -> list[TradeRecord]:
+    """Every trade opened on this *trading* day, newest scan first.
+
+    The day is an IST trading date, not a UTC calendar date, because that is
+    what a daily trade cap means to the person the cap protects.
+
+    Filtering happens in Python rather than SQL on purpose. `created_at` is
+    stored as UTC but SQLite hands it back naive, so a SQL comparison against
+    a timezone-aware bound is correct on Postgres and quietly wrong on the
+    backend the tests run against. Normalising on read is dialect-proof, and
+    at a few rows a day the scan is free.
+    """
+    day = day or trading_date()
+    rows = db.scalars(
+        select(TradeRecord).order_by(TradeRecord.created_at.desc()).limit(limit)
+    ).all()
+    return [r for r in rows
+            if r.created_at is not None and trading_date(_as_utc(r.created_at)) == day]
+
+
+def open_trades(db: Session) -> list[TradeRecord]:
+    """Every trade still open, whatever day it was opened on.
+
+    Not filtered by date: a position carried overnight still occupies a slot
+    this morning, and counting only today's would let it be ignored on the
+    one day it matters most.
+    """
+    return list(db.scalars(select(TradeRecord).where(TradeRecord.status == "open")).all())

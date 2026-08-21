@@ -146,3 +146,86 @@ def test_market_candles_response_is_strict_json(client):
         raise AssertionError(f"response contains {constant}, which is not valid JSON")
 
     json.loads(raw, parse_constant=reject)
+
+
+# ---- timestamps the browser can actually parse -------------------------
+
+def test_timestamps_are_iso_8601_not_pandas_repr():
+    """`str(Timestamp)` is space-separated: "2026-08-19 03:45:00+00:00".
+
+    ECMA-262 defines `Date.parse` only for the ISO form. Everything else is
+    implementation-defined, and an engine that declines it returns an
+    Invalid Date whose epoch is NaN — which sorts silently rather than
+    raising. V8 accepts the space form, so the browser looked correct while
+    the contract was not.
+    """
+    df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-08-19 03:45"], utc=True)})
+    stamp = jsonable_records(df)[0]["timestamp"]
+
+    assert stamp == "2026-08-19T03:45:00+00:00"
+    assert " " not in stamp
+    assert "T" in stamp
+
+
+def test_the_utc_offset_survives_serialisation():
+    """A stamp without a zone is an instant the client has to guess at, and
+    it will guess its own — a 5.5-hour error against IST."""
+    df = pd.DataFrame({"timestamp": pd.to_datetime(["2026-08-19 03:45"], utc=True)})
+    stamp = jsonable_records(df)[0]["timestamp"]
+    assert stamp.endswith("+00:00")
+
+    from datetime import UTC, datetime
+    assert datetime.fromisoformat(stamp) == datetime(
+        2026, 8, 19, 3, 45, tzinfo=UTC)
+
+
+def test_a_missing_timestamp_becomes_null_not_the_string_NaT():
+    """`astype(str)` renders NaT as the literal "NaT", which is a truthy
+    string on the far side and parses to an Invalid Date."""
+    df = pd.DataFrame({"timestamp": pd.to_datetime(
+        ["2026-08-19 03:45", None], utc=True)})
+    records = jsonable_records(df)
+    assert records[0]["timestamp"] == "2026-08-19T03:45:00+00:00"
+    assert records[1]["timestamp"] is None
+
+
+# ---- the chart's ordering contract -------------------------------------
+
+def test_candles_come_back_in_strict_chronological_order(monkeypatch):
+    """The chart sorts on the instant, but it should not have to rescue a
+    feed that arrives shuffled — the endpoint owns the order.
+
+    `indicators.enrich` sorts via `validate`. This pins that behaviour to
+    the endpoint's response, so removing the sort upstream fails here rather
+    than surfacing as a chart nobody can read.
+    """
+    from datetime import datetime
+
+    from app.api import market
+
+    class ShuffledBroker(MockBroker):
+        def candles(self, symbol="NIFTY", interval="5m", days=5):
+            df = super().candles(symbol, interval, days)
+            df["volume"] = 1.0
+            return df.sample(frac=1.0, random_state=7).reset_index(drop=True)
+
+    monkeypatch.setattr(market, "get_broker", lambda: ShuffledBroker())
+    app = FastAPI()
+    app.include_router(market.router)
+
+    body = TestClient(app).get(
+        "/market/candles?symbol=NIFTY&interval=5m&days=2").json()
+    stamps = [datetime.fromisoformat(row["timestamp"]) for row in body["candles"]]
+
+    assert len(stamps) > 100, "test premise: needs a multi-session window"
+    assert stamps == sorted(stamps)
+    assert len(set(stamps)) == len(stamps), "duplicate instants in the series"
+    assert all(t.tzinfo is not None for t in stamps)
+
+
+def test_the_shuffle_in_that_test_actually_shuffles():
+    """Guard against the guard. If `sample` happened to return the frame in
+    order, the test above would pass without proving anything."""
+    df = MockBroker(seed=5).candles(days=2, interval="5m")
+    shuffled = df.sample(frac=1.0, random_state=7).reset_index(drop=True)
+    assert not shuffled["timestamp"].is_monotonic_increasing

@@ -369,6 +369,16 @@ def test_market_status_labels_the_session():
 
     ist = timezone(timedelta(hours=5, minutes=30))
     assert market_status(datetime(2026, 8, 5, 11, 0, tzinfo=ist))["session"] == "open"
-    assert market_status(datetime(2026, 8, 5, 8, 0, tzinfo=ist))["session"] == "pre-open"
     assert market_status(datetime(2026, 8, 5, 17, 0, tzinfo=ist))["session"] == "closed"
-    assert market_status(datetime(2026, 8, 8, 11, 0, tzinfo=ist))["session"] == "weekend"
+
+    # 08:00 used to read "pre-open" because anything before 09:15 did — the
+    # bug that made midnight announce an imminent session. Pre-open is now a
+    # bounded window; 08:00 is simply closed, and 08:50 is not.
+    assert market_status(datetime(2026, 8, 5, 8, 0, tzinfo=ist))["session"] == "closed"
+    assert market_status(datetime(2026, 8, 5, 8, 50, tzinfo=ist))["session"] == "pre-open"
+
+    # Weekends are closed like any other non-session; which kind of closed
+    # moved to the `reason` field so the badge can stay a clean three-way.
+    weekend = market_status(datetime(2026, 8, 8, 11, 0, tzinfo=ist))
+    assert weekend["session"] == "closed"
+    assert weekend["reason"] == "weekend"

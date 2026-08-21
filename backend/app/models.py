@@ -1,5 +1,5 @@
 """Database tables."""
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import (
     JSON,
@@ -21,13 +21,32 @@ class Base(DeclarativeBase):
     pass
 
 
+def utc_now() -> datetime:
+    """The default for every `created_at`, timezone-aware.
+
+    These columns defaulted to a *naive* UTC value going into a TIMESTAMP
+    WITH TIME ZONE. Postgres then reads such a value in the session
+    timezone, so the stored instant was correct only because that session
+    happens to be UTC. Point `TimeZone` at Asia/Kolkata, an entirely
+    reasonable thing to do on an Indian trading system, and every row shifts
+    five and a half hours — including `TradeRecord.created_at`, which is
+    what the daily trade cap counts.
+
+    The old spelling was also deprecated as of Python 3.12 and scheduled for
+    removal.
+
+    Right by construction now rather than by configuration.
+    """
+    return datetime.now(UTC)
+
+
 class SignalRecord(Base):
     """Every signal the engine produces, saved whether or not it was traded.
     This is what makes the system auditable after the fact."""
     __tablename__ = "signals"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     timeframe: Mapped[str] = mapped_column(String(8))
     action: Mapped[str] = mapped_column(String(8), index=True)
@@ -39,13 +58,24 @@ class SignalRecord(Base):
     checks: Mapped[dict] = mapped_column(JSON, default=dict)
     context: Mapped[dict] = mapped_column(JSON, default=dict)
 
+    # The risk decision this signal was published with: approved or blocked,
+    # the reasons, the sizing, and the day state it was judged against.
+    #
+    # Its own column rather than a key inside `context`. `context` is the
+    # market reading the signal engine produced — VWAP, ATR, trend — and the
+    # dashboard reads it as such; folding a governance record into it would
+    # leave neither column meaning one thing. Nullable because every row
+    # written before this existed has no decision to report, and "unknown"
+    # is the honest answer for those.
+    risk: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
 
 class TradeRecord(Base):
     """The trade journal. Fill the review fields after the close, not during."""
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     symbol: Mapped[str] = mapped_column(String(48), index=True)
     side: Mapped[str] = mapped_column(String(8))
     quantity: Mapped[int] = mapped_column(Integer)
@@ -227,4 +257,4 @@ class DatasetVersion(Base):
     source_mix: Mapped[dict] = mapped_column(JSON, default=dict)
     volume_is_synthetic: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow)
+        DateTime(timezone=True), default=utc_now)

@@ -30,7 +30,7 @@ def rig(monkeypatch):
     broker = StubBroker()
     redis = FakeRedis()
     monkeypatch.setattr(ticker, "get_broker", lambda: broker)
-    monkeypatch.setattr(ticker, "redis_client", lambda: redis)
+    monkeypatch.setattr(ticker, "publish", redis.publish)
     monkeypatch.setattr(ticker, "market_is_open", lambda: True)
     ticker._previous.clear()
     return broker, redis

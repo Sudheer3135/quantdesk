@@ -1,4 +1,17 @@
-fastapi==0.115.6
+# Exact pins for the Docker image. Loose pins for local work live in
+# requirements-local.txt.
+#
+# Versions here were moved forward to clear the advisories found in the
+# August 2026 audit (finding M-3):
+#   starlette     0.41.3 -> 1.6.0    8 advisories, incl. urlencoded form
+#                                    limits being silently ignored
+#   fastapi       0.115.6 -> 0.141.1 required to reach that starlette; needs
+#                                    the lifespan handler, not on_event
+#   curl_cffi     0.13.0 -> 0.16.0   SSRF: no internal-IP restriction
+#   python-dotenv 1.0.1  -> 1.2.3    symlink following in set_key()
+#   pytest        8.3.4  -> 9.1.1    predictable /tmp directory
+fastapi==0.141.1
+starlette==1.6.0
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
@@ -10,7 +23,6 @@ pandas==2.2.3
 numpy==2.2.1
 apscheduler==3.11.0
 httpx==0.28.1
-curl_cffi==0.13.0
-python-dotenv==1.0.1
-kiteconnect==5.0.1
-pytest==8.3.4
+curl_cffi==0.16.0
+python-dotenv==1.2.3
+pytest==9.1.1

@@ -20,9 +20,11 @@ Use it for your own analysis only. Do not redistribute the data.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pandas as pd
@@ -45,6 +47,12 @@ HEADERS = {
     "Connection": "keep-alive",
 }
 
+# The index derivatives NSE publishes a chain for. Same reasoning as the
+# Yahoo allowlist: `symbol` arrives from a query parameter and is
+# interpolated into an outbound query string, so an unrecognised value must
+# be refused rather than forwarded.
+NSE_INDEX_SYMBOLS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
+
 MIN_SECONDS_BETWEEN_CALLS = 1.5
 COOKIE_MAX_AGE_SECONDS = 240
 
@@ -64,6 +72,19 @@ CANDIDATE_CHAIN_PATHS = [
 ]
 
 
+def resolve_nse_symbol(symbol: str) -> str:
+    """Validate an index symbol and return it URL-encoded."""
+    from .base import UnknownSymbol
+
+    sym = symbol.strip().upper()
+    if sym not in NSE_INDEX_SYMBOLS:
+        raise UnknownSymbol(
+            f"{symbol!r} is not an index NSE publishes a chain for. "
+            f"Supported: {', '.join(sorted(NSE_INDEX_SYMBOLS))}."
+        )
+    return quote(sym, safe="")
+
+
 class NSEClient:
     """One long-lived session. Create it once and reuse it."""
 
@@ -71,25 +92,60 @@ class NSEClient:
         self.client = httpx.Client(headers=HEADERS, timeout=timeout, follow_redirects=True)
         self._cookie_time: float = 0.0
         self._last_call: float = 0.0
+        # One instance is shared by the agent, the price ticker, the option
+        # collector and every API request thread, so the rate limit below is
+        # enforced across all of them or not at all. See `_throttle`.
+        self._lock = threading.Lock()
         self._chain_expiry: str | None = None
         self._chain_expiry_time: float = 0.0
 
     # ---- session handling ----------------------------------------------
     def _warm_up(self, force: bool = False) -> None:
-        if not force and time.time() - self._cookie_time < COOKIE_MAX_AGE_SECONDS:
-            return
-        for path in ("/", "/option-chain"):
-            try:
-                self.client.get(f"{BASE}{path}")
-            except httpx.HTTPError as exc:
-                log.warning("NSE warm-up on %s failed: %s", path, exc)
-        self._cookie_time = time.time()
+        """Refresh the session cookie, once, however many threads ask.
+
+        Held under the same lock as the throttle so a cold start does not
+        send every waiting thread to fetch its own cookie. The freshness
+        check is repeated inside the lock because the thread that was
+        blocked may find the work already done.
+        """
+        with self._lock:
+            if not force and time.monotonic() - self._cookie_time < COOKIE_MAX_AGE_SECONDS:
+                return
+            for path in ("/", "/option-chain"):
+                try:
+                    self.client.get(f"{BASE}{path}")
+                except httpx.HTTPError as exc:
+                    log.warning("NSE warm-up on %s failed: %s", path, exc)
+            self._cookie_time = time.monotonic()
 
     def _throttle(self) -> None:
-        gap = time.time() - self._last_call
-        if gap < MIN_SECONDS_BETWEEN_CALLS:
-            time.sleep(MIN_SECONDS_BETWEEN_CALLS - gap)
-        self._last_call = time.time()
+        """Space outbound calls by at least MIN_SECONDS_BETWEEN_CALLS.
+
+        Audit finding M-2: this used to read `_last_call`, sleep, then write
+        it, with no lock. Concurrent callers all measured the same gap, all
+        slept the same amount and all fired together — observed in
+        production as bursts of five requests inside 68ms, which is exactly
+        the pattern this module's own docstring warns gets the IP blocked.
+
+        The whole read-sleep-write is one critical section, so the sleep of
+        a waiting thread starts from the *updated* deadline rather than the
+        stale one. Serialising here is the point: the limit is per-source,
+        not per-thread.
+
+        Uses a monotonic clock so an NTP correction cannot make the gap look
+        negative and release a burst.
+        """
+        with self._lock:
+            gap = time.monotonic() - self._last_call
+            if gap < MIN_SECONDS_BETWEEN_CALLS:
+                # Clamped to the interval itself. A monotonic clock cannot
+                # run backwards, but a corrupted or hand-set `_last_call`
+                # would otherwise compute a sleep of arbitrary length and
+                # wedge the scheduler thread indefinitely. Waiting one full
+                # interval is the worst this can now cost.
+                time.sleep(min(MIN_SECONDS_BETWEEN_CALLS - gap,
+                               MIN_SECONDS_BETWEEN_CALLS))
+            self._last_call = time.monotonic()
 
     def get_json(self, path: str, attempts: int = 3) -> Any:
         """GET a JSON endpoint, refreshing the cookie if NSE rejects us."""
@@ -114,12 +170,13 @@ class NSEClient:
 
     # ---- endpoints ------------------------------------------------------
     def contract_info(self, symbol: str = "NIFTY") -> dict:
-        return self.get_json(f"/api/option-chain-contract-info?symbol={symbol.upper()}", attempts=3)
+        return self.get_json(
+            f"/api/option-chain-contract-info?symbol={resolve_nse_symbol(symbol)}", attempts=3)
 
     def _chain_url(self, symbol: str, expiry: str | None = None) -> str:
-        url = f"/api/option-chain-v3?type=Indices&symbol={symbol.upper()}"
+        url = f"/api/option-chain-v3?type=Indices&symbol={resolve_nse_symbol(symbol)}"
         if expiry:
-            url += f"&expiry={expiry}"
+            url += f"&expiry={quote(expiry, safe='')}"
         return url
 
     def _select_chain_expiry(self, symbol: str, expiry: str | None = None) -> str | None:
@@ -143,7 +200,8 @@ class NSEClient:
         `/api/option-chain-v3` with the selected expiry. Reusing that flow is
         more stable than probing bare candidate URLs.
         """
-        sym = symbol.upper()
+        sym = symbol.strip().upper()
+        resolve_nse_symbol(sym)          # refuse early, before any network call
 
         contract = self.contract_info(sym)
         expiry_dates = [expiry] if expiry else []
