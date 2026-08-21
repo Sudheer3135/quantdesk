@@ -179,15 +179,33 @@ def test_a_clean_day_is_approved(db, config):
     assert evaluate(config=config, state=state, **TRADE).approved
 
 
-@pytest.mark.parametrize("rows,expected_reason", [
-    ([trade(pnl=50), trade(pnl=60)], "Daily trade cap"),
-    ([trade(pnl=-1500), trade(pnl=-1600)], "losses in a row"),
-    ([trade(status="open")], "Already holding"),
+# Descriptions of rows, not rows.
+#
+# A `parametrize` list is built once, when the decorator is evaluated at
+# import — so ORM instances placed in it are shared by every case that reads
+# them, including across the sqlite and postgresql runs of the `db` fixture.
+# The first backend inserts them and commits; the objects come back detached
+# but still carrying an identity key, and `add()` on the next session treats
+# that as an existing row and issues no INSERT. The Postgres run then found
+# an empty journal, every limit measured against zero, and the trade was
+# approved — which is precisely the bug this file exists to catch, wearing
+# the costume of a passing fixture.
+#
+# Built inside the test instead, so each case gets rows of its own.
+@pytest.mark.parametrize("row_specs,expected_reason", [
+    ([{"pnl": 50}, {"pnl": 60}], "Daily trade cap"),
+    ([{"pnl": -1500}, {"pnl": -1600}], "losses in a row"),
+    ([{"status": "open"}], "Already holding"),
 ])
-def test_journal_history_blocks_the_next_trade(db, config, rows, expected_reason):
+def test_journal_history_blocks_the_next_trade(db, config, row_specs, expected_reason):
     """The regression itself: these rows exist, so the limit must trip."""
+    rows = [trade(**spec) for spec in row_specs]
     db.add_all(rows)
     db.commit()
+
+    # The premise. Without this the assertions below can pass for the wrong
+    # reason — or, as they did on Postgres, fail for one.
+    assert len(repository.todays_trades(db, trading_date())) == len(rows)
 
     day = trading_date()
     state = day_state_from_trades(day, repository.todays_trades(db, day),
