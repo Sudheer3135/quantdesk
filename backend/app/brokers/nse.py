@@ -316,6 +316,15 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
     # contracts into one premium series, and the result looks plausible.
     chain.attrs["expiry"] = chosen
 
+    # When the exchange last printed this chain, as NSE itself reports it.
+    #
+    # On a holiday NSE keeps serving the previous session's chain, so the
+    # payload looks entirely normal — same strikes, same prices, HTTP 200 —
+    # and the only thing distinguishing it from live data is this stamp.
+    # Carrying it through means the archive can refuse a replay on evidence
+    # rather than on a holiday list that might be wrong.
+    chain.attrs["source_time"] = parse_nse_timestamp(records.get("timestamp"))
+
     if not spot:                       # fall back to the ATM crossover
         diff = (chain["call_ltp"] - chain["put_ltp"]).abs()
         spot = float(chain.loc[diff.idxmin(), "strike"])

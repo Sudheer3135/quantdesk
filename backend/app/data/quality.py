@@ -318,6 +318,84 @@ def source_mix(db: Session, symbol: str, timeframe: str) -> list[Finding]:
 
 # -------------------------------------------------------------- options
 
+def option_bars_on_non_sessions(db: Session, underlying: str = "NIFTY") -> list[Finding]:
+    """Option bars dated on a day the exchange never opened.
+
+    NSE keeps serving the previous session's chain on a holiday — same
+    strikes, same prices, HTTP 200 — so the collector filed a full day of
+    identical snapshots for a day that never traded. The importer now
+    refuses those on the chain's own timestamp, but rows captured before
+    that guard existed are still in the archive, and option history cannot
+    be rebuilt to replace them. Naming them is what lets a backtest exclude
+    them.
+
+    Weekends are included in the same count. They should be impossible —
+    the collector's market-hours gate covers them — so finding any at all
+    says something about the gate, not about the calendar.
+
+    Years with no published holiday list are reported separately rather than
+    guessed at. `market_calendar.is_session` answers None for those, and
+    treating None as "not a session" would condemn a year of real data.
+    """
+    rows = db.execute(
+        select(OptionCandle.session_date, func.count(OptionCandle.id))
+        .join(OptionContract, OptionCandle.contract_id == OptionContract.id)
+        .where(OptionContract.underlying == underlying,
+               OptionCandle.session_date.isnot(None))
+        .group_by(OptionCandle.session_date)
+        .order_by(OptionCandle.session_date)
+    ).all()
+    if not rows:
+        return []
+
+    offending: list[tuple] = []
+    unverified_years: set[int] = set()
+    for session_date, count in rows:
+        state = is_session(session_date)
+        if state is None:
+            unverified_years.add(session_date.year)
+        elif state is False:
+            offending.append((session_date, count))
+
+    findings: list[Finding] = []
+    if offending:
+        bars = sum(count for _, count in offending)
+        # `is_provisional` takes the date, not the year.
+        provisional = sorted({d.year for d, _ in offending if is_provisional(d)})
+        findings.append(Finding(
+            "option_bars_on_non_sessions",
+            # An error, not a warning: these bars are indistinguishable from
+            # real ones by shape, and a backtest that reads them prices
+            # trades against a chain that never moved.
+            "error",
+            f"{bars} option bar(s) are dated on {len(offending)} day(s) the "
+            f"exchange did not trade. NSE replays the previous session's "
+            f"chain when it is shut, so these repeat a close and are not "
+            f"observations. Exclude them from any backtest."
+            + (f" Note that {', '.join(map(str, provisional))} "
+               f"{'is' if len(provisional) == 1 else 'are'} still provisional "
+               f"in market_calendar — confirm against the NSE circular before "
+               f"deleting anything." if provisional else ""),
+            count=bars,
+            detail={"days": len(offending),
+                    "provisional_years": provisional},
+            samples=[f"{d.isoformat()} ({c} bars)" for d, c in offending[:5]],
+        ))
+
+    if unverified_years:
+        findings.append(Finding(
+            "option_sessions_unverified", "info",
+            f"No published holiday list for "
+            f"{', '.join(map(str, sorted(unverified_years)))}, so option bars "
+            f"in those years cannot be checked against the exchange calendar. "
+            f"Add the year to market_calendar.HOLIDAYS to resolve this.",
+            count=len(unverified_years),
+            detail={"years": sorted(unverified_years)},
+        ))
+
+    return findings
+
+
 def missing_option_strikes(db: Session, underlying: str = "NIFTY",
                            step: float = STRIKE_STEP) -> list[Finding]:
     """Holes in the strike ladder.
@@ -785,6 +863,7 @@ def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
     if include_options:
         for finding in (option_coverage(db, symbol)
                         + option_snapshot_coverage(db, symbol)
+                        + option_bars_on_non_sessions(db, symbol)
                         + missing_option_strikes(db, symbol)
                         + abnormal_iv(db, symbol)
                         + oi_discontinuities(db, symbol)):

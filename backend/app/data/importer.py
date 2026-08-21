@@ -20,6 +20,7 @@ from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from ..market_hours import is_open as market_is_open
+from ..market_hours import is_trading_date
 from ..models import CandleRecord, OptionCandle, OptionContract
 from .upsert import UpsertResult, upsert
 from .validation import RejectionReport, clean_candles
@@ -149,6 +150,10 @@ class OptionImportReport:
     candles: UpsertResult = field(default_factory=UpsertResult)
     skipped: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Set when the whole snapshot was declined, with the reason. Distinct
+    # from a warning: a warning describes something stored, this describes
+    # something deliberately not stored.
+    refused: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -162,6 +167,7 @@ class OptionImportReport:
             "candles": self.candles.to_dict(),
             "skipped": {k: v for k, v in self.skipped.items() if v},
             "warnings": self.warnings,
+            "refused": self.refused,
         }
 
 
@@ -197,6 +203,25 @@ def _clean_iv(raw: float | None) -> float | None:
     if value <= 0 or value > 300:
         return None
     return value / 100.0
+
+
+def _chain_source_time(chain: pd.DataFrame) -> datetime | None:
+    """When the exchange last printed this chain, if the source said so.
+
+    NSE stamps its payload; the mock broker does not. A missing stamp is not
+    an error — it means this particular source cannot corroborate the day,
+    and the caller falls back to the calendar for a warning.
+    """
+    raw = getattr(chain, "attrs", {}).get("source_time") if chain is not None else None
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
 
 
 def import_option_snapshot(
@@ -244,10 +269,55 @@ def import_option_snapshot(
     report.bar_timestamp = bar_ts.isoformat()
     session_date = pd.Timestamp(bar_ts).tz_convert(IST).date()
 
+    # ---- did the exchange actually trade on this day? -------------------
+    #
+    # On a holiday NSE keeps serving the previous session's chain: same
+    # strikes, same prices, HTTP 200. Nothing in the payload looks wrong, so
+    # the collector filed a full day of identical snapshots dated on a day
+    # the market never opened — roughly 375 of them, aggregated into bars
+    # whose high, low and close are all the closing price. Option history
+    # cannot be backfilled *or* meaningfully cleaned once it is mixed in.
+    #
+    # The gate is the chain's own timestamp, not the holiday list. Evidence
+    # beats a calendar: it catches unlisted closures, mid-session halts and a
+    # source serving stale data, and it stays right when the calendar is
+    # wrong — which matters because the 2026 list is still marked
+    # provisional. Refusing a real session on a mis-transcribed holiday
+    # would destroy data that can never be recovered; refusing a replay
+    # costs nothing, because the replay carries no new information.
+    chain_time = _chain_source_time(chain)
+    if chain_time is not None:
+        # `IST` here is the zone *name*, matching this module's pandas
+        # idiom two lines above — not a tzinfo object.
+        printed_on = pd.Timestamp(chain_time).tz_convert(IST).date()
+        if printed_on != session_date:
+            report.refused = (
+                f"chain was last printed on {printed_on.isoformat()}, not "
+                f"{session_date.isoformat()} — the exchange did not trade "
+                f"today, so this snapshot is a replay of an earlier session. "
+                f"Nothing stored.")
+            report.warnings.append(report.refused)
+            return report
+
+    # Additive, not a replacement. A Saturday capture is both outside market
+    # hours and not a trading day, and the existing contract is that an
+    # out-of-hours capture says so. The calendar note adds information; it
+    # does not take the older warning's place.
     if not market_is_open(captured_at):
         report.warnings.append(
             "Captured outside market hours. The chain does not change when "
             "the market is shut, so this bar repeats the closing state.")
+
+    if not is_trading_date(session_date):
+        # The calendar says this is not a session, and no chain timestamp
+        # was available to corroborate it. A warning rather than a refusal:
+        # the calendar alone is not worth an unrecoverable deletion, because
+        # a mis-transcribed holiday would throw away a session that can
+        # never be re-collected.
+        report.warnings.append(
+            f"{session_date.isoformat()} is not a trading day according to "
+            f"the exchange calendar, and the chain carried no timestamp to "
+            f"confirm it either way. Stored, but treat it as suspect.")
 
     if chain is None or chain.empty:
         report.warnings.append("Empty chain — nothing to store.")
