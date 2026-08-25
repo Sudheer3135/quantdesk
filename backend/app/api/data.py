@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ..brokers.base import UnknownSymbol
 from ..config import get_settings
 from ..data import dataset as dataset_module
-from ..data import importer, quality, repository
+from ..data import importer, quality, regime_store, repository
 from ..db import get_db
 from ..deps import get_broker
 from ..security import require_api_key
@@ -76,6 +76,26 @@ def import_options(
     wait for the data to accumulate, and until then the option engine prices
     with Black-Scholes and says so in its `assumptions` block.
     """
+    if expiry is None:
+        # Checked before anything is fetched. `parse_option_chain` returns
+        # the nearest expiry when none is asked for but does not say which
+        # one that was, so a snapshot filed under a guess silently merges
+        # two different contracts — refuse rather than guess.
+        #
+        # The order matters beyond tidiness. This ran *after* the chain
+        # fetch, so a request that was always going to be refused first made
+        # a live call to NSE. That wasted a request against an endpoint this
+        # platform already has to throttle, and it made the refusal
+        # conditional on the network: when NSE was slow or rate-limiting,
+        # the caller got a 502 about a fetch that never needed to happen
+        # instead of the 400 explaining what they did wrong.
+        raise HTTPException(
+            400,
+            "expiry is required. The chain endpoint defaults to the nearest "
+            "expiry without reporting which, and a snapshot filed under the "
+            "wrong expiry silently merges two different contracts. Read the "
+            "list from GET /market/option-chain first.")
+
     settings = get_settings()
     broker = get_broker()
     try:
@@ -90,18 +110,6 @@ def import_options(
         raise
     except Exception as exc:
         raise HTTPException(502, f"could not load option chain: {exc}") from exc
-
-    if expiry is None:
-        # `parse_option_chain` returns the nearest expiry when none is asked
-        # for, but does not say which one that was. Storing a chain under
-        # the wrong expiry would silently mix two contracts, so refuse
-        # rather than guess.
-        raise HTTPException(
-            400,
-            "expiry is required. The chain endpoint defaults to the nearest "
-            "expiry without reporting which, and a snapshot filed under the "
-            "wrong expiry silently merges two different contracts. Read the "
-            "list from GET /market/option-chain first.")
 
     try:
         report = importer.import_option_snapshot(
@@ -147,3 +155,34 @@ def datasets(limit: int = Query(25, ge=1, le=200), db: Session = Depends(get_db)
     data did?" — a question that is unanswerable without it.
     """
     return {"datasets": dataset_module.recent(db, limit)}
+
+
+@router.post("/regimes/backfill", dependencies=[Depends(require_api_key)])
+def backfill_regimes(symbol: str = "NIFTY", timeframe: str = "5m",
+                     rebuild: bool = False, db: Session = Depends(get_db)):
+    """Classify every stored candle into a market regime.
+
+    Idempotent — it upserts, so re-running it after new candles arrive costs
+    only the new bars' worth of change. Key-guarded because it writes.
+
+    `rebuild=true` clears the table first. That is the tool for the case
+    `engine_version` exists to catch: once the classifier's thresholds
+    change, a table holding both generations produces regime splits that
+    look like findings and are artefacts of the mix. Upserting alone would
+    leave any bar whose candle has since been dropped sitting there under
+    the old version.
+    """
+    removed = regime_store.clear(db, symbol, timeframe) if rebuild else 0
+    report = regime_store.backfill(db, symbol, timeframe)
+    return report.to_dict() | {"cleared": removed}
+
+
+@router.get("/regimes")
+def regime_coverage(symbol: str = "NIFTY", timeframe: str = "5m",
+                    db: Session = Depends(get_db)):
+    """How much of the archive has been classified, and by which version.
+
+    `mixed_versions` is the one to read: true means the table holds more than
+    one definition of the same label and no split over it is trustworthy.
+    """
+    return regime_store.coverage(db, symbol, timeframe)

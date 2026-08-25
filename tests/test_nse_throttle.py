@@ -140,7 +140,10 @@ def test_cold_start_warms_up_once_not_once_per_thread(monkeypatch):
     guard = threading.Lock()
 
     class Recording:
-        def get(self, url):
+        # `timeout` is not optional decoration: the warm-up now passes a
+        # slice of the caller's budget on every page load, and a stub that
+        # would not accept one could pass while the real call raised.
+        def get(self, url, timeout=None, **kw):
             with guard:
                 calls.append(url)
 
@@ -162,7 +165,7 @@ def test_a_fresh_cookie_is_not_refetched(monkeypatch):
     calls = []
 
     class Recording:
-        def get(self, url):
+        def get(self, url, timeout=None, **kw):
             calls.append(url)
 
     c = NSEClient.__new__(NSEClient)
@@ -181,7 +184,7 @@ def test_force_refreshes_even_when_fresh(monkeypatch):
     calls = []
 
     class Recording:
-        def get(self, url):
+        def get(self, url, timeout=None, **kw):
             calls.append(url)
 
     c = NSEClient.__new__(NSEClient)

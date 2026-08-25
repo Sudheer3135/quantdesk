@@ -33,6 +33,32 @@ services:
       - ./backend/app:/srv/app
       - ./backend/alembic:/srv/alembic
       - ./scripts:/scripts
+    # Name resolution, bounded and not left to the host.
+    #
+    # On 24 and 25-Aug-2026 this container logged 268 DNS failures in eight
+    # hours while the host resolved the same names fine. Docker's embedded
+    # resolver forwards whatever the host's /etc/resolv.conf points at, so
+    # the desk inherited a resolver it never chose — a VPN's, a captive
+    # portal's, one that had gone away — and outbound calls stopped failing
+    # and started *hanging*, which is far worse: `getaddrinfo` is a blocking
+    # C call that no Python timeout can interrupt.
+    #
+    # Two named forwarders instead. Service names still resolve: on a
+    # user-defined network the container still asks Docker's embedded server
+    # at 127.0.0.11, and these are only what it forwards to, so `postgres`
+    # and `redis` are unaffected. Both are overridable, so nothing here is
+    # wedded to one address.
+    dns:
+      - ${DNS_SERVER_1:-1.1.1.1}
+      - ${DNS_SERVER_2:-8.8.8.8}
+    # The bound on the hang itself, and the reason this is a Compose fix
+    # rather than an application one. glibc defaults to five seconds per
+    # nameserver and two rounds; at two seconds and two rounds a resolution
+    # that is going to fail fails in about four, inside the option
+    # collector's budget instead of many times over it.
+    dns_opt:
+      - timeout:2
+      - attempts:2
     # Migrations run before the app, never from inside it. A process that
     # migrates its own schema on boot will happily run three copies of the
     # same migration when you scale it to three replicas.

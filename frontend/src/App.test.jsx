@@ -918,3 +918,229 @@ describe("risk exposure and freshness", () => {
     expect(badge.textContent).toMatch(/APPROVED/);
   });
 });
+
+/* --- market regime -------------------------------------------------------
+
+   The regime is a property of the market, not of any one signal, so it has
+   to render before the first signal ever arrives and it has to keep updating
+   between agent ticks. Both are easy to get wrong by hanging it off the
+   signal object, which is where every other reading on this screen lives. */
+
+const regimeFrame = (day, hour, extra = {}) => ({
+  type: "heartbeat",
+  market: { open: true, session: "open", server_time: iso(0) },
+  regime: {
+    timestamp: iso(60),
+    session_date: "2026-08-21",
+    engine_version: "1.0",
+    day: {
+      level: "day", label: day, confidence: 0.72, provisional: false,
+      reasons: ["ATR is 1.31x its own 100-bar average.",
+                "Efficiency 0.71 — 71% of the distance travelled ended up as net direction."],
+      ...(extra.day || {}),
+    },
+    hour: {
+      level: "hour", label: hour, confidence: 0.55, provisional: false,
+      reasons: ["Closed above VWAP on 83% of the window's bars."],
+      ...(extra.hour || {}),
+    },
+  },
+});
+
+describe("market regime", () => {
+  it("renders before any signal has arrived", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("TREND_UP", "TREND_UP"));
+    });
+
+    expect(screen.getByText("Market regime")).toBeTruthy();
+    expect(screen.getAllByText("Trend up").length).toBe(2);
+    expect(screen.getByText(/awaiting first signal/)).toBeTruthy();
+  });
+
+  it("shows the reasoning behind the label, not just the label", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("VOLATILE_CHOP", "RANGE"));
+    });
+
+    expect(screen.getByText(/ATR is 1.31x its own 100-bar average/)).toBeTruthy();
+    expect(screen.getByText(/71% of the distance travelled/)).toBeTruthy();
+  });
+
+  it("calls out a session and an hour that disagree", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("TREND_UP", "VOLATILE_CHOP"));
+    });
+
+    expect(screen.getByText(/either the turn or a trap/)).toBeTruthy();
+  });
+
+  it("stays quiet when the two levels agree", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("RANGE", "RANGE"));
+    });
+
+    expect(screen.queryByText(/either the turn or a trap/)).toBeNull();
+  });
+
+  it("marks a provisional reading as provisional", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(
+        regimeFrame("RANGE", "RANGE", { day: { provisional: true } }));
+    });
+
+    expect(screen.getByText("provisional")).toBeTruthy();
+  });
+
+  it("updates between signals, because the market does", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("RANGE", "RANGE"));
+    });
+    expect(screen.getAllByText("Range").length).toBe(2);
+
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("TREND_DOWN", "TREND_DOWN"));
+    });
+
+    expect(screen.getAllByText("Trend down").length).toBe(2);
+    expect(screen.queryByText("Range")).toBeNull();
+  });
+
+  it("says nothing is classified rather than inventing a condition", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver({
+        type: "heartbeat",
+        market: { open: true, session: "open", server_time: iso(0) },
+        regime: null,
+      });
+    });
+
+    expect(screen.getByText(/No regime classified yet/)).toBeTruthy();
+  });
+
+  it("keeps the last regime when a frame carries none at all", async () => {
+    /* `undefined` means this frame said nothing about the regime; `null`
+       means the backend looked and found none. Only the second should
+       clear the screen. */
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(regimeFrame("SQUEEZE", "SQUEEZE"));
+    });
+    await act(async () => {
+      FakeSocket.last.deliver(priceFrame(24_223.35, 2));
+    });
+
+    expect(screen.getAllByText("Squeeze").length).toBe(2);
+  });
+});
+
+/* --- bias and entry ------------------------------------------------------
+
+   The two layers must render as two. Fusing them back into one badge on
+   screen would undo the split the backend just made — "BULLISH, but wait for
+   a pullback near 24,180" is the sentence the desk needs, and it needs both
+   halves of it. */
+
+const planned = (bias, entry, extra = {}) => ({
+  ...signalFrame(iso(30)),
+  signal: {
+    ...signalFrame(iso(30)).signal,
+    plan: {
+      symbol: "NIFTY", timeframe: "5m", timestamp: iso(30),
+      bias: {
+        label: bias, confidence: 0.68, score: 0.41, agreement: 0.75,
+        reasons: ["15m structure is bullish.",
+                  "1h: EMAs stacked up and price above all of them."],
+        readings: [],
+      },
+      entry: {
+        state: entry, confidence: 0.55,
+        reasons: ["Session regime is TREND_UP and the bias agrees, so this is a pullback market: entries are taken at value, not at extension."],
+        style: "trend-pullback", trigger_level: 24_180.5,
+        trigger_note: "wait for a pullback toward 20 EMA",
+        stretch_atr: 1.9, regime_day: "TREND_UP", regime_hour: "TREND_UP",
+        ...(extra.entry || {}),
+      },
+      regime: null,
+    },
+  },
+});
+
+describe("bias and entry layers", () => {
+  it("shows the two layers separately", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(planned("BULLISH", "WAIT_PULLBACK"));
+    });
+
+    expect(screen.getByText("Layer 1 · higher timeframe")).toBeTruthy();
+    expect(screen.getByText("Layer 2 · this bar")).toBeTruthy();
+    expect(screen.getAllByText("Bullish").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Wait for pullback").length).toBeGreaterThan(0);
+  });
+
+  it("names the level it is waiting for", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(planned("BULLISH", "WAIT_PULLBACK"));
+    });
+
+    expect(
+      screen.getByText(/wait for a pullback toward 20 EMA 24,180.50/)
+    ).toBeTruthy();
+  });
+
+  it("shows the reasoning for both layers", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(planned("BEARISH", "NO_ENTRY"));
+    });
+
+    expect(screen.getByText(/15m structure is bullish/)).toBeTruthy();
+    expect(screen.getByText(/entries are taken at value/)).toBeTruthy();
+  });
+
+  it("renders a signal that carries no plan without breaking", async () => {
+    /* The plan is a caption on the signal, never load-bearing. */
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(signalFrame(iso(30)));
+    });
+
+    expect(screen.getByText(/No two-layer read for this signal/)).toBeTruthy();
+    expect(screen.getByText("BUY")).toBeTruthy();
+  });
+
+  it("keeps the entry state visually distinct from the bias", async () => {
+    /* The entry layer takes the bias's direction and has none of its own, so
+       it must not be coloured as though it did. */
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(
+        planned("BULLISH", "ENTER_NOW", { entry: { trigger_note: null } }));
+    });
+
+    const enter = screen.getAllByText("Enter now")[0];
+    expect(enter.className).toContain("entry-ENTER_NOW");
+  });
+});

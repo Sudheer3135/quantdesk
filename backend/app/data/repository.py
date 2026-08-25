@@ -184,9 +184,19 @@ def check_coverage(
     return None
 
 
-def _as_utc(moment: datetime) -> datetime:
-    """SQLite hands back naive datetimes. Everything here is stored in UTC."""
+def as_utc(moment: datetime) -> datetime:
+    """SQLite hands back naive datetimes. Everything here is stored in UTC.
+
+    Public because the same normalisation is needed anywhere a stored
+    timestamp is compared against a real instant, not only inside this
+    module. Reading one backend's naive value as though it carried a zone is
+    how a query answers differently on Postgres and SQLite.
+    """
     return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+# The previous private name, kept so nothing in-module has to change.
+_as_utc = as_utc
 
 
 def load_index_candles(

@@ -12,7 +12,7 @@ from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
 from .security import verify_startup
-from .workers import agent, option_collector, ticker
+from .workers import agent, option_collector, ticker, watchdog
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
@@ -41,6 +41,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler = agent.start()
     ticker.start(scheduler)
     option_collector.start(scheduler)
+
+    # Attached to the one scheduler all three share. Every job runs with
+    # `max_instances=1`, so a job that overruns its interval has its next
+    # run silently skipped — which is how the desk lost two sessions of
+    # option data while looking perfectly healthy. This gives that skip a
+    # voice; see `/health/scheduler`.
+    watchdog.attach(scheduler)
 
     try:
         yield

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.analytics.signal_engine import Signal
 from app.api import signals as signals_api
+from app.api.signals import Analysis
 from app.config import get_settings
 from app.data import repository
 from app.db import get_db
@@ -145,8 +146,13 @@ def published(db, monkeypatch):
     monkeypatch.setattr(agent, "publish", capture)
 
     def run(signal):
-        monkeypatch.setattr(agent, "build_signal", lambda *a, **k: signal)
-        agent.tick()
+        # The agent builds a signal and a two-layer plan in one pass now.
+        # Stubbing the pass rather than the signal keeps the seam where the
+        # code actually has one; `plan=None` is the honest stand-in, since
+        # what is under test here is the risk decision, not the plan.
+        monkeypatch.setattr(agent, "build_analysis",
+                            lambda *a, **k: Analysis(signal=signal, plan=None))
+        agent.tick(force=True)
         assert sent, "the agent published nothing"
         return sent["payload"]
 
@@ -351,7 +357,8 @@ def test_both_routes_produce_the_same_decision(db, published, monkeypatch):
     app = FastAPI()
     app.include_router(signals_api.router)
     app.dependency_overrides[get_db] = lambda: db
-    monkeypatch.setattr(signals_api, "build_signal", lambda *a, **k: signal)
+    monkeypatch.setattr(signals_api, "build_analysis",
+                        lambda *a, **k: Analysis(signal=signal, plan=None))
 
     from_endpoint = TestClient(app).get("/signals/live").json()["risk"]
     from_socket = published(signal)["risk"]
@@ -371,7 +378,8 @@ def test_the_endpoint_still_carries_its_decision(db, monkeypatch):
     app = FastAPI()
     app.include_router(signals_api.router)
     app.dependency_overrides[get_db] = lambda: db
-    monkeypatch.setattr(signals_api, "build_signal", lambda *a, **k: a_buy())
+    monkeypatch.setattr(signals_api, "build_analysis",
+                        lambda *a, **k: Analysis(signal=a_buy(), plan=None))
 
     risk = TestClient(app).get("/signals/live").json()["risk"]
     assert risk["evaluated"] is True
@@ -380,23 +388,33 @@ def test_the_endpoint_still_carries_its_decision(db, monkeypatch):
 
 # ---- no second copy of the logic --------------------------------------
 
-def _calls_named(path: Path, name: str) -> bool:
-    """Does this module actually *call* `name`, per the parse tree?
+def _reaches_the_risk_evaluator(path: Path) -> bool:
+    """Does this module get at `risk.manager.evaluate`?
 
-    The first version of this test searched the source text for "evaluate(",
-    which also matches the word inside a comment or a docstring — so a future
-    note explaining why a route does not evaluate risk would have failed it.
-    An AST walk asks the question that was meant: is there a call here.
+    Two earlier versions of this check were wrong in opposite directions. A
+    text search for "evaluate(" also matched the word in a comment. Matching
+    any call named `evaluate` then caught `outcome_study.evaluate` — the
+    signal-outcome study, an entirely different function that happens to
+    share a verb.
+
+    The precise question is whether a route can reach the risk rulebook at
+    all, and it cannot call what it has not imported. So: the import is the
+    check, plus a qualified call through the manager module.
     """
     tree = ast.parse(path.read_text())
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Name) and func.id == name:
-            return True
-        if isinstance(func, ast.Attribute) and func.attr == name:
-            return True
+        if isinstance(node, ast.ImportFrom) and node.module:
+            # The last segment, so a relative `from .manager import evaluate`
+            # counts the same as `from ..risk.manager import evaluate`.
+            if node.module.split(".")[-1] == "manager" and any(
+                    alias.name == "evaluate" for alias in node.names):
+                return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (isinstance(func, ast.Attribute) and func.attr == "evaluate"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in {"manager", "risk_manager"}):
+                return True
     return False
 
 
@@ -405,7 +423,8 @@ def test_no_live_route_evaluates_risk_for_itself():
 
     H-4 existed because the assembly lived inside a route. The second route
     then went without one. This fails the moment an API route or a worker
-    calls `evaluate` directly again instead of going through the shared step.
+    reaches for the risk rulebook directly instead of going through the
+    shared step.
 
     The backtest engines are deliberately not covered: they run the same
     rulebook over historical bars with their own simulated day state, which
@@ -418,26 +437,32 @@ def test_no_live_route_evaluates_risk_for_itself():
     assert live, "test premise: found no api or worker modules"
 
     offenders = sorted(p.relative_to(root).as_posix() for p in live
-                       if _calls_named(p, "evaluate"))
+                       if _reaches_the_risk_evaluator(p))
     assert offenders == [], offenders
 
-    # And the shared step really is the one that calls it.
-    assert _calls_named(root / "risk" / "live.py", "evaluate")
+    # And the shared step really is the one that reaches it.
+    assert _reaches_the_risk_evaluator(root / "risk" / "live.py")
 
 
-def test_the_ast_check_can_tell_a_call_from_a_mention(tmp_path):
-    """Guard against the guard. A checker that never finds a call would make
-    the assertion above pass vacuously, and one that matched text would fail
-    on a comment."""
+def test_the_check_can_tell_the_risk_evaluator_from_anything_else(tmp_path):
+    """Guard against the guard, in both directions this check has been wrong.
+
+    A comment mentioning it is not a call. A different module's `evaluate`
+    is not the risk manager's. Both used to fail this test."""
     mentions = tmp_path / "mentions.py"
     mentions.write_text('"""We deliberately do not call evaluate() here."""\n'
                         "# evaluate(x) would be wrong\n"
                         "value = 1\n")
-    calls = tmp_path / "calls.py"
-    calls.write_text("from x import evaluate\nevaluate(1)\n")
+    other = tmp_path / "other.py"
+    other.write_text("from ..evaluation import outcomes as study\n"
+                     "study.evaluate(db)\n")
+    real = tmp_path / "real.py"
+    real.write_text("from ..risk.manager import evaluate\n"
+                    "evaluate(config=1, state=2)\n")
 
-    assert not _calls_named(mentions, "evaluate")
-    assert _calls_named(calls, "evaluate")
+    assert not _reaches_the_risk_evaluator(mentions)
+    assert not _reaches_the_risk_evaluator(other)
+    assert _reaches_the_risk_evaluator(real)
 
 
 def test_the_ist_trading_day_is_what_the_cap_counts(db, published):

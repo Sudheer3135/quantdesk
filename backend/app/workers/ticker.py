@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from .. import net
 from ..cache import publish
 from ..config import get_settings
 from ..deps import get_broker
@@ -78,7 +79,13 @@ def tick() -> None:
 
     symbol = settings.watch_symbol
     try:
-        quote = get_broker().quote(symbol)
+        # Bounded by this job's own interval. A quote that takes longer than
+        # the gap to the next poll is not a slow quote, it is a quote that
+        # will be superseded before it arrives — and while it is in flight
+        # `max_instances=1` skips the poll that would have replaced it.
+        with net.budget(net.budget_for(settings.ticker_interval_seconds),
+                        label="price-ticker"):
+            quote = get_broker().quote(symbol)
         price = float(quote["last_price"])
     except Exception as exc:
         # A failed price poll is routine — NSE throttles, networks blip.

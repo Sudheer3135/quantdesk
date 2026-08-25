@@ -293,6 +293,25 @@ def run_api(base: str) -> None:
                 return json.dumps(body)[:180]
             return ", ".join(f"{k}={v}" for k, v in list(body.items())[:4])[:180]
 
+    # Reported on its own rather than through the loop above, because the
+    # generic printer truncates and the one field that matters here — what
+    # is actually starving — would be the part cut off. `/health` said "ok"
+    # throughout both sessions the desk lost; this is the question that was
+    # really failing.
+    @check("scheduler not starved")
+    def _():
+        r = httpx.get(f"{base}/health/scheduler", timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:180]}")
+        body = r.json()
+        jobs = body.get("jobs") or {}
+        summary = ", ".join(
+            f"{name} ok={h['successes']} skipped={h['skips']}"
+            for name, h in sorted(jobs.items())) or "no job has run yet"
+        if not body.get("healthy", True):
+            raise RuntimeError("; ".join(body["problems"]))
+        return summary
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()

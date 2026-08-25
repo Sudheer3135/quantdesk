@@ -1,21 +1,50 @@
+import logging
+from dataclasses import dataclass
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..analytics import options as option_analytics
+from ..analytics import plan as plan_builder
 from ..analytics import signal_engine
 from ..brokers.base import UnknownSymbol
 from ..db import get_db
 from ..deps import get_broker
+from ..evaluation import outcomes as outcome_study
+from ..evaluation import regime_report, two_layer
 from ..models import SignalRecord
 from ..risk import live as risk_live
 from ..security import HEADER as API_KEY_HEADER
 from ..security import key_is_valid
 from ..symbols import validate as validate_symbol
 
+log = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/signals", tags=["signals"])
 
 
-def build_signal(symbol: str, timeframe: str, days: int = 5) -> signal_engine.Signal:
+@dataclass
+class Analysis:
+    """One market read: the existing verdict, and the two-layer plan beside it.
+
+    Both are built from the same candle frame and the same option chain in
+    one pass. Fetching twice would let the signal and the plan describe
+    different bars — a five-minute boundary crossing between two broker calls
+    is enough — and the dashboard would show a BUY against a plan formed on a
+    different price.
+    """
+    signal: signal_engine.Signal
+    plan: plan_builder.Plan | None = None
+
+
+def build_analysis(symbol: str, timeframe: str, days: int = 5) -> Analysis:
+    """The signal and the plan, from one fetch.
+
+    The plan is additive: it changes nothing about how the signal is reached.
+    If building it fails the signal still ships, because a missing plan costs
+    the desk a caption and a missing signal costs it the screen.
+    """
     symbol = validate_symbol(symbol)
     broker = get_broker()
     candles = broker.candles(symbol, timeframe, days)
@@ -23,10 +52,47 @@ def build_signal(symbol: str, timeframe: str, days: int = 5) -> signal_engine.Si
         chain = broker.option_chain(symbol)
     except Exception:
         chain = None
-    return signal_engine.generate(
+
+    signal = signal_engine.generate(
         candles, symbol=symbol, timeframe=timeframe,
         chain=chain, india_vix=broker.india_vix(),
     )
+
+    plan = None
+    try:
+        # The chain summary the engine already computed, reused rather than
+        # recomputed — two summaries of one chain is two chances to disagree
+        # about what the positioning says.
+        summary = None
+        stored = (signal.context or {}).get("option_chain")
+        if stored:
+            summary = option_analytics.ChainSummary(**stored)
+        plan = plan_builder.build(candles, symbol=symbol, timeframe=timeframe,
+                                  chain=chain, chain_summary=summary)
+    except Exception:
+        log.exception("plan build failed; serving the signal without it")
+
+    return Analysis(signal=signal, plan=plan)
+
+
+def build_signal(symbol: str, timeframe: str, days: int = 5) -> signal_engine.Signal:
+    """The verdict alone. Kept because plenty of callers only want that."""
+    return build_analysis(symbol, timeframe, days).signal
+
+
+def plan_columns(built: plan_builder.Plan | None) -> dict:
+    """The signal row's plan fields. One definition, used by both writers.
+
+    The agent and `/signals/live` both persist signals, and the two-layer
+    read has to land in the same three columns from either. The last time a
+    field was assembled separately in these two routes, one of them shipped
+    without it for weeks — see audit finding H-4.
+    """
+    if built is None:
+        return {"bias": None, "entry_state": None, "plan": None}
+    return {"bias": built.bias["label"],
+            "entry_state": built.entry["state"],
+            "plan": built.to_dict()}
 
 
 @router.get("/live")
@@ -40,7 +106,8 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
         raise HTTPException(
             401, f"persist=true writes a signal row. Send your key in the {API_KEY_HEADER} header.")
     try:
-        sig = build_signal(symbol, timeframe)
+        analysis = build_analysis(symbol, timeframe)
+        sig = analysis.signal
     except UnknownSymbol:
         # The caller named something we do not carry. Let it reach the 422
         # handler instead of being relabelled as an upstream failure.
@@ -50,6 +117,7 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
 
     payload = sig.to_dict()
     payload["explanation"] = sig.explain()
+    payload["plan"] = analysis.plan.to_dict() if analysis.plan else None
 
     # The risk decision is assembled in `risk.live` and nowhere else. It used
     # to be built inline here, which is how the agent's route — the one the
@@ -67,6 +135,7 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
             # why" is answerable from the database rather than only from
             # whatever was on screen at the time.
             risk=payload["risk"],
+            **plan_columns(analysis.plan),
         )
         db.add(record)
         db.commit()
@@ -86,3 +155,82 @@ def signal_history(limit: int = 50, db: Session = Depends(get_db)):
          "stop_loss": r.stop_loss, "target": r.target}
         for r in rows
     ]
+
+
+@router.get("/outcomes")
+def signal_outcomes(symbol: str = "NIFTY", timeframe: str = "5m",
+                    include_signals: bool = False,
+                    db: Session = Depends(get_db)):
+    """What actually happened after each stored signal.
+
+    Read-only, and it computes no signal of its own: it replays decisions
+    already on record against candles already on record, using the backtest's
+    entry and exit conventions so the answer is comparable with what the
+    engine would have produced.
+
+    `include_signals=true` returns every individual outcome. The default is
+    the summary, because the per-signal list is long and the aggregate is
+    what answers the question.
+
+    Read `selection` before anything else. It says how many stored signals
+    were excluded and why, and a win rate whose sample you have not looked at
+    is not a result.
+    """
+    symbol = validate_symbol(symbol)
+    report = outcome_study.evaluate(
+        db, symbol, timeframe, include_outcomes=include_signals)
+    return report.to_dict()
+
+
+@router.get("/outcomes/by-regime")
+def outcomes_by_regime(symbol: str = "NIFTY", timeframe: str = "5m",
+                       db: Session = Depends(get_db)):
+    """The same evaluated signals, split by the market condition they fired in.
+
+    The headline outcome study averages over every condition the market can
+    be in, which is an average of things that should not be added together:
+    a rule that works in a trend and fails in chop looks like a rule that
+    does not work. This asks where it fails.
+
+    Read `matched` and `unmatched` first. Unmatched signals are reported as
+    an `unclassified` bucket rather than dropped — quietly shrinking the
+    sample would let a split of 140 be compared against a headline of 167
+    without anyone noticing. If `unmatched` is large, the regime table is
+    behind the candle archive: POST /data/regimes/backfill.
+
+    Every bucket carries an `interpretation` saying whether its `n` is large
+    enough to mean anything. Most are not, yet.
+    """
+    symbol = validate_symbol(symbol)
+    return regime_report.build(db, symbol, timeframe).to_dict()
+
+
+@router.get("/outcomes/two-layer")
+def outcomes_two_layer(symbol: str = "NIFTY", timeframe: str = "5m",
+                       include_rows: bool = False,
+                       db: Session = Depends(get_db)):
+    """The evaluated signals seen through the bias and entry-state layers.
+
+    Answers the two questions separately, because they fail separately. A
+    bias can be right while every trade taken on it is stopped out — that is
+    exactly the case Step 1 found, where eleven with-trend signals had an
+    average best moment of 0.059R.
+
+    Read in this order:
+
+      `bias_accuracy.edge_over_base_rate` — not `accuracy`. If most hours in
+      the sample closed up, a permanently bullish model scores well and
+      knows nothing.
+
+      `entry_states` — what the model WOULD have said. Nothing was gated on
+      it; that is a later step, and this is the evidence for it.
+
+      `reinterpretation` — the two groups side by side. Suggestive at best:
+      167 non-independent observations over thirteen trading days.
+
+    The plans are recomputed from the archive at each signal's own bar, from
+    a window the size the live path actually sees. Nothing is written back.
+    """
+    symbol = validate_symbol(symbol)
+    return two_layer.build(db, symbol, timeframe,
+                           include_rows=include_rows).to_dict()

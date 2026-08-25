@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.analytics.signal_engine import Signal
 from app.api import signals as signals_api
+from app.api.signals import Analysis
 from app.config import get_settings
 from app.db import get_db
 from app.models import SignalRecord, TradeRecord
@@ -49,8 +50,9 @@ def ticked(db, monkeypatch):
     monkeypatch.setattr(agent, "publish", lambda *a, **k: True)
 
     def run(signal):
-        monkeypatch.setattr(agent, "build_signal", lambda *a, **k: signal)
-        agent.tick()
+        monkeypatch.setattr(agent, "build_analysis",
+                        lambda *a, **k: Analysis(signal=signal, plan=None))
+        agent.tick(force=True)
         return db.query(SignalRecord).order_by(SignalRecord.id.desc()).first()
 
     return run
@@ -112,9 +114,10 @@ def test_the_stored_decision_matches_the_published_one(db, monkeypatch):
     monkeypatch.setattr(agent, "SessionLocal", SessionFactory(db))
     monkeypatch.setattr(agent, "publish",
                         lambda channel, blob, **kw: sent.update(json.loads(blob)))
-    monkeypatch.setattr(agent, "build_signal", lambda *a, **k: a_buy())
+    monkeypatch.setattr(agent, "build_analysis",
+                        lambda *a, **k: Analysis(signal=a_buy(), plan=None))
 
-    agent.tick()
+    agent.tick(force=True)
 
     stored = db.query(SignalRecord).order_by(SignalRecord.id.desc()).first()
     assert stored.risk == sent["risk"]
@@ -123,7 +126,8 @@ def test_the_stored_decision_matches_the_published_one(db, monkeypatch):
 # ---- the endpoint's route ----------------------------------------------
 
 def test_persisting_through_the_endpoint_records_the_decision(db, monkeypatch):
-    monkeypatch.setattr(signals_api, "build_signal", lambda *a, **k: a_buy())
+    monkeypatch.setattr(signals_api, "build_analysis",
+                        lambda *a, **k: Analysis(signal=a_buy(), plan=None))
     app = FastAPI()
     app.include_router(signals_api.router)
     app.dependency_overrides[get_db] = lambda: db

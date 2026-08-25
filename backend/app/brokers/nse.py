@@ -29,6 +29,8 @@ from urllib.parse import quote
 import httpx
 import pandas as pd
 
+from .. import net
+
 log = logging.getLogger(__name__)
 
 BASE = "https://www.nseindia.com"
@@ -55,6 +57,31 @@ NSE_INDEX_SYMBOLS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"})
 
 MIN_SECONDS_BETWEEN_CALLS = 1.5
 COOKIE_MAX_AGE_SECONDS = 240
+
+# One HTTP round trip. Shorter than the 12s it replaces, because the number
+# that matters is now the caller's budget and this is only the point at
+# which a single hung socket stops being worth waiting on. NSE answers a
+# healthy chain request in about 1.6s.
+REQUEST_TIMEOUT_SECONDS = 8.0
+
+# What a standalone call gets when nobody upstream set a budget — an API
+# request handler, a diagnostic script. Scheduled work always arrives with
+# its own, sized from its interval; see `net.budget_for`.
+DEFAULT_BUDGET_SECONDS = 30.0
+
+# Backoff between attempts within one `get_json`.
+RETRY_BACKOFF_SECONDS = 1.5
+
+# How many published expiries a chain fetch will try before giving up.
+#
+# NSE lists every weekly and monthly expiry it carries, a dozen or more, and
+# the loop below used to try all of them. A healthy fetch succeeds on the
+# first — the list arrives nearest-first and that is the one being collected
+# — so trying the rest only ever happens when something is already wrong,
+# and it turns one failing call into twelve. Two spares is enough to survive
+# an expiry rolling over mid-session, which is the case the loop was written
+# for.
+MAX_CHAIN_EXPIRIES = 3
 
 # NSE moves this path without notice. Confirmed on 05-Aug-2026: the old
 # /api/option-chain-indices returns 404 while /api/allIndices still works,
@@ -88,7 +115,10 @@ def resolve_nse_symbol(symbol: str) -> str:
 class NSEClient:
     """One long-lived session. Create it once and reuse it."""
 
-    def __init__(self, timeout: float = 12.0):
+    def __init__(self, timeout: float = REQUEST_TIMEOUT_SECONDS):
+        # A per-request default. Every call site below overrides it with a
+        # slice of the caller's remaining budget, so this only covers a path
+        # that forgot to — a floor, not the policy.
         self.client = httpx.Client(headers=HEADERS, timeout=timeout, follow_redirects=True)
         self._cookie_time: float = 0.0
         self._last_call: float = 0.0
@@ -100,25 +130,42 @@ class NSEClient:
         self._chain_expiry_time: float = 0.0
 
     # ---- session handling ----------------------------------------------
-    def _warm_up(self, force: bool = False) -> None:
+    def _warm_up(self, force: bool = False,
+                 deadline: net.Deadline | None = None) -> None:
         """Refresh the session cookie, once, however many threads ask.
 
         Held under the same lock as the throttle so a cold start does not
         send every waiting thread to fetch its own cookie. The freshness
         check is repeated inside the lock because the thread that was
         blocked may find the work already done.
+
+        Two page loads, and both of them spend from the caller's budget.
+        This is the step that made a slow network catastrophic rather than
+        merely slow: `get_json` warms up before *every* attempt, so an
+        unbounded warm-up multiplied by attempts, by candidate expiries.
+
+        A warm-up cut short by the budget deliberately does not stamp
+        `_cookie_time`. Recording a half-finished handshake as fresh would
+        leave the client believing it holds a cookie it never received, and
+        the next call would fail on a 401 it could have avoided.
         """
         with self._lock:
             if not force and time.monotonic() - self._cookie_time < COOKIE_MAX_AGE_SECONDS:
                 return
             for path in ("/", "/option-chain"):
                 try:
-                    self.client.get(f"{BASE}{path}")
+                    timeout = (deadline.slice(REQUEST_TIMEOUT_SECONDS)
+                               if deadline is not None else REQUEST_TIMEOUT_SECONDS)
+                except net.BudgetExhausted as exc:
+                    log.warning("NSE warm-up abandoned before %s: %s", path, exc)
+                    return
+                try:
+                    self.client.get(f"{BASE}{path}", timeout=timeout)
                 except httpx.HTTPError as exc:
                     log.warning("NSE warm-up on %s failed: %s", path, exc)
             self._cookie_time = time.monotonic()
 
-    def _throttle(self) -> None:
+    def _throttle(self, deadline: net.Deadline | None = None) -> None:
         """Space outbound calls by at least MIN_SECONDS_BETWEEN_CALLS.
 
         Audit finding M-2: this used to read `_last_call`, sleep, then write
@@ -134,6 +181,12 @@ class NSEClient:
 
         Uses a monotonic clock so an NTP correction cannot make the gap look
         negative and release a burst.
+
+        With a `deadline`, a caller that cannot afford the full spacing is
+        refused rather than released early. Shortening the gap to fit a
+        budget would fire the burst this whole method exists to prevent, and
+        an NSE block costs option snapshots that cannot be re-collected —
+        strictly worse than the skipped poll that refusing costs.
         """
         with self._lock:
             gap = time.monotonic() - self._last_call
@@ -143,35 +196,60 @@ class NSEClient:
                 # would otherwise compute a sleep of arbitrary length and
                 # wedge the scheduler thread indefinitely. Waiting one full
                 # interval is the worst this can now cost.
-                time.sleep(min(MIN_SECONDS_BETWEEN_CALLS - gap,
-                               MIN_SECONDS_BETWEEN_CALLS))
+                wait = min(MIN_SECONDS_BETWEEN_CALLS - gap,
+                           MIN_SECONDS_BETWEEN_CALLS)
+                if deadline is not None:
+                    deadline.wait(wait)
+                else:
+                    time.sleep(wait)
             self._last_call = time.monotonic()
 
-    def get_json(self, path: str, attempts: int = 3) -> Any:
-        """GET a JSON endpoint, refreshing the cookie if NSE rejects us."""
+    def get_json(self, path: str, attempts: int = 3,
+                 deadline: net.Deadline | None = None) -> Any:
+        """GET a JSON endpoint, refreshing the cookie if NSE rejects us.
+
+        Every wait in here — warm-up, rate limit, request, backoff — comes
+        out of one budget, so the total is bounded by it however the
+        attempts fall. Without that the retry structure was multiplicative:
+        three attempts, each preceded by a two-page warm-up, at twelve
+        seconds a socket.
+
+        `BudgetExhausted` propagates rather than being retried. There is
+        nothing to retry with.
+        """
+        deadline = deadline or net.deadline_or(DEFAULT_BUDGET_SECONDS,
+                                               label=f"NSE {path}")
         last_error: Exception | None = None
         for attempt in range(attempts):
-            self._warm_up(force=attempt > 0)
-            self._throttle()
+            self._warm_up(force=attempt > 0, deadline=deadline)
+            self._throttle(deadline)
             try:
-                response = self.client.get(f"{BASE}{path}")
+                response = self.client.get(
+                    f"{BASE}{path}", timeout=deadline.slice(REQUEST_TIMEOUT_SECONDS))
                 if response.status_code == 200 and response.text.strip():
                     return response.json()
                 last_error = RuntimeError(
                     f"NSE returned {response.status_code} for {path}"
                 )
+            except net.BudgetExhausted:
+                raise
             except Exception as exc:
                 last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+            # Only *between* attempts. The old code slept after the last one
+            # too, spending four and a half seconds on its way to raising.
+            if attempt + 1 < attempts:
+                deadline.wait(RETRY_BACKOFF_SECONDS * (attempt + 1))
         raise RuntimeError(f"NSE request failed after {attempts} attempts: {last_error}")
 
     def close(self) -> None:
         self.client.close()
 
     # ---- endpoints ------------------------------------------------------
-    def contract_info(self, symbol: str = "NIFTY") -> dict:
+    def contract_info(self, symbol: str = "NIFTY",
+                      deadline: net.Deadline | None = None) -> dict:
         return self.get_json(
-            f"/api/option-chain-contract-info?symbol={resolve_nse_symbol(symbol)}", attempts=3)
+            f"/api/option-chain-contract-info?symbol={resolve_nse_symbol(symbol)}",
+            attempts=3, deadline=deadline)
 
     def _chain_url(self, symbol: str, expiry: str | None = None) -> str:
         url = f"/api/option-chain-v3?type=Indices&symbol={resolve_nse_symbol(symbol)}"
@@ -179,47 +257,69 @@ class NSEClient:
             url += f"&expiry={quote(expiry, safe='')}"
         return url
 
-    def _select_chain_expiry(self, symbol: str, expiry: str | None = None) -> str | None:
+    def _select_chain_expiry(self, symbol: str, expiry: str | None = None,
+                             deadline: net.Deadline | None = None) -> str | None:
         if expiry:
             return expiry
 
         if self._chain_expiry and time.time() - self._chain_expiry_time < 6 * 3600:
             return self._chain_expiry
 
-        contract = self.contract_info(symbol)
+        contract = self.contract_info(symbol, deadline=deadline)
         dates = contract.get("expiryDates") or []
         chosen = dates[0] if dates else None
         self._chain_expiry = chosen
         self._chain_expiry_time = time.time()
         return chosen
 
-    def raw_option_chain(self, symbol: str = "NIFTY", expiry: str | None = None) -> dict:
+    def raw_option_chain(self, symbol: str = "NIFTY", expiry: str | None = None,
+                         deadline: net.Deadline | None = None) -> dict:
         """Fetch the chain using the same flow as NSE's own page.
 
         NSE's option-chain page first loads contract metadata, then requests
         `/api/option-chain-v3` with the selected expiry. Reusing that flow is
         more stable than probing bare candidate URLs.
+
+        The metadata request and every chain attempt share one budget. They
+        did not before, and this method is where the 25-Aug-2026 data loss
+        was manufactured: one call, unbounded, fanning out across every
+        expiry NSE publishes, on a job scheduled every sixty seconds.
         """
         sym = symbol.strip().upper()
         resolve_nse_symbol(sym)          # refuse early, before any network call
+        deadline = deadline or net.deadline_or(DEFAULT_BUDGET_SECONDS,
+                                               label="NSE option chain")
 
-        contract = self.contract_info(sym)
+        contract = self.contract_info(sym, deadline=deadline)
         expiry_dates = [expiry] if expiry else []
         for candidate in contract.get("expiryDates") or []:
             if candidate not in expiry_dates:
                 expiry_dates.append(candidate)
 
         errors: list[str] = []
-        for candidate_expiry in expiry_dates:
+        for candidate_expiry in expiry_dates[:MAX_CHAIN_EXPIRIES]:
             path = self._chain_url(sym, candidate_expiry)
             try:
-                payload = self.get_json(path, attempts=2)
+                payload = self.get_json(path, attempts=2, deadline=deadline)
                 if isinstance(payload, dict) and payload.get("records", {}).get("data"):
                     self._chain_expiry = candidate_expiry
                     self._chain_expiry_time = time.time()
                     log.info("NSE option chain endpoint resolved to %s", path)
                     return payload
                 errors.append(f"{path}: 200 but no strike rows")
+            except net.BudgetExhausted as exc:
+                # Out of time, not out of endpoints. Trying the next expiry
+                # would only add another line to the error list.
+                #
+                # Re-raised as itself rather than folded into the RuntimeError
+                # below, because the two say different things to the caller
+                # and lead to different fixes: "NSE refused us" is a source
+                # problem, "we ran out of the time our schedule allows" is
+                # ours. The collector logs them differently for that reason.
+                raise net.BudgetExhausted(
+                    f"NSE option chain ran out of budget: {exc}"
+                    + (f" (after {'; '.join(errors)})" if errors else "")
+                ) from exc
             except Exception as exc:
                 errors.append(f"{path}: {exc}")
 
@@ -230,8 +330,8 @@ class NSEClient:
               "Network tab at https://www.nseindia.com/option-chain."
         )
 
-    def all_indices(self) -> dict:
-        return self.get_json("/api/allIndices")
+    def all_indices(self, deadline: net.Deadline | None = None) -> dict:
+        return self.get_json("/api/allIndices", deadline=deadline)
 
 
 # --------------------------------------------------------------------------

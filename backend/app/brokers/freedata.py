@@ -27,6 +27,7 @@ from urllib.parse import quote
 import pandas as pd
 from curl_cffi import requests as curl_requests
 
+from .. import net
 from .base import Broker, UnknownSymbol
 from .nse import NSEClient, parse_index_value, parse_nse_timestamp, parse_option_chain
 
@@ -72,6 +73,15 @@ MAX_DAYS = {"1m": 7, "2m": 59, "5m": 59, "15m": 59, "30m": 59, "60m": 729, "1d":
 # than blocking the ticker behind one slow request.
 QUOTE_TIMEOUT_SECONDS = 8
 
+# A candle fetch is three hundred rows and is allowed to be slower than a
+# quote, but not unboundedly so.
+CANDLE_TIMEOUT_SECONDS = 20
+
+# What a Yahoo call gets when nobody upstream set a budget. Scheduled work
+# always arrives with one, sized from its own interval — see `net.budget_for`
+# and the workers that wrap their ticks in it.
+DEFAULT_BUDGET_SECONDS = 30.0
+
 INTERVAL_MAP = {
     "1m": "1m", "3m": "5m", "5m": "5m", "15m": "15m",
     "30m": "30m", "1h": "60m", "60m": "60m", "1d": "1d",
@@ -102,7 +112,10 @@ class FreeDataBroker(Broker):
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
             f"?range={days}d&interval={yf_interval}&includePrePost=false&events=div%2Csplits"
         )
-        response = curl_requests.get(url, impersonate="chrome120", timeout=20)
+        deadline = net.deadline_or(DEFAULT_BUDGET_SECONDS, label="Yahoo candles")
+        response = curl_requests.get(
+            url, impersonate="chrome120",
+            timeout=deadline.slice(CANDLE_TIMEOUT_SECONDS))
         if response.status_code != 200:
             raise RuntimeError(
                 f"Yahoo returned {response.status_code} for {ticker} at {yf_interval}")
@@ -151,8 +164,10 @@ class FreeDataBroker(Broker):
         ticker = resolve_yahoo_symbol(symbol)
         url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
                f"?range=1d&interval=1m")
-        response = curl_requests.get(url, impersonate="chrome120",
-                                     timeout=QUOTE_TIMEOUT_SECONDS)
+        deadline = net.deadline_or(DEFAULT_BUDGET_SECONDS, label="Yahoo quote")
+        response = curl_requests.get(
+            url, impersonate="chrome120",
+            timeout=deadline.slice(QUOTE_TIMEOUT_SECONDS))
         if response.status_code != 200:
             raise RuntimeError(f"Yahoo returned {response.status_code} for {ticker}")
 
@@ -200,6 +215,13 @@ class FreeDataBroker(Broker):
         """
         try:
             return self._yahoo_quote(symbol)
+        except net.BudgetExhausted:
+            # No time left is not the same failure as a source being down,
+            # and only the second one has a useful fallback. Falling through
+            # here would start a second and a third request that the caller's
+            # schedule has already run out of room for — which is how one
+            # slow poll became a skipped tick became a lost session.
+            raise
         except Exception as exc:
             log.debug("Yahoo quote failed, trying NSE: %s", exc)
 
@@ -210,6 +232,8 @@ class FreeDataBroker(Broker):
             if value:
                 return {"last_price": value, "source": "nse",
                         "source_time": parse_nse_timestamp(indices.get("timestamp"))}
+        except net.BudgetExhausted:
+            raise
         except Exception as exc:
             log.debug("NSE quote failed, falling back to candles: %s", exc)
 

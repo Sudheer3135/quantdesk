@@ -24,13 +24,14 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
 from ..market_calendar import is_provisional, is_session
+from ..market_hours import OPEN, session_label
 from ..models import CandleRecord, OptionCandle, OptionContract
 from . import oi_classifier
 from . import option_coverage as option_coverage_lib
@@ -49,6 +50,10 @@ STRIKE_STEP = 50.0
 MAX_PLAUSIBLE_IV = 2.0
 MIN_PLAUSIBLE_IV = 0.01
 
+
+# How many polling intervals may pass before a quiet collector counts as
+# a stopped one. One covers a missed poll and scheduler jitter.
+LIVENESS_TOLERANCE_INTERVALS = 3
 
 INDEX = "index"
 OPTIONS = "options"
@@ -317,6 +322,74 @@ def source_mix(db: Session, symbol: str, timeframe: str) -> list[Finding]:
 
 
 # -------------------------------------------------------------- options
+
+def option_collector_liveness(db: Session, underlying: str = "NIFTY") -> list[Finding]:
+    """Is the option collector still running, right now?
+
+    Option history is the one dataset here that cannot be rebuilt. If the
+    collector dies mid-session — a throttled source, a broken cookie, a
+    scheduler that quietly stopped — nothing announces it. The archive keeps
+    answering questions about the days it already has, and the gap is
+    discovered weeks later by a backtest that comes up short for a week
+    nobody can go back and re-collect.
+
+    So this asks the operational question rather than the archival one: has
+    a snapshot landed recently *while the market is open*. Outside the
+    session it says nothing, because silence is the correct behaviour then
+    and an alarm that cries all night is one nobody reads.
+    """
+    if session_label() != OPEN:
+        return []
+
+    latest = db.scalar(
+        select(func.max(OptionCandle.ingested_at))
+        .join(OptionContract, OptionCandle.contract_id == OptionContract.id)
+        .where(OptionContract.underlying == underlying)
+    )
+    interval = get_settings().option_snapshot_interval_seconds
+
+    if latest is None:
+        # Never collected is not the same failure as stopped collecting, and
+        # only the second one is an error.
+        #
+        # A desk that has been polling for months and goes quiet mid-session
+        # is losing data it can never get back — that is the alarm this check
+        # exists for. A database with no option snapshot *at all* is usually
+        # a fresh install, where the honest reading is "not set up yet".
+        # Grading it `error` made `report()["verdict"]` say "unusable" for
+        # every new deployment, but only between 09:15 and 15:30 IST, which
+        # is exactly the shape of bug that gets diagnosed as flakiness.
+        return [Finding(
+            "option_collector_silent", "warning",
+            "The market is open and no option snapshot has ever been stored. "
+            "If this desk is meant to be collecting, the collector is down, "
+            "and option history only accumulates forward — every minute lost "
+            "cannot be recovered. On a new install this is simply the state "
+            "before the first capture.",
+            count=1, detail={"expected_interval_seconds": interval})]
+
+    if latest.tzinfo is None:
+        latest = latest.replace(tzinfo=UTC)
+    behind = (datetime.now(UTC) - latest).total_seconds()
+
+    # Three intervals. One allows for a single missed poll and the jitter of
+    # a scheduled job; three missed in a row is a collector that has stopped,
+    # not a slow round trip.
+    if behind <= interval * LIVENESS_TOLERANCE_INTERVALS:
+        return []
+
+    return [Finding(
+        "option_collector_stalled", "error",
+        f"The market is open but the newest option snapshot is "
+        f"{behind / 60:.1f} minutes old, against a {interval}s polling "
+        f"interval. Option history cannot be backfilled — check the "
+        f"collector before this session's data is lost.",
+        count=1,
+        detail={"seconds_behind": round(behind, 1),
+                "expected_interval_seconds": interval,
+                "last_snapshot": latest.isoformat()},
+    )]
+
 
 def option_bars_on_non_sessions(db: Session, underlying: str = "NIFTY") -> list[Finding]:
     """Option bars dated on a day the exchange never opened.
@@ -861,7 +934,8 @@ def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
         findings.append(finding)
 
     if include_options:
-        for finding in (option_coverage(db, symbol)
+        for finding in (option_collector_liveness(db, symbol)
+                        + option_coverage(db, symbol)
                         + option_snapshot_coverage(db, symbol)
                         + option_bars_on_non_sessions(db, symbol)
                         + missing_option_strikes(db, symbol)

@@ -182,3 +182,126 @@ def test_downgrade_returns_to_the_baseline(url):
     columns = {c["name"] for c in inspect(engine).get_columns("candles")}
     assert "session_date" not in columns
     engine.dispose()
+
+
+# ---- 0005: market regimes ----------------------------------------------
+
+def test_the_regime_table_is_created_with_its_indexes(url):
+    command.upgrade(make_config(url), "head")
+
+    engine = create_engine(url)
+    inspector = inspect(engine)
+    assert "market_regimes" in set(inspector.get_table_names())
+
+    columns = {c["name"] for c in inspector.get_columns("market_regimes")}
+    assert {"symbol", "timeframe", "timestamp", "session_date",
+            "day_regime", "day_confidence", "day_reasons",
+            "hour_regime", "hour_confidence", "hour_reasons",
+            "features", "engine_version", "computed_at"} <= columns
+
+    indexes = {ix["name"] for ix in inspector.get_indexes("market_regimes")}
+    assert "ix_regime_session" in indexes
+    engine.dispose()
+
+
+def test_the_regime_table_survives_a_database_that_already_had_it(url):
+    """The awkward upgrade state: the app booted, `create_all` built the
+    table, and only then did anyone run the migration. A create that assumed
+    it was starting from nothing would fail here with "table already
+    exists" and leave the schema half-applied."""
+    from app.models import Base
+
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    engine.dispose()
+
+    command.upgrade(make_config(url), "head")       # must not raise
+
+    engine = create_engine(url)
+    assert "market_regimes" in set(inspect(engine).get_table_names())
+    engine.dispose()
+
+
+def test_the_regime_migration_is_reversible(url):
+    cfg = make_config(url)
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "0004")
+
+    engine = create_engine(url)
+    tables = set(inspect(engine).get_table_names())
+    assert "market_regimes" not in tables
+    # The migration before it is untouched — a downgrade must not take
+    # neighbouring work with it.
+    assert "risk" in {c["name"] for c in inspect(engine).get_columns("signals")}
+    engine.dispose()
+
+
+def test_a_regime_row_round_trips_through_the_migrated_schema(url):
+    """The columns exist is not the same claim as the columns work. JSON on
+    SQLite in particular is a text column with a converter, and a mismatch
+    between the migration's type and the model's shows up only on a write."""
+    import json
+
+    command.upgrade(make_config(url), "head")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO market_regimes (symbol, timeframe, timestamp, "
+            "session_date, day_regime, day_confidence, day_reasons, "
+            "hour_regime, hour_confidence, hour_reasons, features, "
+            "engine_version, computed_at) VALUES "
+            "('NIFTY', '5m', :ts, :day, 'TREND_UP', 0.72, :reasons, "
+            "'RANGE', 0.4, :reasons, :features, '1.0', :ts)"),
+            {"ts": datetime(2026, 6, 17, 4, 30, tzinfo=UTC).isoformat(),
+             "day": "2026-06-17",
+             "reasons": json.dumps(["ATR is 1.3x its own average."]),
+             "features": json.dumps({"day": {"efficiency": 0.7}})})
+
+        row = conn.execute(text(
+            "SELECT day_regime, day_confidence FROM market_regimes")).one()
+    assert row == ("TREND_UP", 0.72)
+    engine.dispose()
+
+
+def test_running_a_migration_does_not_silence_the_application(url):
+    """Alembic must not mute the desk on its way past.
+
+    `alembic/env.py` calls `logging.config.fileConfig`, whose default is
+    `disable_existing_loggers=True`. That sets `.disabled = True` on every
+    logger not named in alembic.ini — which is every `app.*` logger this
+    project has. A process that migrated in-process then went permanently
+    silent: no agent tick, no collector failure, and no scheduler-starvation
+    alarm, all while the desk carried on running and looking healthy.
+
+    Today's compose command runs the migration as a separate process from
+    uvicorn, so this was not costing production anything. It was costing the
+    suite: the tests proving the starvation alarm actually reaches a log were
+    failing because alembic had muted the logger several files earlier, which
+    is exactly how a real regression would present.
+    """
+    import logging
+
+    from app.workers import watchdog
+
+    command.upgrade(make_config(url), "head")
+
+    assert not watchdog.log.disabled, "alembic disabled the application's loggers"
+
+    # A handler on the logger itself rather than `caplog`. `fileConfig` also
+    # rebuilds the *root* logger's handlers, which is where caplog attaches,
+    # and that part is legitimate — alembic is a CLI and configuring root is
+    # its job. What must survive is the app logger's ability to emit at all.
+    captured: list[str] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = Collect()
+    watchdog.log.addHandler(handler)
+    try:
+        watchdog.log.warning("the desk can still speak")
+    finally:
+        watchdog.log.removeHandler(handler)
+
+    assert captured == ["the desk can still speak"]

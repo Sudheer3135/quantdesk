@@ -193,3 +193,51 @@ def test_an_option_import_without_an_expiry_is_refused(client):
     response = client.post("/data/import/options", params={"symbol": "NIFTY"})
     assert response.status_code == 400
     assert "expiry is required" in response.json()["detail"]
+
+
+def test_a_missing_expiry_is_refused_without_calling_the_broker(client, monkeypatch):
+    """The refusal must not depend on the network.
+
+    This check used to run *after* the chain fetch, so a request that was
+    always going to be refused first made a live call to NSE. Two costs: a
+    wasted request against an endpoint this platform already throttles, and
+    a refusal that became conditional on the network — when NSE was slow or
+    rate-limiting, the caller got a 502 about a fetch that never needed to
+    happen instead of the 400 explaining what they did wrong. That is also
+    why this test failed intermittently for reasons unconnected to what it
+    was testing.
+
+    Asserting the status code alone would not have caught the ordering, so
+    the broker is replaced with one that raises if anything touches it.
+    """
+    class Landmine:
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"the broker was consulted ({name}) for a request that is "
+                "refused on its arguments alone")
+
+    monkeypatch.setattr(data_api, "get_broker", lambda: Landmine())
+
+    response = client.post("/data/import/options", params={"symbol": "NIFTY"})
+
+    assert response.status_code == 400
+    assert "expiry is required" in response.json()["detail"]
+
+
+def test_a_valid_expiry_still_reaches_the_broker(client, monkeypatch):
+    """The other half: reordering a guard must not disable the path behind
+    it. Without this, deleting the fetch entirely would pass the test above."""
+    reached = []
+
+    class Broker:
+        def chain_with_spot(self, symbol, expiry):
+            reached.append((symbol, expiry))
+            raise RuntimeError("upstream is down")
+
+    monkeypatch.setattr(data_api, "get_broker", lambda: Broker())
+
+    response = client.post("/data/import/options",
+                           params={"symbol": "NIFTY", "expiry": "2026-06-25"})
+
+    assert reached == [("NIFTY", "2026-06-25")]
+    assert response.status_code == 502

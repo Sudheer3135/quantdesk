@@ -69,6 +69,22 @@ class SignalRecord(Base):
     # is the honest answer for those.
     risk: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # The two-layer read that runs alongside the BUY/SELL/HOLD verdict:
+    # where the higher timeframe is pointing, and whether this is the moment
+    # to act on it. Two indexed columns and a JSON body, for the same reason
+    # `risk` is shaped that way — these two labels are what a study groups
+    # by, and the justification behind them is what a human reads afterwards.
+    #
+    # Nullable with no backfill. Every row written before this existed had
+    # no bias and no entry state, and computing one now from today's code
+    # and calling it what the desk said at the time would be a fabricated
+    # record. The replay in `evaluation.two_layer` recomputes them
+    # explicitly, as a study, and says so.
+    bias: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
+    entry_state: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, index=True)
+    plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
 
 class TradeRecord(Base):
     """The trade journal. Fill the review fields after the close, not during."""
@@ -257,4 +273,55 @@ class DatasetVersion(Base):
     source_mix: Mapped[dict] = mapped_column(JSON, default=dict)
     volume_is_synthetic: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now)
+
+
+class MarketRegime(Base):
+    """What kind of market each bar happened in.
+
+    Stored rather than recomputed on demand for two reasons. The cheap one is
+    speed: splitting an outcome study by regime otherwise re-derives the
+    whole archive's features on every request. The real one is that a
+    classifier changes. `engine_version` is on every row so a table holding
+    two generations is detectable instead of quietly mixed — a regime split
+    computed across two different definitions of TREND_UP would look like a
+    finding.
+
+    Both levels live on one row because they describe the same bar and are
+    always read together: the day answers "is this a trend day", the hour
+    answers "is it still trending right now", and the interesting bars are
+    the ones where those disagree.
+
+    `reasons` and `features` are stored, not just the label. A regime label
+    with no justification is exactly the black box this platform keeps
+    refusing to build — and without the features, a threshold change months
+    from now cannot be argued about against the bars it would have moved.
+    """
+    __tablename__ = "market_regimes"
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", "timestamp", name="uq_market_regime"),
+        Index("ix_regime_session", "symbol", "timeframe", "session_date"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    session_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
+
+    day_regime: Mapped[str] = mapped_column(String(16), index=True)
+    day_confidence: Mapped[float] = mapped_column(Float)
+    day_reasons: Mapped[list] = mapped_column(JSON, default=list)
+
+    hour_regime: Mapped[str] = mapped_column(String(16), index=True)
+    hour_confidence: Mapped[float] = mapped_column(Float)
+    hour_reasons: Mapped[list] = mapped_column(JSON, default=list)
+
+    # The numbers behind both verdicts: efficiency, ATR ratio, VWAP side, the
+    # gap, the opening range. Kept so a verdict can be re-argued without the
+    # candles.
+    features: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    engine_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now)

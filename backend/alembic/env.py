@@ -13,7 +13,19 @@ from sqlalchemy import engine_from_config, pool
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers=False` is not a style preference. The default
+    # is True, and it sets `.disabled = True` on every logger not named in
+    # alembic.ini — which is every `app.*` logger this project has. Any
+    # process that runs a migration in-process therefore goes permanently
+    # silent afterwards: no agent tick, no collector failure, and no
+    # scheduler-starvation alarm, all while the desk keeps running.
+    #
+    # Today's compose command runs `alembic upgrade head` as a separate
+    # process from uvicorn, so production is not affected. The suite is: it
+    # runs migrations in-process, and the tests proving the starvation alarm
+    # actually logs were failing purely because alembic had muted the logger
+    # several files earlier.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # A caller that has already set a URL (the migration tests, which run
 # against a throwaway SQLite file) wins. Otherwise the application's own

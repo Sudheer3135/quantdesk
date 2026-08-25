@@ -467,3 +467,121 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 .risk-potential {
   margin: 0 0 8px; font-size: 12.5px; color: var(--muted); font-style: italic;
 }
+
+/* --- market regime ------------------------------------------------------
+   Two readings side by side. The colour carries the direction only where
+   there is one: a trend gets the same green/red the action pill uses, while
+   chop, squeeze and range stay neutral. Tinting every regime would turn a
+   description of conditions into something that reads like a call. */
+.regime-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+}
+
+.regime-reading {
+  border-left: 3px solid var(--ink-line);
+  padding-left: 0.85rem;
+}
+
+.regime-reading.regime-TREND_UP { border-left-color: var(--bull); }
+.regime-reading.regime-TREND_DOWN { border-left-color: var(--bear); }
+.regime-reading.regime-VOLATILE_CHOP { border-left-color: var(--amber); }
+
+.regime-label {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0.15rem 0 0;
+  letter-spacing: -0.01em;
+}
+
+.regime-flag {
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--ink-line);
+  border-radius: 3px;
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+.regime-confidence {
+  margin: 0.1rem 0 0.55rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.regime-reasons {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.regime-note {
+  margin: 1rem 0 0;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--ink-line);
+  border-radius: 4px;
+  font-size: 0.82rem;
+}
+
+.regime-foot { margin-top: 0.9rem; font-size: 0.76rem; }
+
+/* --- bias and entry ------------------------------------------------------
+   Two columns that stay two columns. The colour lives on the headline
+   sentence only: tinting both panels would imply the entry state carries a
+   direction, and it deliberately does not — it takes the bias's. */
+.plan-headline {
+  font-size: 1.05rem;
+  margin: 0 0 1rem;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid var(--ink-line);
+}
+
+.plan-headline.bias-BULLISH strong { color: var(--bull); }
+.plan-headline.bias-BEARISH strong { color: var(--bear); }
+.plan-headline.bias-NEUTRAL strong { color: var(--muted); }
+
+.entry-ENTER_NOW { color: var(--bull); font-weight: 600; }
+.entry-WAIT_PULLBACK,
+.entry-WAIT_BREAKOUT { color: var(--amber); }
+.entry-NO_ENTRY { color: var(--muted); }
+
+.plan-trigger { color: var(--muted); font-size: 0.85rem; }
+
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1.25rem;
+}
+
+.plan-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0.15rem 0 0.6rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.plan-confidence {
+  font-size: 0.8rem;
+  font-weight: 400;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.plan-reasons {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--muted);
+}

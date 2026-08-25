@@ -20,11 +20,13 @@ import json
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
 
 from ..cache import get_json
 from ..config import get_settings
-from ..db import SessionLocal
+from ..data import regime_store
+from ..db import SessionLocal, get_db
 from ..market_hours import status as market_status
 from ..risk import live as risk_live
 from ..security import key_is_valid
@@ -148,6 +150,30 @@ async def _current_risk(signal_payload: dict | None) -> dict | None:
         return None
 
 
+async def _current_regime() -> dict | None:
+    """The market condition the desk is currently reading.
+
+    Served from the stored table rather than recomputed here, deliberately.
+    A second classification in this process would be free to disagree with
+    the one the research split is built on — the dashboard would say RANGE
+    while the table that decides which conditions the strategy is allowed to
+    trade said TREND_UP, and nothing would report the contradiction.
+
+    Off the event loop and never raising, same as `_current_risk`: a regime
+    is a caption, and losing it must not cost the desk its price feed.
+    """
+    def read() -> dict | None:
+        with SessionLocal() as db:
+            s = get_settings()
+            return regime_store.latest(db, s.watch_symbol, s.watch_timeframe)
+
+    try:
+        return await asyncio.to_thread(read)
+    except Exception as exc:
+        log.warning("could not read current regime: %s", exc)
+        return None
+
+
 @router.websocket("/ws/signals")
 async def stream_signals(ws: WebSocket, key: str | None = Query(default=None)) -> None:
     # Browsers cannot set headers on a websocket handshake, so the key comes
@@ -185,6 +211,11 @@ async def stream_signals(ws: WebSocket, key: str | None = Query(default=None)) -
             # without anything on screen saying so. This is the same question
             # asked of today's journal, now.
             "risk_now": await _current_risk(snapshot_signal),
+            # The condition the analysis is being formed in. Sent on connect
+            # and refreshed on the heartbeat rather than with the signal,
+            # because a regime is a property of the market and keeps moving
+            # between agent ticks.
+            "regime": await _current_regime(),
         })
 
         while True:
@@ -198,6 +229,7 @@ async def stream_signals(ws: WebSocket, key: str | None = Query(default=None)) -
                 "type": "heartbeat",
                 "market": market_status(),
                 "risk_now": await _current_risk(get_json("signal:latest")),
+                "regime": await _current_regime(),
             })
     except WebSocketDisconnect:
         pass
@@ -239,6 +271,27 @@ def _aged(source_time: str | None) -> dict:
     except (TypeError, ValueError):
         return {"age_seconds": None, "freshness": "unknown"}
     return {"age_seconds": age, "freshness": classify_age(age)}
+
+
+@router.get("/market/regime")
+def current_regime(db: Session = Depends(get_db)) -> dict:
+    """The latest classified bar, for clients that cannot use a socket.
+
+    The dashboard falls back to polling whenever the socket is unavailable,
+    and a regime that vanished in that state would read as "no condition"
+    rather than "no connection".
+    """
+    s = get_settings()
+    found = regime_store.latest(db, s.watch_symbol, s.watch_timeframe)
+    if found is None:
+        # Same shape either way. A caller that has to branch on which keys
+        # came back will eventually forget to, and the branch it forgets is
+        # the empty one.
+        return {"timestamp": None, "session_date": None,
+                "engine_version": None, "day": None, "hour": None,
+                "note": "No regimes classified yet — "
+                        "POST /data/regimes/backfill to build the history."}
+    return found
 
 
 @router.get("/market/status")

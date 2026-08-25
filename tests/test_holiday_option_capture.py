@@ -18,7 +18,7 @@ Refusing a replay costs nothing, because a replay carries no information
 that is not already stored. So: refuse on evidence, warn on the calendar.
 """
 import sys
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -242,3 +242,89 @@ def test_a_year_with_no_calendar_is_reported_not_condemned(db):
 
 def test_an_empty_archive_reports_nothing(db):
     assert option_bars_on_non_sessions(db, "NIFTY") == []
+
+
+# ---- is the collector still alive? -------------------------------------
+
+def test_liveness_is_silent_outside_the_session(db, monkeypatch):
+    """An alarm that cries all night is one nobody reads. Silence is the
+    correct behaviour when no snapshot is due."""
+    from app.data import quality
+
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: "closed")
+    assert quality.option_collector_liveness(db, "NIFTY") == []
+
+
+def test_liveness_reports_a_stalled_collector(db, monkeypatch):
+    """Option history only accumulates forward. A collector that dies
+    mid-session costs a day that cannot be re-collected, and nothing else
+    announces it — the archive keeps answering questions about the days it
+    already has."""
+    from app.data import quality
+
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: quality.OPEN)
+    seed_bar(db, PREVIOUS_SESSION)          # ingested_at defaults to now...
+    stale = db.query(OptionCandle).first()
+    stale.ingested_at = datetime.now(UTC) - timedelta(minutes=30)
+    db.commit()
+
+    findings = quality.option_collector_liveness(db, "NIFTY")
+
+    assert len(findings) == 1
+    assert findings[0].check == "option_collector_stalled"
+    assert findings[0].severity == "error"
+    assert findings[0].detail["seconds_behind"] > 1_000
+    assert "cannot be backfilled" in findings[0].summary
+
+
+def test_liveness_is_quiet_when_snapshots_are_arriving(db, monkeypatch):
+    from app.data import quality
+
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: quality.OPEN)
+    seed_bar(db, PREVIOUS_SESSION)
+    fresh = db.query(OptionCandle).first()
+    fresh.ingested_at = datetime.now(UTC)
+    db.commit()
+
+    assert quality.option_collector_liveness(db, "NIFTY") == []
+
+
+def test_liveness_says_so_when_nothing_was_ever_collected(db, monkeypatch):
+    """Reported, but as a warning rather than an error.
+
+    Never collected and stopped collecting are different failures and only
+    the second is an error. Grading this one `error` made
+    `quality.report()` call a brand-new install "unusable" — but only
+    between 09:15 and 15:30 IST, so it read as a flaky test rather than as
+    the verdict being wrong. `test_quality.py` covers both branches with the
+    clock pinned; this one covers the message.
+    """
+    from app.data import quality
+
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: quality.OPEN)
+    findings = quality.option_collector_liveness(db, "NIFTY")
+
+    assert len(findings) == 1
+    assert findings[0].check == "option_collector_silent"
+    assert findings[0].severity == "warning"
+    assert "cannot be recovered" in findings[0].summary
+
+
+def test_liveness_tolerates_a_single_missed_poll(db, monkeypatch):
+    """One interval of jitter is a scheduled job being a scheduled job.
+    Three in a row is a collector that has stopped."""
+    from app.config import get_settings
+    from app.data import quality
+
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: quality.OPEN)
+    interval = get_settings().option_snapshot_interval_seconds
+    seed_bar(db, PREVIOUS_SESSION)
+    row = db.query(OptionCandle).first()
+
+    row.ingested_at = datetime.now(UTC) - timedelta(seconds=interval * 2)
+    db.commit()
+    assert quality.option_collector_liveness(db, "NIFTY") == []
+
+    row.ingested_at = datetime.now(UTC) - timedelta(seconds=interval * 4)
+    db.commit()
+    assert quality.option_collector_liveness(db, "NIFTY") != []

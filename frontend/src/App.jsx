@@ -166,6 +166,10 @@ function useLiveSignal() {
      open a position at 10:01 and the 10:00 approval is stale by 10:02. The
      backend recomputes this on connect and on every heartbeat. */
   const [riskNow, setRiskNow] = useState(null);
+  /* The market condition the analysis is being formed in. A property of the
+     market rather than of the signal, so it arrives on the heartbeat and
+     keeps updating between agent ticks. */
+  const [regime, setRegime] = useState(null);
   const [link, setLink] = useState("connecting");   // connecting | live | polling
   const [skewMs, setSkewMs] = useState(0);
 
@@ -196,12 +200,14 @@ function useLiveSignal() {
 
   const poll = useCallback(async () => {
     try {
-      const [sig, status, tick] = await Promise.all([
+      const [sig, status, tick, condition] = await Promise.all([
         getJSON("/signals/live?symbol=NIFTY&timeframe=5m"),
         getJSON("/market/status").catch(() => null),
         getJSON("/market/price").catch(() => null),
+        getJSON("/market/regime").catch(() => null),
       ]);
       setSignal(sig);
+      if (condition) setRegime(condition);
       /* The polled endpoint builds a signal from scratch, so its verdict was
          computed for this request — current by construction. */
       if (sig?.risk) setRiskNow(sig.risk);
@@ -286,6 +292,10 @@ function useLiveSignal() {
         if (msg.risk_now === undefined && msg.signal.risk) setRiskNow(msg.signal.risk);
       }
       if (msg.risk_now !== undefined) setRiskNow(msg.risk_now);
+      /* `undefined` means this frame carried no regime; `null` means the
+         backend looked and has none classified. Only the second should clear
+         what is on screen. */
+      if (msg.regime !== undefined) setRegime(msg.regime);
     };
 
     ws.onclose = () => {
@@ -311,7 +321,7 @@ function useLiveSignal() {
     };
   }, [connect, stopPolling]);
 
-  return { signal, price, market, riskNow, link, skewMs, refresh: poll };
+  return { signal, price, market, riskNow, regime, link, skewMs, refresh: poll };
 }
 
 /* The live price. Separate from the signal on purpose: the price moves
@@ -585,6 +595,179 @@ function Ledger({ checks, context, confidence, action }) {
   );
 }
 
+/* Which condition the desk thinks the market is in, at two levels.
+
+   Separate from the signal on purpose. The regime is a property of the
+   market, not of any one decision, and it keeps moving between agent ticks —
+   rendering it inside the signal panel would freeze it at whatever it was
+   when the last signal fired.
+
+   The two levels are shown together because the interesting case is when
+   they disagree: an hour running against the day is either the turn or a
+   trap, and the desk has no rule yet that tells those apart. Hiding the
+   disagreement behind a single label would hide the one thing worth
+   looking at. */
+const REGIME_LABEL = {
+  TREND_UP: "Trend up",
+  TREND_DOWN: "Trend down",
+  RANGE: "Range",
+  VOLATILE_CHOP: "Volatile chop",
+  SQUEEZE: "Squeeze",
+};
+
+function RegimeReading({ level, reading }) {
+  if (!reading) return null;
+  const label = REGIME_LABEL[reading.label] ?? reading.label;
+  return (
+    <div className={`regime-reading regime-${reading.label}`}>
+      <p className="eyebrow">{level}</p>
+      <p className="regime-label">
+        {label}
+        {reading.provisional && <span className="regime-flag">provisional</span>}
+      </p>
+      <p className="regime-confidence">
+        {Math.round((reading.confidence ?? 0) * 100)}% confidence
+      </p>
+      <ul className="regime-reasons">
+        {(reading.reasons || []).map((reason, i) => (
+          <li key={i}>{reason}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/* The two layers, shown as two. The whole point of splitting the output is
+   that direction and timing fail independently, so a dashboard that fused
+   them back into one badge would undo it — "BULLISH, but wait for a pullback
+   near 24,180" is the sentence the desk needs, and it needs both halves. */
+const BIAS_LABEL = { BULLISH: "Bullish", BEARISH: "Bearish", NEUTRAL: "Neutral" };
+
+const ENTRY_LABEL = {
+  ENTER_NOW: "Enter now",
+  WAIT_PULLBACK: "Wait for pullback",
+  WAIT_BREAKOUT: "Wait for breakout",
+  NO_ENTRY: "No entry",
+};
+
+function PlanLayers({ plan }) {
+  if (!plan || !plan.bias || !plan.entry) {
+    return (
+      <div className="panel">
+        <h2>Bias &amp; entry</h2>
+        <p className="muted">
+          No two-layer read for this signal. The bias needs closed 15-minute
+          and hourly bars, which the first minutes of a session do not have.
+        </p>
+      </div>
+    );
+  }
+
+  const { bias, entry } = plan;
+  const level =
+    entry.trigger_level === null || entry.trigger_level === undefined
+      ? null
+      : num(entry.trigger_level);
+
+  return (
+    <div className="panel">
+      <h2>Bias &amp; entry</h2>
+
+      {/* The headline sentence, assembled from both layers rather than from
+          either one. */}
+      <p className={`plan-headline bias-${bias.label}`}>
+        <strong>{BIAS_LABEL[bias.label] ?? bias.label}</strong>
+        {" — "}
+        <span className={`entry-${entry.state}`}>
+          {ENTRY_LABEL[entry.state] ?? entry.state}
+        </span>
+        {entry.trigger_note && level && (
+          <span className="plan-trigger">
+            {" "}
+            ({entry.trigger_note} {level})
+          </span>
+        )}
+      </p>
+
+      <div className="plan-grid">
+        <div className="plan-layer">
+          <p className="eyebrow">Layer 1 · higher timeframe</p>
+          <p className="plan-value">
+            {BIAS_LABEL[bias.label] ?? bias.label}
+            <span className="plan-confidence">
+              {Math.round((bias.confidence ?? 0) * 100)}%
+            </span>
+          </p>
+          <ul className="plan-reasons">
+            {(bias.reasons || []).map((reason, i) => (
+              <li key={i}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="plan-layer">
+          <p className="eyebrow">Layer 2 · this bar</p>
+          <p className="plan-value">
+            {ENTRY_LABEL[entry.state] ?? entry.state}
+            <span className="plan-confidence">
+              {Math.round((entry.confidence ?? 0) * 100)}%
+            </span>
+          </p>
+          <ul className="plan-reasons">
+            {(entry.reasons || []).map((reason, i) => (
+              <li key={i}>{reason}</li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      <p className="muted regime-foot">
+        Two layers, deliberately. The bias says where the higher timeframe
+        points; the entry state says whether this is the moment. Neither
+        places an order, and neither overrides the risk manager.
+      </p>
+    </div>
+  );
+}
+
+function RegimePanel({ regime }) {
+  if (!regime || (!regime.day && !regime.hour)) {
+    return (
+      <div className="panel">
+        <h2>Market regime</h2>
+        <p className="muted">
+          {regime?.note ??
+            "No regime classified yet. The agent classifies each bar as it is archived."}
+        </p>
+      </div>
+    );
+  }
+
+  const disagree =
+    regime.day && regime.hour && regime.day.label !== regime.hour.label;
+
+  return (
+    <div className="panel">
+      <h2>Market regime</h2>
+      <div className="regime-grid">
+        <RegimeReading level="Session so far" reading={regime.day} />
+        <RegimeReading level="Last hour" reading={regime.hour} />
+      </div>
+      {disagree && (
+        <p className="regime-note">
+          The hour is reading against the session. That is either the turn or
+          a trap — nothing here yet tells those apart.
+        </p>
+      )}
+      <p className="muted regime-foot">
+        Classified from ATR against its own baseline, directional efficiency,
+        VWAP behaviour and the session&rsquo;s opening range. A description of
+        conditions, not a trade instruction.
+      </p>
+    </div>
+  );
+}
+
 function PlanPanel({ signal, marketOpen, riskNow }) {
   if (signal.action === "HOLD") {
     return (
@@ -739,7 +922,8 @@ function ContextPanel({ context }) {
 }
 
 export default function App() {
-  const { signal, price, market, riskNow, link, skewMs, refresh } = useLiveSignal();
+  const { signal, price, market, riskNow, regime, link, skewMs, refresh } =
+    useLiveSignal();
   const { candles, chain } = useMarketData();
   const [clock, setClock] = useState(() => Date.now());
 
@@ -847,6 +1031,12 @@ export default function App() {
         </div>
       </section>
 
+      {/* Rendered whether or not a signal exists. The market is in some
+          condition regardless of whether the agent has spoken yet, and the
+          first thing a desk wants on opening the page is what kind of day
+          this is. */}
+      <RegimePanel regime={regime} />
+
       {!signal && (
         <p className="notice">
           Waiting for the first signal. The agent publishes one every five
@@ -863,6 +1053,8 @@ export default function App() {
             </Suspense>
             <PlanPanel signal={signal} marketOpen={marketOpen} riskNow={riskNow} />
           </div>
+
+          <PlanLayers plan={signal.plan} />
 
           <Ledger
             checks={signal.checks || []}

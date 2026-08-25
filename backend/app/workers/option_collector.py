@@ -30,6 +30,7 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from .. import net
 from ..config import get_settings
 from ..data import importer
 from ..db import SessionLocal
@@ -87,8 +88,28 @@ def capture(force: bool = False) -> dict | None:
 
 
 def tick() -> None:
+    """One scheduled poll, bounded by the gap to the next one.
+
+    The budget is here rather than in `capture` because it is a fact about
+    the *schedule*, not about taking a snapshot: a manual or diagnostic
+    capture has no next run to get out of the way of, and falls back to the
+    broker's own standalone default instead.
+
+    This bound is the fix for 25-Aug-2026. An unbounded `chain_with_spot`
+    ran for the rest of the session against a sixty-second job, and every
+    poll behind it was skipped by `max_instances=1`. Half a session of
+    option data, which nobody can re-collect, was lost to a call that should
+    have given up after forty-eight seconds.
+    """
+    interval = get_settings().option_snapshot_interval_seconds
     try:
-        capture()
+        with net.budget(net.budget_for(interval), label="option-collector"):
+            capture()
+    except net.BudgetExhausted as exc:
+        # Expected under a slow or unresolvable source. One observation is
+        # lost; the next poll starts clean with a full budget, which is the
+        # entire point of giving the slot back.
+        log.warning("option chain snapshot gave up to keep the schedule: %s", exc)
     except Exception:
         # A failed poll costs one observation. Raising here would let
         # APScheduler retire the job, which would cost every observation

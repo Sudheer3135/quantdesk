@@ -387,3 +387,65 @@ def test_an_empty_database_does_not_crash_any_diagnostic(db):
 def test_expected_bars_per_session(timeframe, expected):
     """09:15 to 15:30 is 375 minutes."""
     assert quality.expected_bars(timeframe) == expected
+
+
+# ---- collector liveness: never-started vs stopped ----------------------
+
+def _force_session(monkeypatch, state):
+    """Pin the market clock. These two branches differ only by what time it
+    is, so a test that reads the wall clock passes or fails by the hour —
+    which is how the empty-database case sat green until a run happened to
+    land inside 09:15-15:30 IST."""
+    monkeypatch.setattr(quality, "session_label", lambda *a, **k: state)
+
+
+def test_a_fresh_install_is_not_called_unusable_mid_session(db, monkeypatch):
+    """An empty database during market hours is 'not set up yet', not a
+    dataset you must not trust."""
+    _force_session(monkeypatch, quality.OPEN)
+
+    report = quality.report(db)
+
+    assert report["errors"] == 0
+    assert report["verdict"] != "unusable"
+    silent = [f for f in report["findings"]
+              if f["check"] == "option_collector_silent"]
+    assert silent and silent[0]["severity"] == "warning"
+
+
+def test_a_collector_that_stopped_mid_session_is_still_an_error(db, monkeypatch):
+    """The alarm this check exists for must survive the downgrade above.
+
+    Data already collected proves the desk was polling, so silence now is a
+    collector that died — and option history cannot be backfilled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import OptionCandle, OptionContract
+
+    contract = OptionContract(
+        underlying="NIFTY", expiry_date=date(2026, 6, 25), strike=24_000.0,
+        option_type="CE", first_seen=datetime.now(UTC), last_seen=datetime.now(UTC),
+        source="test")
+    db.add(contract)
+    db.flush()
+    db.add(OptionCandle(
+        contract_id=contract.id, timeframe="5m",
+        timestamp=datetime.now(UTC) - timedelta(hours=3),
+        open=100.0, high=101.0, low=99.0, close=100.5,
+        bar_kind="snapshot", source="test",
+        ingested_at=datetime.now(UTC) - timedelta(hours=3)))
+    db.commit()
+
+    _force_session(monkeypatch, quality.OPEN)
+    findings = quality.option_collector_liveness(db)
+
+    assert findings and findings[0].check == "option_collector_stalled"
+    assert findings[0].severity == "error"
+
+
+def test_the_liveness_check_stays_quiet_outside_the_session(db, monkeypatch):
+    """An alarm that cries all night is one nobody reads."""
+    _force_session(monkeypatch, "closed")
+
+    assert quality.option_collector_liveness(db) == []
