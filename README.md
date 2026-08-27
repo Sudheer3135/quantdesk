@@ -178,8 +178,71 @@ Read these before trusting anything on the dashboard.
 
 ---
 
+## The option-buying backtest
+
+`POST /backtest/option-buying` runs the desk's own decisions as an option
+buyer. It generates nothing of its own: `signal_engine` produces the
+direction and the levels, `plan` produces the bias and the entry state, and
+`risk.manager` keeps its veto. This module turns that decision into a
+contract, a size, a fill and a premium — and says where every premium came
+from.
+
+**Three evidence labels, never blended.**
+
+| Label | What it means |
+|---|---|
+| `OBSERVED` | A real tape. The contract traded at this price and the bar's range is the true one |
+| `SNAPSHOT_DERIVED` | A real *price*, sampled. The close printed; the range is folded from polls and understates |
+| `MODELLED` | Nothing was observed. Black-Scholes at an assumed constant IV — a calculation, not a market |
+
+A trade whose two legs disagree is labelled `MIXED` rather than filed under
+the flattering half. `pricing_policy` decides which labels may be used at
+all: `observed_only` refuses to open a trade it cannot price from the
+archive, `prefer_observed` falls back to the model and labels it,
+`modelled_only` never reads the archive.
+
+**It refuses rather than inventing history.** Option data cannot be
+backfilled — NSE publishes a snapshot, not a tape, so a session the
+collector missed is gone permanently. `observed_only` over a window with
+holes returns **409 with the failing sessions named**. A run that completes
+but whose fills fall below `min_observed_pct` is also refused: coverage
+measured over sessions and evidence measured over the trades actually taken
+come apart, and a window can pass the first while every trade lands in the
+hole. `GET /backtest/option-buying/coverage` answers the same question
+without walking anything.
+
+**Contract selection is a policy, and every refusal is a named code.** Side
+follows the direction; expiry is the nearest listed one inside a tenor
+window, with expiry day excluded by default; strike is at-the-money, a fixed
+offset, or delta-targeted, always snapped to the ladder the archive actually
+listed; open interest, volume and quoted spread are checked as of the
+decision bar. Signals that never became trades are counted under codes like
+`no_quote_at_decision_bar` and `expiry_too_near`, so the selection is visible
+instead of being a silent `continue`.
+
+**Both look-ahead guards are structural.** `HistoricalFeed` refuses a candle
+the walk has not reached; `ChainStore` carries its own clock and refuses a
+quote that had not printed. Index look-ahead is loud — an absurd equity
+curve. Option look-ahead is quiet: a few rupees a fill, permanently, with
+nothing in the output to flag it.
+
+### What it cannot tell you
+
+- The archive holds bucket-resolution premiums, not a tick tape. An observed
+  entry pays the last quote at the *decision* bar while the index fills at
+  the next bar's open, and an observed exit fills at the close of the bar
+  that triggered rather than at the trigger level. Every trade names both
+  pairings in `entry_basis` and `exit_basis`.
+- Sizing is always modelled. No archive holds the premium at a level the
+  index never reached, so the stop premium is projected with Black-Scholes —
+  at the contract's own stored IV where there is one.
+- `decay_cost` is a modelled attribution: both sides are priced at the same
+  index level and the same IV, differing only in time. It says what the
+  clock cost, not what the trade lost.
+
+---
+
 ## Roadmap
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining phases: the option
-buying strategy backtest, the AI chat assistant, the morning report, the
-Bloomberg-style terminal, and the trade review scorer.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the remaining phases: the AI chat
+assistant, the morning report, and the trade review scorer.
