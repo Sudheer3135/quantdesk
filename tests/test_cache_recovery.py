@@ -186,7 +186,7 @@ def test_publish_with_no_redis_at_all_is_a_quiet_false(rig):
 
 def test_the_price_ticker_survives_and_resumes(rig, monkeypatch):
     now, server, _ = rig
-    from app.workers import ticker
+    from app.workers import prices, ticker
 
     class Broker:
         def quote(self, symbol="NIFTY"):
@@ -196,7 +196,7 @@ def test_the_price_ticker_survives_and_resumes(rig, monkeypatch):
 
     monkeypatch.setattr(ticker, "get_broker", Broker)
     monkeypatch.setattr(ticker, "market_is_open", lambda: True)
-    ticker._previous.clear()
+    prices.reset_previous()
 
     ticker.tick()
     assert len(server.published) == 1

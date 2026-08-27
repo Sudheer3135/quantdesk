@@ -3,7 +3,7 @@ from fastapi import APIRouter
 from ..cache import client as redis_client
 from ..config import get_settings
 from ..deps import get_broker
-from ..workers import watchdog
+from ..workers import angel_feed, watchdog
 
 router = APIRouter(tags=["health"])
 
@@ -44,3 +44,27 @@ def scheduler_health():
     the running desk, not about the archive.
     """
     return watchdog.report()
+
+
+@router.get("/health/feed")
+def feed_health():
+    """Which source is serving the live price, and how well.
+
+    Deliberately unauthenticated, like the rest of `/health` — and therefore
+    deliberately free of anything secret. It reports counters, timestamps,
+    a state name and latency percentiles. The Angel session appears only
+    through `redacted`: enough to see *that* an account is connected and
+    which one, never enough to be that account.
+
+    `source` is the field to read first. It answers the question a desk
+    actually has when a price looks wrong: am I looking at the push feed or
+    at the poller that took over when it went quiet?
+    """
+    status = angel_feed.status()
+    settings = get_settings()
+    return {
+        "live_price_source": status["source"],
+        "transport": status["transport"],
+        "fallback_broker": settings.broker,
+        "angel": status,
+    }

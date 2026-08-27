@@ -1,81 +1,67 @@
-"""Live price ticker.
+"""Live price ticker — now the fallback rather than the source.
 
 The agent runs every five minutes because that is the strategy's timeframe.
 Between ticks the dashboard showed a frozen number, which is correct for a
-signal and wrong for a price — a desk should show the market moving.
+signal and wrong for a price. This is the second, much lighter loop that
+keeps the tape moving. It computes nothing and decides nothing; signals
+still come only from the agent, so there is still exactly one code path that
+produces a trading decision.
 
-So this is a second, much lighter loop: fetch the spot price every few
-seconds and publish it. It computes nothing and decides nothing. Signals
-still come only from the agent, so there is still exactly one code path
-that produces a trading decision.
+What changed: when the Angel One websocket is enabled and healthy, this job
+**does not poll at all**. A push feed already delivered the price, and
+polling a second source alongside it would spend requests to produce a
+number that is strictly worse — a poll cannot be fresher than a push — while
+racing it into the same Redis key. The two would take turns publishing, the
+change column would flip between two slightly different prices, and the
+`source` field would be the only clue.
 
-Honest limits of the free data:
+So the rule is a single question asked once per job run: *is Angel serving
+right now?* If yes, do nothing. If no, poll as before, publish with the
+polling source's own name, and record that a fallback happened — so the
+report can tell one long outage from a feed that keeps flapping.
 
-  - This is a poll, not a stream. NSE and Yahoo hand out snapshots; neither
-    gives retail a tick-by-tick websocket. Expect a few seconds of lag.
+Honest limits of the polled path, unchanged:
+
+  - It is a poll, not a stream. NSE and Yahoo hand out snapshots; expect a
+    few seconds of lag.
   - It runs only while the market is open. Polling a closed market wastes
-    requests and risks getting your IP throttled for nothing.
-  - The number can be several seconds stale. Fine for watching the market.
-    Not fine for anything that needs an exact fill price.
+    requests and risks throttling for nothing.
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .. import net
-from ..cache import publish
 from ..config import get_settings
 from ..deps import get_broker
 from ..market_hours import is_open as market_is_open
+from .prices import (  # noqa: F401  (re-exported: imported from here elsewhere)
+    CACHE_KEY,
+    CHANNEL,
+    DELAYED_SECONDS,
+    LIVE_SECONDS,
+    classify_age,
+    publish_price,
+)
 
 log = logging.getLogger(__name__)
-
-CHANNEL = "prices"
-CACHE_KEY = "price:latest"
-
-# How far behind the market a price may be before the desk should say so.
-#
-# Both numbers are set against the measured behaviour of the free sources:
-# Yahoo's quote is typically 2-6s behind the print and occasionally 11s, so
-# anything inside 15s is ordinary and calling it "delayed" would train the
-# eye to ignore the warning. Past 60s the source has stopped refreshing —
-# that is a real fault, not jitter.
-LIVE_SECONDS = 15
-DELAYED_SECONDS = 60
-
-
-def classify_age(age_seconds: float | None) -> str:
-    """Name how far behind the market a price is.
-
-    Kept as a plain function of one number so it can be tested without a
-    broker, a socket or a clock, and so the dashboard and the API cannot
-    drift into disagreeing about what "stale" means.
-
-    `None` means the source would not say when the price was printed. That
-    is reported as "unknown" rather than "live": a price we cannot date is
-    precisely the one that should not be presented as current.
-    """
-    if age_seconds is None:
-        return "unknown"
-    if age_seconds <= LIVE_SECONDS:
-        return "live"
-    if age_seconds <= DELAYED_SECONDS:
-        return "delayed"
-    return "stale"
-
-# Remembered between ticks so the dashboard can show direction and change
-# without needing a second request for the previous value.
-_previous: dict[str, float] = {}
 
 
 def tick() -> None:
     settings = get_settings()
     if settings.environment == "prod" and not market_is_open():
         return
+
+    # Asked once, here, rather than inside the publish path. A poll that is
+    # started and then discarded has already spent the request and already
+    # taken the slot that `max_instances=1` protects.
+    from . import angel_feed
+    if angel_feed.healthy():
+        return
+    if settings.angel_enabled:
+        angel_feed.note_fallback()
 
     symbol = settings.watch_symbol
     try:
@@ -94,43 +80,11 @@ def tick() -> None:
         log.debug("price tick failed: %s", exc)
         return
 
-    prev = _previous.get(symbol)
-    _previous[symbol] = price
-
-    # Two different clocks, and conflating them is what made a stale price
-    # look current:
-    #   source_time — when the market printed this price. The only basis on
-    #                 which staleness can honestly be judged.
-    #   at          — when we published it. Useful for measuring our own
-    #                 internal delay, and for a browser to correct its clock
-    #                 against the server's rather than trusting its own.
-    published = datetime.now(UTC)
-    source_time = quote.get("source_time")
-    age = None
-    if source_time:
-        try:
-            age = round((published - datetime.fromisoformat(source_time)).total_seconds(), 3)
-        except (TypeError, ValueError):
-            log.debug("unparseable source_time %r", source_time)
-
-    payload = {
-        "symbol": symbol,
-        "price": price,
-        "previous": prev,
-        "change": None if prev is None else round(price - prev, 2),
-        "direction": "flat" if prev is None or price == prev
-        else "up" if price > prev else "down",
-        "source": quote.get("source", settings.broker),
-        "source_time": source_time,
-        "age_seconds": age,
-        "freshness": classify_age(age),
-        "at": published.isoformat(),
-        "market_open": market_is_open(),
-    }
-
-    # Never raises: a Redis outage costs this tick's publish and nothing
-    # more, and the connection heals itself on a later one.
-    publish(CHANNEL, json.dumps(payload), cache_key=CACHE_KEY, ttl=120)
+    publish_price(
+        symbol, price,
+        source=quote.get("source", settings.broker),
+        source_time=quote.get("source_time"),
+        transport="poll")
 
 
 def start(scheduler: BackgroundScheduler | None = None) -> BackgroundScheduler:
@@ -143,5 +97,11 @@ def start(scheduler: BackgroundScheduler | None = None) -> BackgroundScheduler:
     )
     if not scheduler.running:
         scheduler.start()
-    log.info("price ticker running every %ss", settings.ticker_interval_seconds)
+    # The job still runs at this cadence when Angel is enabled — it is what
+    # notices the feed has gone quiet and takes over. It just stops making
+    # requests while the feed is healthy.
+    log.info("price ticker running every %ss (%s)",
+             settings.ticker_interval_seconds,
+             "fallback only — Angel feed is preferred" if settings.angel_enabled
+             else "primary source")
     return scheduler

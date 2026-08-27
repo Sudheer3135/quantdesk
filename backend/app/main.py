@@ -7,12 +7,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import backtest, data, health, journal, market, signals, stream
+from .api import backtest, data, health, journal, market, news, signals, stream
 from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
 from .security import verify_startup
-from .workers import agent, option_collector, ticker, watchdog
+from .workers import agent, angel_feed, option_collector, ticker, watchdog
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
@@ -49,9 +49,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # voice; see `/health/scheduler`.
     watchdog.attach(scheduler)
 
+    # The Angel One websocket, if it is configured. Started after the
+    # scheduler so the ticker exists to fall back to, and never allowed to
+    # stop the application from booting: a missing credential leaves the
+    # desk on the polled feed and says so in the log, rather than taking the
+    # whole API down with it.
+    angel_feed.start()
+
     try:
         yield
     finally:
+        # Close the socket before the scheduler, so the ticker is still
+        # alive to serve prices while the feed is shutting down.
+        angel_feed.stop()
         scheduler.shutdown(wait=False)
 
 
@@ -71,7 +81,8 @@ app.add_middleware(
 )
 
 for router in (health.router, market.router, signals.router,
-               journal.router, backtest.router, stream.router, data.router):
+               journal.router, backtest.router, stream.router, data.router,
+               news.router):
     app.include_router(router)
 
 

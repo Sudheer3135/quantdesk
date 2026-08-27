@@ -21,6 +21,51 @@ class Settings(BaseSettings):
     kite_api_secret: str | None = None
     kite_access_token: str | None = None
 
+    # ---- Angel One SmartAPI, live price feed only ----------------------
+    #
+    # Deliberately *not* a value of `broker`. Angel is layered on top of
+    # whichever broker is configured, as the preferred source of the live
+    # spot price and nothing else: candles, the option chain and every
+    # analytical input still come from the existing adapter, so switching
+    # this on cannot move the 5-minute pipeline underneath the strategy.
+    #
+    # These are read here and nowhere else. Nothing below serialises them,
+    # and no API response carries them — see `tests/test_angel_isolation.py`.
+    angel_enabled: bool = False
+    angel_api_key: str | None = None
+    angel_client_code: str | None = None
+    # MPIN on newer accounts, the login password on older ones. Angel takes
+    # whichever the account uses in the same field.
+    angel_password: str | None = None
+    angel_mpin: str | None = None
+    angel_totp_secret: str | None = None
+
+    # NIFTY 50 on NSE cash. Angel identifies instruments by numeric token,
+    # not by name, and 99926000 is the index token in their instrument
+    # master. Exposed because a token that silently changes would subscribe
+    # the desk to the wrong instrument and every price would simply be
+    # somebody else's — verify it against the master before trusting it.
+    angel_nifty_token: str = "99926000"
+    angel_exchange_type: int = 1        # 1 = NSE_CM in SmartWebSocketV2
+
+    # A push feed proves it is alive by pushing. Past this with no tick
+    # during market hours the feed is treated as down and the free-data
+    # poller takes over. Angel's index feed prints about once a second, so
+    # this is roughly ten missed ticks — long enough not to flap on a hiccup.
+    angel_stale_seconds: float = 10.0
+
+    # The floor between two published prices. The feed is push, so this is
+    # not a poll interval: it caps how often a burst of ticks can reach
+    # Redis and every open browser. 250ms is four updates a second, which is
+    # past what an eye reads off a dashboard anyway.
+    angel_min_publish_ms: int = 250
+
+    # Reconnect backoff. Starts fast because most drops are momentary, and
+    # tops out well under a session so a feed that recovers at lunchtime
+    # does not sit waiting until the close.
+    angel_reconnect_min_seconds: float = 2.0
+    angel_reconnect_max_seconds: float = 60.0
+
     # Nothing places a real order unless this is explicitly true.
     live_trading: bool = False
 
