@@ -1,0 +1,105 @@
+/* The market bar: the one strip that is true whether or not anything else
+   on the page has loaded.
+
+   Everything in it is a fact about the market or about this desk's link to
+   it — never an opinion. Quotes the backend does not serve are named and
+   marked unavailable rather than omitted, because a missing tile reads as
+   "flat" and an absent feed is not a flat market.
+*/
+import { useEffect, useRef, useState } from "react";
+
+import { QuoteCell } from "./panels.jsx";
+import { UNAVAILABLE, istTime } from "./format.js";
+
+/** Flash the tape green or red for a moment when the print changes.
+
+    Lives here because the top bar is the only place the live price is
+    rendered. It used to appear twice — once here and once in a detail panel
+    — and a number that disagrees with itself for one render, or simply
+    repeats, costs screen space without adding a reading. */
+function useFlash(value) {
+  const [flash, setFlash] = useState("");
+  const last = useRef(null);
+
+  useEffect(() => {
+    if (value === null || value === undefined || value === last.current) return;
+    const dir = last.current === null ? "" : value > last.current ? "up" : "down";
+    last.current = value;
+    if (!dir) return;
+    setFlash(dir);
+    const id = setTimeout(() => setFlash(""), 600);
+    return () => clearTimeout(id);
+  }, [value]);
+
+  return flash;
+}
+
+const SESSION_LABEL = {
+  open: "Market open", "pre-open": "Pre-open", closed: "Market closed",
+};
+
+/* Terse on purpose. The full sentence — "Data live", "Last print" — belongs
+   to the freshness line in the status column, and having both say the same
+   words made the eye read the phrase twice and learn nothing the second
+   time. Here it is a status lamp; there it is an explanation. */
+const AGE_LABEL = {
+  live: "LIVE", delayed: "DELAYED", stale: "STALE",
+  closed: "CLOSED", unknown: "AGE UNKNOWN",
+};
+
+const AGE_TONE = {
+  live: "go", delayed: "wait", stale: "stop", closed: "flat", unknown: "wait",
+};
+
+export default function TopBar({
+  price, vix, market, link, ageState, ageText, clock, onRefresh,
+}) {
+  const session = market?.session ?? null;
+  const flash = useFlash(price?.price);
+
+  return (
+    <header className="topbar">
+      <div className="brand">
+        <span className="brand-mark" aria-hidden="true" />
+        <span className="brand-name">Quant<b>Desk</b></span>
+        <span className="brand-sub">options signal platform</span>
+      </div>
+
+      <div className="quotes">
+        <QuoteCell label="NIFTY 50" quote={price} flash={flash} />
+        {/* Deliberately empty. `/market/price` serves the single configured
+            watch symbol, and this desk has no second feed — so these are
+            named and marked unavailable rather than quietly dropped or,
+            worse, filled with the NIFTY number. */}
+        <QuoteCell label="SENSEX" quote={null} />
+        <QuoteCell label="BANK NIFTY" quote={null} />
+        <div className="quote">
+          <span className="quote-name">INDIA VIX</span>
+          <span className="quote-price mono">
+            {vix === null || vix === undefined ? UNAVAILABLE : vix.toFixed(2)}
+          </span>
+          <span className="quote-change mono dim">
+            {vix === null || vix === undefined ? "" : vix < 15 ? "LOW" : vix < 22 ? "MID" : "HIGH"}
+          </span>
+        </div>
+      </div>
+
+      <div className="topbar-status">
+        <span className={`pill ${market?.open ? "on" : "off"}`}>
+          <i className="dot" />
+          {session ? (SESSION_LABEL[session] ?? session) : "…"}
+        </span>
+        <span className={`pill tone-${AGE_TONE[ageState] ?? "wait"}`} title="Feed freshness">
+          <i className="dot" />
+          {AGE_LABEL[ageState] ?? ageState}
+          {ageText ? ` ${ageText}` : ""}
+        </span>
+        <span className={`pill link-${link}`} title="Transport to the backend">
+          <i className="dot" />{link}
+        </span>
+        <span className="clock mono">{istTime(clock, true)} IST</span>
+        <button className="ghost-btn" onClick={onRefresh}>refresh</button>
+      </div>
+    </header>
+  );
+}

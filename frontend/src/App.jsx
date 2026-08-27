@@ -6,6 +6,12 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
 const PriceChart = lazy(() => import("./PriceChart.jsx"));
 const OIProfile = lazy(() => import("./OIProfile.jsx"));
 
+import TopBar from "./TopBar.jsx";
+import {
+  DecisionPanel, MarketOverview, NewsPanel, PerformanceStrip, SafetyMonitor,
+  SignalFeed, performanceFrom,
+} from "./panels.jsx";
+
 function ChartFallback({ label }) {
   return (
     <div className="panel chart-fallback">
@@ -349,6 +355,60 @@ function useMarketData(intervalMs = 60_000) {
   }, [load, intervalMs]);
 
   return { candles, chain };
+}
+
+/* The slow-moving desk furniture: the journal, the outcome study, the data
+   quality report, the scheduler and the archive.
+
+   Deliberately its own loop and a slow one. None of this changes between
+   agent ticks, and putting it on the price socket would repaint the whole
+   right-hand column every few seconds for no new information.
+
+   Every request is independently guarded. A backend with no scheduler
+   endpoint, or a quality report that fails, must cost that one panel its
+   reading and not the other six — which is why this is six catches rather
+   than one try block. */
+function useDeskData(intervalMs = 60_000) {
+  const [feed, setFeed] = useState([]);
+  const [study, setStudy] = useState(null);
+  const [quality, setQuality] = useState(null);
+  const [scheduler, setScheduler] = useState(null);
+  const [coverage, setCoverage] = useState(null);
+  const [vix, setVix] = useState(null);
+  const [news, setNews] = useState(null);
+  const [priceFeed, setPriceFeed] = useState(null);
+
+  const load = useCallback(async () => {
+    // `feedStatus` is the *price* feed — which source is serving — and is
+    // deliberately not the same thing as `feed`, the signal journal.
+    const [history, outcomes, qual, sched, feedStatus, cov, vixRes, headlines] =
+      await Promise.all([
+      getJSON("/signals/history?limit=25").catch(() => null),
+      getJSON("/signals/outcomes?symbol=NIFTY&include_signals=true").catch(() => null),
+      getJSON("/data/quality?symbol=NIFTY").catch(() => null),
+      getJSON("/health/scheduler").catch(() => null),
+      getJSON("/health/feed").catch(() => null),
+      getJSON("/data/coverage?symbol=NIFTY").catch(() => null),
+      getJSON("/market/vix").catch(() => null),
+      getJSON("/news").catch(() => null),
+    ]);
+    if (Array.isArray(history)) setFeed(history);
+    if (outcomes) setStudy(outcomes);
+    if (qual) setQuality(qual);
+    if (sched) setScheduler(sched);
+    if (feedStatus) setPriceFeed(feedStatus);
+    if (cov) setCoverage(cov);
+    if (vixRes && typeof vixRes.india_vix === "number") setVix(vixRes.india_vix);
+    if (headlines) setNews(headlines);
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, intervalMs);
+    return () => clearInterval(id);
+  }, [load, intervalMs]);
+
+  return { feed, study, quality, scheduler, priceFeed, coverage, vix, news };
 }
 
 function Ticker({ price, marketOpen }) {
@@ -925,11 +985,12 @@ export default function App() {
   const { signal, price, market, riskNow, regime, link, skewMs, refresh } =
     useLiveSignal();
   const { candles, chain } = useMarketData();
+  const { feed, study, quality, scheduler, priceFeed, coverage, vix, news } = useDeskData();
   const [clock, setClock] = useState(() => Date.now());
 
-  /* Drives the age counter. It ticks on its own so a price that stops
-     arriving visibly gets older, instead of freezing at whatever it said
-     when the last frame landed. */
+  /* Drives the age counter and the wall clock. It ticks on its own so a
+     price that stops arriving visibly gets older, instead of freezing at
+     whatever it said when the last frame landed. */
   useEffect(() => {
     const id = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(id);
@@ -964,106 +1025,109 @@ export default function App() {
     ? Math.max(0, (new Date(market.next_boundary).getTime() - (clock - skewMs)) / 1000)
     : null;
 
-  const signalTime = signal?.timestamp
-    ? new Date(signal.timestamp).toLocaleTimeString("en-IN", {
-        hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata",
-      })
-    : "—";
+  const perf = performanceFrom(study);
+  const outcomeRows = study?.outcomes ?? [];
+
+  /* What the freshness pill says after the label. A fixed instant once the
+     session is over, because the number stops moving when the thing it
+     describes stops moving. */
+  const ageText = !price ? ""
+    : ageState === "closed" ? formatClock(price.source_time)
+    : formatAge(priceAge);
 
   return (
     <div className="shell">
-      <header className="masthead">
-        <h1 className="wordmark">Quant<span>Desk</span></h1>
-        <div className="masthead-meta">
-          <span className={`pill ${marketOpen ? "on" : "off"}`}>
-            {market ? (SESSION_LABEL[market.session] ?? market.session) : "…"}
-          </span>
-          <span className={`pill link-${link}`}>
-            <i className="dot" />{link}
-          </span>
-          <span className={`pill age-${ageState}`}>
-            {!price ? "waiting"
-              : ageState === "closed" ? formatClock(price.source_time)
-              : formatAge(priceAge)}
-          </span>
-          {/* The desk updates itself; this is here for a forced re-read,
-              not because anything requires clicking it. */}
-          <button onClick={refresh}>refresh</button>
-        </div>
-      </header>
+      <TopBar
+        price={price} vix={vix} market={market} link={link}
+        ageState={ageState} ageText={ageText} clock={clock}
+        onRefresh={refresh}
+      />
 
-      {/* The tape renders whether or not a signal exists yet. The price is
-          live market data and the signal is a five-minute decision; gating
-          the former on the latter meant a working feed showed nothing at
-          all until the agent's first tick. */}
-      <section className="tape">
-        <div className="tape-price">
-          <p className="eyebrow">Current price</p>
-          <Ticker price={price} marketOpen={marketOpen} />
-          <DataAge seconds={priceAge} price={price} sessionLive={sessionLive} />
-          <SessionClock market={market} secondsToBoundary={secondsToBoundary} />
-        </div>
-        {signal ? (
-          <div className={`tape-verdict ${signal.action}`}>
-            <div className={`action ${signal.action}`}>{signal.action}</div>
-            <div className="confidence-label">
-              {Math.round(signal.confidence * 100)}% confidence
-            </div>
-          </div>
-        ) : (
-          <div className="tape-verdict">
-            <div className="action">—</div>
-            <div className="confidence-label">awaiting first signal</div>
-          </div>
-        )}
-        <div className="tape-stats">
-          <div><span className="stat-label">VWAP</span>
-            <span className="stat-value">{num(signal?.context?.vwap)}</span></div>
-          <div><span className="stat-label">ATR 14</span>
-            <span className="stat-value">{num(signal?.context?.atr14)}</span></div>
-          <div><span className="stat-label">Trend</span>
-            <span className="stat-value">{signal?.context?.trend ?? "—"}</span></div>
-          {/* The decision time, which is not the price time. A signal taken
-              at 10:20 stays stamped 10:20 while the price above keeps
-              moving — that gap is real and the desk should show it. */}
-          <div><span className="stat-label">Last signal</span>
-            <span className="stat-value">{signalTime}</span></div>
-        </div>
-      </section>
+      <PerformanceStrip perf={perf} />
 
-      {/* Rendered whether or not a signal exists. The market is in some
-          condition regardless of whether the agent has spoken yet, and the
-          first thing a desk wants on opening the page is what kind of day
-          this is. */}
-      <RegimePanel regime={regime} />
-
-      {!signal && (
-        <p className="notice">
-          Waiting for the first signal. The agent publishes one every five
-          minutes — if this does not clear, check that the backend is running.
-          The price above updates independently and is already live.
-        </p>
-      )}
-
-      {signal && (
-        <>
-          <div className="desk">
-            <Suspense fallback={<ChartFallback label="Price · VWAP" />}>
-              <PriceChart candles={candles} signal={signal} />
-            </Suspense>
-            <PlanPanel signal={signal} marketOpen={marketOpen} riskNow={riskNow} />
-          </div>
-
-          <PlanLayers plan={signal.plan} />
-
-          <Ledger
-            checks={signal.checks || []}
-            context={signal.context}
-            confidence={signal.confidence}
-            action={signal.action}
+      <main className="terminal">
+        {/* Left: the chart is the main visual, with the numbers that
+            describe the same market directly under it. */}
+        <div className="col col-chart">
+          <Suspense fallback={<ChartFallback label="NIFTY 50 · 5m" />}>
+            <PriceChart candles={candles} signal={signal} />
+          </Suspense>
+          <MarketOverview
+            signal={signal} chain={chain} regime={regime} vix={vix} price={price}
           />
+        </div>
 
-          <div className="desk">
+        {/* Centre: what the desk is deciding, and the record of what it
+            decided before. This column is the reason the page exists. */}
+        <div className="col col-decision">
+          {signal ? (
+            <DecisionPanel
+              signal={signal} regime={regime} riskNow={riskNow}
+              marketOpen={marketOpen}
+            />
+          ) : (
+            <section className="panel decision-panel">
+              <div className="panel-head">
+                <h2>Active decision</h2>
+                <span className="panel-note">awaiting first signal</span>
+              </div>
+              <div className="verdict verdict-flat">
+                <span className="verdict-kicker">Model</span>
+                <strong className="verdict-headline">—</strong>
+                <span className="verdict-sub">no decision yet</span>
+              </div>
+              <p className="muted-body">
+                The agent publishes one every five minutes — if this does not
+                clear, check that the backend is running. The price above
+                updates independently and is already live.
+              </p>
+            </section>
+          )}
+          <SignalFeed rows={feed} outcomes={outcomeRows} />
+        </div>
+
+        {/* Right: is the desk itself trustworthy right now. */}
+        <div className="col col-status">
+          {/* The price itself lives in the top bar and only there. This
+              panel is about how far behind the market that number is and
+              where the session stands — the two questions the number alone
+              cannot answer. */}
+          <section className="panel session-panel">
+            <div className="panel-head">
+              <h2>Current price</h2>
+              <span className="panel-note mono">
+                {price?.source ? `via ${price.source}` : "no feed"}
+              </span>
+            </div>
+            <DataAge seconds={priceAge} price={price} sessionLive={sessionLive} />
+            <SessionClock market={market} secondsToBoundary={secondsToBoundary} />
+          </section>
+          {/* The market is in some condition whether or not the agent has
+              spoken yet, so this is never gated on a signal. */}
+          <RegimePanel regime={regime} />
+          <SafetyMonitor
+            ageState={ageState} priceAge={priceAge} market={market}
+            quality={quality} scheduler={scheduler} riskNow={riskNow}
+            coverage={coverage} feed={priceFeed}
+          />
+          <NewsPanel news={news} />
+        </div>
+      </main>
+
+      {/* Below the fold: the working. Kept off the decision columns because
+          it is what you read when you disagree with the call, not what you
+          read to act on it. */}
+      {signal && (
+        <section className="terminal-lower">
+          <div className="lower-wide">
+            <Ledger
+              checks={signal.checks || []}
+              context={signal.context}
+              confidence={signal.confidence}
+              action={signal.action}
+            />
+          </div>
+          <div className="lower-wide">
             <Suspense fallback={<ChartFallback label="Open interest" />}>
               <OIProfile
                 strikes={chain?.strikes}
@@ -1071,15 +1135,16 @@ export default function App() {
                 spot={price?.price || signal.price}
               />
             </Suspense>
-            <ContextPanel context={signal.context} />
           </div>
-        </>
+          <ContextPanel context={signal.context} />
+        </section>
       )}
 
       <p className="notice">
-        This is an analysis tool. It reads the market and shows its working — it
-        does not know the future and it is not advice. Every number here comes
-        from a rule you can read in <code>backend/app/analytics</code>.
+        Educational purpose only. This is an analysis tool — it reads the
+        market and shows its working, it does not know the future, and it is
+        not advice. Every number here comes from a rule you can read in{" "}
+        <code>backend/app/analytics</code>. Not SEBI registered.
       </p>
     </div>
   );
