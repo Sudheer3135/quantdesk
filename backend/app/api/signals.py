@@ -146,13 +146,34 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
 
 @router.get("/history")
 def signal_history(limit: int = 50, db: Session = Depends(get_db)):
+    """The signal journal, as the desk recorded it.
+
+    The two-layer read and the risk verdict are included because a feed row
+    without them cannot be read: an action alone does not say which direction
+    the higher timeframe pointed, whether this was the moment, or whether the
+    desk would have been allowed to take it. All four already live on the row
+    — this only stops discarding them on the way out.
+
+    Additive: every field the previous response carried is still here and
+    still spelled the same, so an existing caller sees no change.
+    """
     rows = db.scalars(
         select(SignalRecord).order_by(SignalRecord.created_at.desc()).limit(limit)
     ).all()
     return [
         {"id": r.id, "created_at": r.created_at, "symbol": r.symbol, "action": r.action,
          "confidence": r.confidence, "price": r.price, "entry": r.entry,
-         "stop_loss": r.stop_loss, "target": r.target}
+         "stop_loss": r.stop_loss, "target": r.target,
+         "bias": r.bias, "entry_state": r.entry_state,
+         # The regime the plan was formed in, if the plan recorded one. Read
+         # from the stored plan rather than re-derived, so the row says what
+         # the desk actually saw and never a reconstruction of it.
+         "regime_day": ((r.plan or {}).get("entry") or {}).get("regime_day"),
+         "regime_hour": ((r.plan or {}).get("entry") or {}).get("regime_hour"),
+         # The verdict only. The reasons are long and belong to the detail
+         # view; a feed needs to show approved-or-not at a glance.
+         "risk_state": (r.risk or {}).get("state"),
+         }
         for r in rows
     ]
 
