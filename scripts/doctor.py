@@ -79,8 +79,13 @@ def run_environment() -> None:
             raise WarnCheck(f"Python {v.major}.{v.minor}; the backend targets 3.12")
         return f"Python {v.major}.{v.minor}.{v.micro} on {platform.machine()}"
 
+    # `curl_cffi`, not `yfinance`. The free broker talks to Yahoo's chart
+    # endpoint over HTTP itself; yfinance is not a dependency and is not
+    # installed. Requiring it here failed the doctor for a package the
+    # application deliberately does not carry, which trains you to read a
+    # red line as normal — the one habit a diagnostic must never teach.
     for module in ("pandas", "numpy", "fastapi", "sqlalchemy", "redis",
-                   "httpx", "apscheduler", "yfinance"):
+                   "httpx", "apscheduler", "curl_cffi"):
         @check(f"import {module}")
         def _(m=module):
             mod = __import__(m)

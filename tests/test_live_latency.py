@@ -244,3 +244,22 @@ def test_unparseable_source_timestamps_degrade_to_unknown(raw):
     into `now`, which would mark unusable data as perfectly fresh."""
     from app.brokers.nse import parse_nse_timestamp
     assert parse_nse_timestamp(raw) is None
+
+
+def test_a_second_resolution_source_never_reports_negative_latency():
+    """Angel stamps `exchange_timestamp` to the whole second.
+
+    A tick that leaves at 10:05:48.994 carries 10:05:49, so the naive
+    subtraction makes it arrive six milliseconds before it was sent. A
+    negative latency on the dashboard reads as a broken clock, and it drags
+    the rolling p50 below anything achievable. Zero is the honest floor.
+    """
+    received = datetime(2026, 8, 26, 10, 5, 48, 993661, tzinfo=UTC)
+    stamped = datetime(2026, 8, 26, 10, 5, 49, tzinfo=UTC)          # rounded up
+
+    payload = prices.build_payload(
+        "NIFTY", 24207.75, source="angel", source_time=stamped.isoformat(),
+        received_at=received, transport="stream")
+
+    assert payload["feed_latency_ms"] == 0.0, (
+        "a source stamped to the second must floor at zero, not go negative")

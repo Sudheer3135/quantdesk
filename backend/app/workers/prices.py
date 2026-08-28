@@ -91,9 +91,19 @@ def reset_previous() -> None:
 
 
 def _millis(later: datetime, earlier: datetime | None) -> float | None:
+    """Elapsed milliseconds, floored at zero.
+
+    A latency cannot be negative, but a measured one can be: Angel stamps
+    `exchange_timestamp` to the second, so a tick that leaves the exchange
+    at 10:05:48.994 carries 10:05:49 and appears to arrive six milliseconds
+    before it was sent. Reporting -6.34 ms on the dashboard reads as a
+    broken clock rather than as the rounding it is, and it drags the rolling
+    p50 below anything real. Zero is the honest floor: the transit was too
+    short to measure at the source's resolution.
+    """
     if earlier is None:
         return None
-    return round((later - earlier).total_seconds() * 1000, 2)
+    return round(max(0.0, (later - earlier).total_seconds()) * 1000, 2)
 
 
 def build_payload(
