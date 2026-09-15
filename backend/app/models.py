@@ -325,3 +325,98 @@ class MarketRegime(Base):
     engine_version: Mapped[str] = mapped_column(String(16), nullable=False)
     computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now)
+
+
+class VixDaily(Base):
+    """India VIX, one row per session.
+
+    Its own table rather than rows in `candles`: a daily bar is stamped at
+    midnight, which the candle validator correctly rejects as outside the
+    session, and a volatility index is not a price anything is traded at.
+    Strategy v2 ranks the live VIX against this history before buying
+    premium, so the table has to exist before the gate can say anything.
+    """
+    __tablename__ = "vix_daily"
+    __table_args__ = (UniqueConstraint("session_date", name="uq_vix_daily"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now)
+
+
+class PaperPosition(Base):
+    """One simulated option position opened by strategy v2.
+
+    Paper, and labelled so in the table name: nothing here ever reached a
+    broker. Every level the position was opened against is stored at entry,
+    so a restart resumes monitoring the same stop and target rather than
+    recomputing them from a later price.
+    """
+    __tablename__ = "paper_positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(8), index=True)   # open | closed
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    direction: Mapped[str] = mapped_column(String(8))            # BUY | SELL on the index
+    contract: Mapped[str] = mapped_column(String(48))
+    token: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    option_type: Mapped[str] = mapped_column(String(2))
+    strike: Mapped[float] = mapped_column(Float)
+    expiry: Mapped[date] = mapped_column(Date)
+    lot_size: Mapped[int] = mapped_column(Integer)
+    lots: Mapped[int] = mapped_column(Integer)
+    quantity: Mapped[int] = mapped_column(Integer)
+
+    index_entry: Mapped[float] = mapped_column(Float)
+    index_stop: Mapped[float] = mapped_column(Float)
+    index_target: Mapped[float] = mapped_column(Float)
+    premium_entry: Mapped[float] = mapped_column(Float)
+    premium_stop: Mapped[float] = mapped_column(Float)
+    premium_target: Mapped[float] = mapped_column(Float)
+    risk_amount: Mapped[float] = mapped_column(Float)
+
+    last_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    worst_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    premium_exit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    index_exit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    gross_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costs: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    r_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # The selection, the gates, the risk verdict and the signal it came
+    # from — everything needed to argue with the trade later.
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class PaperDecision(Base):
+    """Every signal strategy v2 looked at, and what it did about it.
+
+    Rejections are stored, not just entries. A paper record that only kept
+    the trades it took would report the win rate of whatever it happened to
+    accept, with nothing showing how much it refused or why.
+    """
+    __tablename__ = "paper_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), index=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    signal_time: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    action: Mapped[str] = mapped_column(String(8))
+    outcome: Mapped[str] = mapped_column(String(8), index=True)    # entered | rejected
+    code: Mapped[str] = mapped_column(String(40), index=True)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
