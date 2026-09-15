@@ -84,6 +84,35 @@ Stop it all with `Ctrl-C`. Wipe the database and start clean with
 
 ---
 
+### Running on a Mac without Docker
+
+Docker Desktop's virtual machine alone was measured at 26–43% of a CPU with
+QuantDesk's four containers doing about 2% of work inside it. On a MacBook
+that is heat for nothing, so the desk also runs natively:
+
+```bash
+./scripts/start.sh     # PostgreSQL 16, Redis, API and dashboard
+./scripts/status.sh    # what is up, market session, where prices come from
+./scripts/stop.sh      # stops all four and confirms the ports closed
+```
+
+One-time requirements, already in place on the desk's Mac:
+
+- `brew install postgresql@16 redis` — PostgreSQL runs on **port 5433**, so
+  it never collides with a separately installed PostgreSQL on 5432
+- `python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt`
+  — the pinned versions, not whatever the system Python has
+- `cd frontend && npm ci`
+
+`.env` is unchanged. The scripts override `DATABASE_URL` and `REDIS_URL` to
+point at the local services, and bind everything to `127.0.0.1` only. Never
+run this and `docker compose up` at the same time: two backends open two
+Angel sessions on one account. Logs are in `logs/native/`.
+
+The Docker database was copied across on 14-Sep-2026 (every table verified by
+row count and checksum) and the `quantdesk_pgdata` volume was left in place as
+a backup.
+
 ## Step 4 — check it actually thinks
 
 Ask the engine for a signal and read its reasoning:
