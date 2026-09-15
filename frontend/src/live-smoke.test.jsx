@@ -155,6 +155,36 @@ describe.skipIf(!present)("the terminal against live payloads", () => {
     }
   });
 
+  it("builds the strike ladder from the real chain", async () => {
+    /* The ladder reads per-strike fields the aggregates above never touch:
+       call_ltp, put_ltp, call_oi_change, call_iv. A backend that renamed
+       any of them would leave the PCR intact and the ladder full of
+       dashes, which is exactly the silent-blank failure this file exists
+       to catch. */
+    await mount();
+    const chain = read("chain");
+    expect(screen.getByText("Strike ladder")).toBeTruthy();
+    expect(screen.getByText(new RegExp(`of ${chain.strikes.length} strikes`))).toBeTruthy();
+
+    // Named by its caption — the desk renders several tables and this must
+    // pick the ladder, not the signal journal.
+    const table = within(screen.getByRole("table", { name: /option chain, calls left/i }));
+    const near = [...chain.strikes]
+      .sort((a, b) => Math.abs(a.strike - chain.summary.spot)
+                    - Math.abs(b.strike - chain.summary.spot))[0];
+    expect(table.getAllByText(
+      Math.round(near.strike).toLocaleString("en-IN")).length).toBeGreaterThan(0);
+    expect(table.getAllByText(
+      near.call_ltp.toLocaleString("en-IN",
+        { minimumFractionDigits: 2, maximumFractionDigits: 2 })).length)
+      .toBeGreaterThan(0);
+
+    // The capture is a polled NSE snapshot, so both optional columns are
+    // carried and must be drawn.
+    expect(screen.getAllByText("ΔOI")).toHaveLength(2);
+    expect(screen.getAllByText("IV")).toHaveLength(2);
+  });
+
   it("renders real headlines with real tone readings", async () => {
     await mount();
     const news = read("news");

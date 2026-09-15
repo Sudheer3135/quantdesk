@@ -1,456 +1,514 @@
-/* The chart read as though its candles were out of order.
+/* The chart component's wiring.
 
-   They were not. `/market/candles?days=2` returns two sessions in perfect
-   chronological order, and the chart plotted them in exactly that order —
-   but it labelled every bar with the time of day and nothing else, so the
-   axis ran
+   lightweight-charts draws to a canvas and jsdom has no canvas, so the
+   renderer is mocked and what is asserted here is the wiring: which series
+   get created, what data reaches them, that zoom survives a data change,
+   and that panning left pages the archive without hammering it.
 
-       ... 02:30 pm -> 03:10 pm -> 09:35 am -> 10:15 am ...
+   The shaping and the paging arithmetic are pure and tested directly in
+   chart-data.test.jsx. */
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-   which is Wednesday's close followed by Thursday's open. Correct data,
-   and no way to tell from the screen.
+/* ---- the mocked renderer ------------------------------------------- */
 
-   Two things are tested here. That the series is ordered by the absolute
-   instant rather than by anything formatted — because sorting on "03:10 pm"
-   really would corrupt it — and that a session boundary is visible, because
-   an ordering that is right but unreadable is the bug that was reported. */
-import { beforeAll, describe, expect, it } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+const made = {
+  charts: [],
+  series: [],
+};
 
-import PriceChart, {
-  candleGeometry, structureMarkers,
-  hhmm, pickTicks, sessionOf, toSeries,
-} from "./PriceChart.jsx";
-
-/* jsdom ships no ResizeObserver, and Recharts' ResponsiveContainer asks for
-   one on mount. The chart geometry is not what these tests read — the panel
-   heading and its date span are — so a stub that never fires is enough. */
-beforeAll(() => {
-  globalThis.ResizeObserver ??= class {
-    observe() {}
-    unobserve() {}
-    disconnect() {}
+function makeSeries(kind, options) {
+  const s = {
+    kind, options,
+    data: null,
+    priceLines: [],
+    setData: vi.fn(function (d) { this.data = d; }),
+    updates: [],
+    update: vi.fn(function (bar) {
+      this.updates.push(bar);
+      if (!this.data) return;
+      const i = this.data.findIndex((b) => b.time === bar.time);
+      if (i >= 0) this.data[i] = bar; else this.data.push(bar);
+    }),
+    createPriceLine: vi.fn(function (l) {
+      this.priceLines.push(l); return l;
+    }),
+    removePriceLine: vi.fn(function (l) {
+      this.priceLines = this.priceLines.filter((x) => x !== l);
+    }),
   };
-});
-
-/* 09:15 IST is 03:45 UTC. Bars are built from the UTC instant so the test
-   states the moment it means rather than trusting a local zone. */
-const bar = (iso, close = 24_200) => ({
-  timestamp: iso,
-  open: close - 5, high: close + 8, low: close - 9, close,
-  volume: 1, vwap: close - 2, vwap_upper: close + 12, vwap_lower: close - 16,
-  // The moving averages and ATR the candles endpoint already carries. Named
-  // exactly as the backend spells them, so a rename there fails a test here
-  // rather than silently drawing a flat line at zero.
-  ema20: close - 3, ema50: close - 8, ema200: close - 25, atr14: 19.5,
-});
-
-/* One IST session as 5-minute bars, from 09:15. */
-function session(date, count, base = 24_200) {
-  const open = Date.parse(`${date}T03:45:00+00:00`);
-  return Array.from({ length: count }, (_, i) =>
-    bar(new Date(open + i * 5 * 60_000).toISOString(), base + i));
+  made.series.push(s);
+  return s;
 }
 
-const WED = session("2026-08-19", 75, 24_200);      // 09:15 -> 15:25 IST
-const THU = session("2026-08-20", 76, 24_310);      // 09:15 -> 15:30 IST
+function makeChart() {
+  const rangeHandlers = new Set();
+  const crosshairHandlers = new Set();
+  const chart = {
+    removed: false,
+    rangeHandlers,
+    crosshairHandlers,
+    series: [],
+    addSeries: vi.fn((kind, options) => {
+      const s = makeSeries(kind, options);
+      chart.series.push(s);
+      return s;
+    }),
+    removeSeries: vi.fn((s) => {
+      chart.series = chart.series.filter((x) => x !== s);
+    }),
+    subscribeCrosshairMove: vi.fn((h) => crosshairHandlers.add(h)),
+    timeScale: vi.fn(() => ({
+      subscribeVisibleLogicalRangeChange: vi.fn((h) => rangeHandlers.add(h)),
+      unsubscribeVisibleLogicalRangeChange: vi.fn((h) => rangeHandlers.delete(h)),
+    })),
+    remove: vi.fn(() => { chart.removed = true; }),
+  };
+  made.charts.push(chart);
+  return chart;
+}
 
-const epochs = (rows) => rows.map((r) => r.ms);
-const isAscending = (xs) => xs.every((x, i) => i === 0 || xs[i - 1] < x);
+vi.mock("lightweight-charts", () => ({
+  createChart: vi.fn(() => makeChart()),
+  CandlestickSeries: "CandlestickSeries",
+  LineSeries: "LineSeries",
+  ColorType: { Solid: "solid" },
+  CrosshairMode: { Normal: 0 },
+  LineStyle: { Solid: 0, Dotted: 1, Dashed: 2 },
+}));
 
-describe("chronological ordering", () => {
-  it("reproduces the reported sequence and puts it back in order", () => {
-    /* The exact shape from the report: a midday bar, a late-afternoon bar,
-       and a next-morning bar, delivered out of order. Formatted as HH:mm
-       they read 12:15 pm, 03:25 pm, 10:45 am — and any sort that touches
-       those strings keeps them in that order. */
-    const broken = [
-      bar("2026-08-20T05:15:00+00:00", 24_400),   // Thu 10:45 IST
-      bar("2026-08-19T06:45:00+00:00", 24_100),   // Wed 12:15 IST
-      bar("2026-08-19T09:55:00+00:00", 24_250),   // Wed 15:25 IST
-    ];
+const { createChart } = await import("lightweight-charts");
 
-    const labels = broken.map((b) => hhmm(Date.parse(b.timestamp)));
-    expect(labels).toEqual(["10:45 am", "12:15 pm", "03:25 pm"]);
+const getJSON = vi.fn();
+vi.mock("./api.js", () => ({ getJSON: (...a) => getJSON(...a) }));
 
-    /* Sorting the labels does not rescue it. A 12-hour clock puts "03:25 pm"
-       first and the true first bar second, so the formatted order is wrong
-       in its own way and gives no hint that it is wrong. */
-    expect([...labels].sort()).toEqual(["03:25 pm", "10:45 am", "12:15 pm"]);
+const { default: PriceChart } = await import("./PriceChart.jsx");
 
-    const rows = toSeries(broken);
-    expect(isAscending(epochs(rows))).toBe(true);
-    expect(rows.map((r) => hhmm(r.ms)))
-      .toEqual(["12:15 pm", "03:25 pm", "10:45 am"]);
-    expect(rows.map((r) => r.close)).toEqual([24_100, 24_250, 24_400]);
-  });
+/* ---- fixtures ------------------------------------------------------- */
 
-  it("orders a fully shuffled two-session window by the instant", () => {
-    const shuffled = [...WED, ...THU]
-      .map((c, i) => ({ c, k: (i * 7919) % 151 }))
-      .sort((a, b) => a.k - b.k)
-      .map((x) => x.c);
+function bars(n, startIso = "2026-08-28T03:45:00+00:00") {
+  const t0 = new Date(startIso).getTime();
+  return Array.from({ length: n }, (_, i) => ({
+    timestamp: new Date(t0 + i * 5 * 60_000).toISOString(),
+    open: 24100 + i, high: 24110 + i, low: 24090 + i, close: 24105 + i,
+    vwap: 24100, ema20: 24102, ema50: 24101, ema200: 24099, atr14: 12.5,
+  }));
+}
 
-    const rows = toSeries(shuffled, 200);
-    expect(rows).toHaveLength(151);
-    expect(isAscending(epochs(rows))).toBe(true);
-    expect(rows[0].timestamp).toBe(WED[0].timestamp);
-    expect(rows[rows.length - 1].timestamp).toBe(THU[THU.length - 1].timestamp);
-  });
+const page = (rows, over = {}) => ({
+  candles: rows,
+  has_more: true,
+  oldest: rows.length ? rows[0].timestamp : null,
+  ...over,
+});
 
-  it("keeps an already-correct series exactly as it is", () => {
-    const rows = toSeries([...WED, ...THU], 200);
-    expect(rows.map((r) => r.timestamp))
-      .toEqual([...WED, ...THU].map((c) => c.timestamp));
-  });
+/* The first archive fetch resolves after mount, so its state update lands
+   outside React's act() unless the render is awaited inside one. */
+async function renderChart(ui) {
+  let utils;
+  await act(async () => { utils = render(ui); });
+  return utils;
+}
 
-  it("trims to the last N bars after sorting, not before", () => {
-    /* Slicing an unordered array keeps the last N of an arbitrary order.
-       Reversed input makes that visible: the naive path would return the
-       *oldest* bars and call them the newest. */
-    const rows = toSeries([...WED, ...THU].reverse(), 10);
-    expect(rows).toHaveLength(10);
-    expect(epochs(rows)).toEqual(epochs(toSeries([...WED, ...THU], 10)));
-    expect(rows[rows.length - 1].timestamp).toBe(THU[THU.length - 1].timestamp);
-  });
+const chart = () => made.charts[0];
+const priceSeries = () =>
+  chart().series.find((s) => s.kind === "CandlestickSeries"
+                          || (s.kind === "LineSeries" && s.options.lineWidth === 2));
 
-  it("collapses a repeated instant to the later reading", () => {
-    const restated = { ...WED[3], close: 24_999 };
-    const rows = toSeries([...WED.slice(0, 5), restated], 50);
-    expect(rows).toHaveLength(5);
-    expect(isAscending(epochs(rows))).toBe(true);
-    expect(rows[3].close).toBe(24_999);
-  });
+beforeEach(() => {
+  made.charts = [];
+  made.series = [];
+  getJSON.mockReset();
+  getJSON.mockResolvedValue(page(bars(60)));
+});
 
-  it("drops a stamp it cannot parse instead of sorting NaN", () => {
-    const rows = toSeries([WED[0], bar("not a date"), WED[1]], 50);
-    expect(rows).toHaveLength(2);
-    expect(isAscending(epochs(rows))).toBe(true);
+afterEach(cleanup);
+
+/* ---- tests ---------------------------------------------------------- */
+
+describe("axis labels", () => {
+  it("shows the date only at a day boundary, not on every tick", async () => {
+    // lightweight-charts hands tickMarkFormatter a TickMarkType: Year=0,
+    // Month=1, DayOfMonth=2, Time=3, TimeWithSeconds=4 — and gives a tick
+    // DayOfMonth precisely when it is the first bar of a new day on an
+    // intraday chart. Wiring anything narrower than `<= 2` meant that case
+    // never fired: every tick rendered bare HH:MM, and two sessions side
+    // by side on the axis read as one clock running backwards.
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    const options = createChart.mock.calls[0][1];
+    const format = options.timeScale.tickMarkFormatter;
+    const epoch = Math.floor(new Date("2026-08-28T03:45:00+00:00").getTime() / 1000);
+
+    expect(format(epoch, 2)).toMatch(/^\d{2} [A-Za-z]{3}$/);  // DayOfMonth
+    expect(format(epoch, 3)).toBe("09:15");                    // Time
   });
 });
 
-describe("timestamps arrive with a full date and a zone", () => {
-  it("accepts the ISO 8601 form the backend now sends", () => {
-    const rows = toSeries([bar("2026-08-19T03:45:00+00:00")]);
-    expect(rows[0].ms).toBe(Date.parse("2026-08-19T03:45:00Z"));
+describe("mounting", () => {
+  it("creates exactly one chart", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(made.charts).toHaveLength(1));
   });
 
-  it("keeps the original stamp beside the epoch", () => {
-    const rows = toSeries([bar("2026-08-19T03:45:00+00:00")]);
-    expect(rows[0].timestamp).toBe("2026-08-19T03:45:00+00:00");
+  it("loads a first window from the archive rather than waiting for props", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalled());
+    expect(getJSON.mock.calls[0][0]).toContain("/market/candles/history");
   });
 
-  it("reads the same instant identically whatever offset expresses it", () => {
-    /* IST only decides how a moment is drawn. It must not decide which
-       moment it is. */
-    const utc = toSeries([bar("2026-08-19T03:45:00+00:00")])[0];
-    const ist = toSeries([bar("2026-08-19T09:15:00+05:30")])[0];
-    expect(utc.ms).toBe(ist.ms);
-    expect(hhmm(utc.ms)).toBe("09:15 am");
-    expect(sessionOf(utc.ms)).toBe(sessionOf(ist.ms));
-  });
-});
-
-describe("multiple sessions", () => {
-  it("groups bars by their IST trading date", () => {
-    const rows = toSeries([...WED, ...THU], 200);
-    expect(new Set(rows.map((r) => r.session)))
-      .toEqual(new Set(["2026-08-19", "2026-08-20"]));
+  it("asks for the newest window first, with no cursor", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalled());
+    expect(getJSON.mock.calls[0][0]).not.toContain("before=");
   });
 
-  it("marks exactly one opening per session", () => {
-    const rows = toSeries([...WED, ...THU], 200);
-    const starts = rows.filter((r) => r.sessionStart);
-    expect(starts).toHaveLength(2);
-    expect(starts.map((r) => hhmm(r.ms))).toEqual(["09:15 am", "09:15 am"]);
+  it("destroys the chart on unmount", async () => {
+    const { unmount } = await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(made.charts).toHaveLength(1));
+    const c = chart();
+    unmount();
+    expect(c.removed).toBe(true);
   });
 
-  it("marks the opening even when the window starts mid-session", () => {
-    const rows = toSeries([...WED.slice(-20), ...THU.slice(0, 20)], 200);
-    const starts = rows.filter((r) => r.sessionStart);
-    expect(starts).toHaveLength(2);
-    expect(starts[0].ms).toBe(rows[0].ms);          // the window's own edge
-    expect(hhmm(starts[1].ms)).toBe("09:15 am");    // the real boundary
+  it("says so when the archive is empty instead of drawing nothing", async () => {
+    getJSON.mockResolvedValue(page([], { has_more: false, oldest: null }));
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    expect(await screen.findByText(/no candles archived yet/i)).toBeTruthy();
   });
 
-  it("labels every session opening with its date", () => {
-    const rows = toSeries([...WED, ...THU], 200);
-    const ticks = pickTicks(rows);
-    for (const start of rows.filter((r) => r.sessionStart)) {
-      expect(ticks).toContain(start.ms);
-    }
-  });
-
-  it("emits ticks in chronological order", () => {
-    const ticks = pickTicks(toSeries([...WED, ...THU], 200));
-    expect(isAscending(ticks)).toBe(true);
-    expect(ticks.length).toBeGreaterThan(2);
-  });
-
-  it("handles a single session and an empty window", () => {
-    expect(toSeries(WED, 200).filter((r) => r.sessionStart)).toHaveLength(1);
-    expect(toSeries([])).toEqual([]);
-    expect(toSeries(null)).toEqual([]);
-    expect(pickTicks([])).toEqual([]);
+  it("keeps the panel alive when the archive request fails", async () => {
+    // A failed page must leave the chart showing what it has, not replace
+    // it with an error.
+    getJSON.mockRejectedValue(new Error("boom"));
+    await renderChart(<PriceChart candles={bars(10)} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data?.length).toBe(10));
   });
 });
 
-describe("rendered panel", () => {
-  it("reports the window's real date span, not a time of day", () => {
-    render(<PriceChart candles={[...WED, ...THU]} signal={null} bars={200} />);
-    expect(screen.getByText(/2 sessions/)).toBeTruthy();
-    expect(screen.getByText(/19 Aug.*20 Aug.*IST/)).toBeTruthy();
+describe("series", () => {
+  it("draws candlesticks by default", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.kind).toBe("CandlestickSeries"));
   });
 
-  it("says so plainly when there are no candles", () => {
-    render(<PriceChart candles={[]} signal={null} />);
-    expect(screen.getByText("No candles loaded.")).toBeTruthy();
+  it("feeds the price series the archived bars", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
   });
 
-  it("plots only the candles it was given", () => {
-    /* The live price arrives every few seconds and the archive advances
-       every five minutes. Appending the tick as a bar would invent a candle
-       that never closed, at a timestamp no session ever produced. */
-    const rows = toSeries([...WED, ...THU], 200);
-    expect(rows).toHaveLength(151);
-    expect(rows[rows.length - 1].close).toBe(THU[THU.length - 1].close);
-    expect(rows.every((r) => r.ms % (5 * 60_000) === 0)).toBe(true);
+  it("adds the four overlays", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => {
+      const overlays = chart().series.filter(
+        (s) => s.kind === "LineSeries" && s.options.lastValueVisible === false);
+      expect(overlays).toHaveLength(4);
+    });
+  });
+
+  it("merges live bars on top of the archive", async () => {
+    const { rerender } = await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+    // One new bar beyond the archived window.
+    const live = bars(1, "2026-08-28T08:45:00+00:00");
+    rerender(<PriceChart candles={live} signal={null} />);
+    await waitFor(() => expect(priceSeries().data.length).toBe(61));
+  });
+
+  it("does not duplicate a bar the archive and the live prop share", async () => {
+    const shared = bars(60);
+    getJSON.mockResolvedValue(page(shared));
+    await renderChart(<PriceChart candles={shared} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+  });
+});
+
+describe("the style toggle", () => {
+  it("swaps to a line series without rebuilding the chart", async () => {
+    // Rebuilding would reset the user's zoom, which is the point of the
+    // whole rewrite.
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.kind).toBe("CandlestickSeries"));
+
+    fireEvent.click(screen.getByRole("button", { name: "LINE" }));
+
+    await waitFor(() => {
+      const line = chart().series.find(
+        (s) => s.kind === "LineSeries" && s.options.lineWidth === 2);
+      expect(line).toBeTruthy();
+    });
+    expect(made.charts).toHaveLength(1);
+    expect(chart().removed).toBe(false);
+  });
+
+  it("removes the old price series rather than stacking them", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "LINE" }));
+    await waitFor(() => expect(chart().removeSeries).toHaveBeenCalled());
+  });
+
+  it("honours an initial style of line", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} style="line" />);
+    await waitFor(() => {
+      expect(chart().series.some(
+        (s) => s.kind === "LineSeries" && s.options.lineWidth === 2)).toBe(true);
+    });
+  });
+
+  it("falls back to candles for an unknown style", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} style="hollow" />);
+    await waitFor(() => expect(priceSeries()?.kind).toBe("CandlestickSeries"));
+  });
+});
+
+describe("plan levels", () => {
+  it("draws entry, stop and target as price lines", async () => {
+    await renderChart(<PriceChart candles={[]}
+                       signal={{ plan: { entry: 24160, stop: 24140, target: 24220 } }} />);
+    await waitFor(() =>
+      expect(priceSeries()?.priceLines.map((l) => l.title))
+        .toEqual(["entry", "stop", "target"]));
+  });
+
+  it("omits a level the plan does not have", async () => {
+    await renderChart(<PriceChart candles={[]} signal={{ plan: { entry: 24160 } }} />);
+    await waitFor(() =>
+      expect(priceSeries()?.priceLines.map((l) => l.title)).toEqual(["entry"]));
+  });
+
+  it("draws none when there is no signal", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()).toBeTruthy());
+    expect(priceSeries().priceLines).toEqual([]);
+  });
+
+  it("replaces the lines when the plan changes", async () => {
+    const { rerender } = render(
+      <PriceChart candles={[]} signal={{ plan: { entry: 24160 } }} />);
+    await waitFor(() => expect(priceSeries()?.priceLines).toHaveLength(1));
+
+    rerender(<PriceChart candles={[]}
+                         signal={{ plan: { entry: 24200, stop: 24180 } }} />);
+    await waitFor(() =>
+      expect(priceSeries().priceLines.map((l) => l.price)).toEqual([24200, 24180]));
+  });
+});
+
+describe("paging the archive while panning", () => {
+  const pan = async (from) => {
+    await act(async () => {
+      for (const h of chart().rangeHandlers) await h({ from, to: from + 100 });
+    });
+  };
+
+  it("fetches older bars when the view nears the left edge", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+
+    getJSON.mockResolvedValue(page(bars(60, "2026-08-27T03:45:00+00:00")));
+    await pan(2);
+
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(2));
+    expect(getJSON.mock.calls[1][0]).toContain("before=");
+  });
+
+  it("does not fetch while the view is well inside the data", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+    await pan(400);
+    expect(getJSON).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages from the oldest bar it holds", async () => {
+    const first = bars(60);
+    getJSON.mockResolvedValue(page(first));
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+
+    getJSON.mockResolvedValue(page(bars(60, "2026-08-27T03:45:00+00:00")));
+    await pan(2);
+
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(2));
+    expect(getJSON.mock.calls[1][0])
+      .toContain(`before=${encodeURIComponent(first[0].timestamp)}`);
+  });
+
+  it("prepends the fetched page beneath what is on screen", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    getJSON.mockResolvedValue(page(bars(60, "2026-08-27T03:45:00+00:00")));
+    await pan(2);
+
+    await waitFor(() => expect(priceSeries().data.length).toBe(120));
+  });
+
+  it("stops asking once the archive says it has nothing older", async () => {
+    // Otherwise the start of history costs one request per pan event, for
+    // as long as the tab is open.
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+
+    getJSON.mockResolvedValue(
+      page(bars(10, "2026-08-27T03:45:00+00:00"), { has_more: false }));
+    await pan(2);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(2));
+
+    await pan(1);
+    await pan(0);
+    await pan(-5);
+    expect(getJSON).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not fire a second request while one is in flight", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+
+    let release;
+    getJSON.mockReturnValue(new Promise((r) => { release = r; }));
+    await pan(2);
+    await pan(1);
+    await pan(0);
+    expect(getJSON).toHaveBeenCalledTimes(2);
+
+    // Settle the held request inside act, so its state update is not
+    // reported as unwrapped after the assertion has already passed.
+    await act(async () => {
+      release(page(bars(10, "2026-08-27T03:45:00+00:00")));
+    });
+  });
+});
+
+describe("the readout", () => {
+  it("shows the last bar before the pointer has moved", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+    // 24105 + 59
+    expect(screen.getByText(/C\s+24164/)).toBeTruthy();
+  });
+
+  it("counts the bars it holds", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    expect(await screen.findByText(/60 bars/)).toBeTruthy();
+  });
+
+  it("marks the start of the archive", async () => {
+    getJSON.mockResolvedValue(page(bars(10), { has_more: false }));
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    expect(await screen.findByText(/start of archive/)).toBeTruthy();
+  });
+
+  it("follows the crosshair when the pointer moves", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    const series = priceSeries();
+    const seriesData = new Map([[series, { close: 23999 }]]);
+    act(() => {
+      for (const h of chart().crosshairHandlers) {
+        h({ time: 1787888700, seriesData });
+      }
+    });
+    await waitFor(() => expect(screen.getByText(/C\s+23999/)).toBeTruthy());
+  });
+
+  it("falls back to the last bar when the pointer leaves the chart", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    act(() => {
+      for (const h of chart().crosshairHandlers) h({ time: null });
+    });
+    await waitFor(() => expect(screen.getByText(/C\s+24164/)).toBeTruthy());
   });
 });
 
 
-/* --- the terminal readout -------------------------------------------------
+describe("the forming candle moves with the feed", () => {
+  const liveTick = (price, iso) =>
+    ({ price, source_time: iso, market_open: true });
 
-   The chart gained the moving averages a desk actually reads a 5-minute
-   NIFTY chart against, plus a numeric readout of the newest bar. The readout
-   matters more than it looks: an axis tells you roughly where a line is, and
-   "roughly" is not a level you can place a stop against.
-*/
-describe("indicator readout", () => {
-  it("states the newest bar's own numbers", () => {
-    render(<PriceChart candles={THU} signal={null} />);
-    const last = THU[THU.length - 1];
-    expect(screen.getByText(`C ${last.close.toFixed(2)}`)).toBeTruthy();
-    expect(screen.getByText(`VWAP ${last.vwap.toFixed(2)}`)).toBeTruthy();
-    expect(screen.getByText(`EMA20 ${last.ema20.toFixed(2)}`)).toBeTruthy();
-    expect(screen.getByText(`EMA50 ${last.ema50.toFixed(2)}`)).toBeTruthy();
-    expect(screen.getByText(`EMA200 ${last.ema200.toFixed(2)}`)).toBeTruthy();
-    expect(screen.getByText("ATR 19.50")).toBeTruthy();
+  /* bars() starts at 03:45Z and steps 5m, so 60 bars ends at 08:40Z. */
+  const LAST_BAR = "2026-08-28T08:40:00+00:00";
+
+  it("updates the last bar instead of redrawing the series", async () => {
+    // A full setData per tick would replace 540 bars four times a second.
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    const before = priceSeries().setData.mock.calls.length;
+    rerender(<PriceChart candles={[]} signal={null}
+                         price={liveTick(24999, LAST_BAR)} />);
+
+    await waitFor(() => expect(priceSeries().updates.length).toBe(1));
+    expect(priceSeries().setData.mock.calls.length).toBe(before);
   });
 
-  it("dashes an indicator the feed did not send, never a zero", () => {
-    /* EMA200 needs 200 bars. Early in an archive it is genuinely absent, and
-       a chart that drew it at 0 would put a line at the bottom of the axis
-       and call it a moving average. */
-    const thin = THU.map(({ ema200, ...rest }) => rest);
-    render(<PriceChart candles={thin} signal={null} />);
-    expect(screen.getByText("EMA200 —")).toBeTruthy();
-    expect(screen.queryByText("EMA200 0.00")).toBeNull();
+  it("moves the close of the bar at the right edge", async () => {
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    rerender(<PriceChart candles={[]} signal={null}
+                         price={liveTick(24999, LAST_BAR)} />);
+    await waitFor(() => {
+      const bar = priceSeries().updates.at(-1);
+      expect(bar.close).toBe(24999);
+      expect(bar.high).toBe(24999);
+    });
   });
 
-  it("titles itself as the instrument and timeframe it is", () => {
-    render(<PriceChart candles={THU} signal={null} />);
-    expect(screen.getByText("NIFTY 50 · 5m")).toBeTruthy();
+  it("appends a new bar when the tick crosses into the next bucket", async () => {
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    rerender(<PriceChart candles={[]} signal={null}
+                         price={liveTick(24999, "2026-08-28T08:46:00+00:00")} />);
+    await waitFor(() => expect(priceSeries().data.length).toBe(61));
   });
 
-  it("renders with structure present without throwing", () => {
-    render(<PriceChart candles={THU} signal={{
-      action: "BUY", entry: 24_380, stop_loss: 24_350, target: 24_440,
-      context: {
-        unfilled_fvgs: [{ midpoint: 24_360 }],
-        liquidity_pools: [{ level: 24_330, side: "buyside", swept: false }],
-      },
-    }} />);
-    expect(screen.getByText("NIFTY 50 · 5m")).toBeTruthy();
-  });
-});
+  it("does not move the candle while the market is shut", async () => {
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
 
-/* --- which structure gets drawn ------------------------------------------
-
-   Tested as a function rather than through the SVG. Recharts does not render
-   its children under jsdom's zero-width container, so an assertion on a
-   `<ReferenceLine>` label passes and fails for reasons that have nothing to
-   do with the rule being checked.
-*/
-describe("structure markers", () => {
-  it("draws nothing when the signal reported no structure", () => {
-    expect(structureMarkers(null)).toEqual({ gaps: [], pools: [] });
-    expect(structureMarkers({ action: "HOLD" })).toEqual({ gaps: [], pools: [] });
-    expect(structureMarkers({ context: {} })).toEqual({ gaps: [], pools: [] });
+    rerender(<PriceChart candles={[]} signal={null}
+                         price={{ price: 24999, source_time: LAST_BAR,
+                                  market_open: false }} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(priceSeries().updates).toHaveLength(0);
   });
 
-  it("drops a pool that has already been swept", () => {
-    /* A pool that has been taken is not a level any more, and drawing it
-       would mark support where support has already gone. */
-    const { pools } = structureMarkers({ context: { liquidity_pools: [
-      { level: 24_180, side: "buyside", swept: true },
-      { level: 24_320, side: "sellside", swept: false },
-    ] } });
-    expect(pools).toHaveLength(1);
-    expect(pools[0].level).toBe(24_320);
+  it("keeps the forming bar when the polled rows arrive underneath it", async () => {
+    // The 60-second poll calls setData. Without carrying the forming bar
+    // across it, the right edge jumps backwards once a minute.
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    rerender(<PriceChart candles={[]} signal={null}
+                         price={liveTick(24999, LAST_BAR)} />);
+    await waitFor(() => expect(priceSeries().updates.length).toBe(1));
+
+    rerender(<PriceChart candles={bars(60)} signal={null}
+                         price={liveTick(24999, LAST_BAR)} />);
+    await waitFor(() => {
+      const drawn = priceSeries().data.at(-1);
+      expect(drawn.close).toBe(24999);
+    });
   });
 
-  it("ignores a gap with no usable midpoint", () => {
-    const { gaps } = structureMarkers({ context: { unfilled_fvgs: [
-      { midpoint: null }, { top: 1, bottom: 0 }, { midpoint: 24_232.05 },
-    ] } });
-    expect(gaps).toHaveLength(1);
-    expect(gaps[0].midpoint).toBe(24_232.05);
-  });
+  it("feeds the line series a value rather than a candle", async () => {
+    const { rerender } = await renderChart(
+      <PriceChart candles={[]} signal={null} style="line" />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
 
-  it("caps how many it will draw, so the chart stays readable", () => {
-    const many = Array.from({ length: 9 }, (_, i) => ({ midpoint: 24_000 + i }));
-    expect(structureMarkers({ context: { unfilled_fvgs: many } }).gaps)
-      .toHaveLength(3);
-  });
-});
-
-
-/* The candles.
-
-   Recharts hands a custom bar shape one rectangle and nothing else: top
-   edge = high, bottom edge = low. Every other price on the candle has to be
-   placed inside it by arithmetic, and jsdom renders none of the resulting
-   SVG — so if the conversion is wrong, a green body appears on a bar that
-   closed down and no test would notice. These read the arithmetic directly.
-
-   The box below is deliberately easy to check by hand: 100 pixels tall
-   spanning 100 points of price, so one point is one pixel and every
-   expected coordinate can be counted rather than recomputed. */
-const BOX = { x: 200, y: 50, width: 9, height: 100 };
-const priceAt = (px) => 24_200 - (px - BOX.y);   // y=50 is the high, 24,200
-
-describe("candle geometry", () => {
-  it("places the body between open and close, inside its own wick", () => {
-    // low 24,100 .. high 24,200; opened at 24,120 and closed at 24,180.
-    const geo = candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: 24_200 }, BOX);
-
-    expect(geo.wickTop).toBe(50);            // the high
-    expect(geo.wickBottom).toBe(150);        // the low
-    expect(geo.bodyY).toBe(70);              // close, 20 points below the high
-    expect(geo.bodyY + geo.bodyHeight).toBe(130);   // open
-
-    expect(priceAt(geo.bodyY)).toBe(24_180);
-    expect(priceAt(geo.bodyY + geo.bodyHeight)).toBe(24_120);
-
-    // The body may touch the wick's ends but must never escape them.
-    expect(geo.bodyY).toBeGreaterThanOrEqual(geo.wickTop);
-    expect(geo.bodyY + geo.bodyHeight).toBeLessThanOrEqual(geo.wickBottom);
-  });
-
-  it("colours the body against the open, not against anything else", () => {
-    const up = candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: 24_200 }, BOX);
-    const down = candleGeometry(
-      { open: 24_180, close: 24_120, low: 24_100, high: 24_200 }, BOX);
-
-    expect(up.tone).toBe("up");
-    expect(down.tone).toBe("down");
-
-    /* The same two bars, swapped. A conversion that reads the rectangle
-       rather than the values would give both candles the same body, since
-       the pixel rect for [min, max] is identical either way. */
-    expect(down.bodyY).toBe(up.bodyY);
-    expect(down.bodyHeight).toBe(up.bodyHeight);
-  });
-
-  it("draws a doji as a mark rather than as nothing", () => {
-    const geo = candleGeometry(
-      { open: 24_150, close: 24_150, low: 24_100, high: 24_200 }, BOX);
-
-    expect(geo.tone).toBe("flat");
-    // A zero-height rect renders nothing at all, which reads as missing data.
-    expect(geo.bodyHeight).toBeGreaterThanOrEqual(1);
-    expect(geo.bodyY).toBe(100);
-  });
-
-  it("survives a bar that never moved", () => {
-    /* high === low is a divide by zero. NaN in an SVG coordinate draws
-       nothing and throws nothing, so this is exactly the failure that hides. */
-    const geo = candleGeometry(
-      { open: 24_150, close: 24_150, low: 24_150, high: 24_150 }, BOX);
-
-    for (const v of Object.values(geo)) {
-      if (typeof v === "number") expect(Number.isFinite(v)).toBe(true);
-    }
-    expect(geo.bodyHeight).toBeGreaterThanOrEqual(1);
-  });
-
-  it("centres the body on the wick", () => {
-    const geo = candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: 24_200 }, BOX);
-
-    expect(geo.centre).toBe(BOX.x + BOX.width / 2);
-    expect(geo.bodyX + geo.bodyWidth / 2).toBe(geo.centre);
-    // Narrower than the band it sits in, so neighbouring candles stay
-    // visibly separate at 120 bars rather than fusing into a slab.
-    expect(geo.bodyWidth).toBeLessThan(BOX.width);
-  });
-
-  it("keeps a body on the tightest band it will ever be given", () => {
-    // A very dense window shrinks the band below the inset. The body must
-    // narrow to a hairline, never to zero or to a negative width.
-    for (const width of [1, 1.5, 2, 2.5, 3]) {
-      const geo = candleGeometry(
-        { open: 24_120, close: 24_180, low: 24_100, high: 24_200 },
-        { ...BOX, width });
-      expect(geo.bodyWidth).toBeGreaterThanOrEqual(1);
-      expect(geo.bodyX + geo.bodyWidth / 2).toBeCloseTo(geo.centre, 10);
-    }
-  });
-
-  it("caps the body width, so a short window does not draw slabs", () => {
-    // Twelve bars across a wide panel gives recharts a very fat band.
-    const geo = candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: 24_200 },
-      { ...BOX, width: 90 });
-
-    expect(geo.bodyWidth).toBeLessThanOrEqual(13);
-    expect(geo.bodyX + geo.bodyWidth / 2).toBe(geo.centre);
-  });
-
-  it("draws nothing at all when the bar is incomplete", () => {
-    // Not a flat candle at zero — no candle. A missing high is unknown
-    // range, and a chart must not invent one to have something to draw.
-    expect(candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: null }, BOX)).toBeNull();
-    expect(candleGeometry({ open: 24_120 }, BOX)).toBeNull();
-    expect(candleGeometry(null, BOX)).toBeNull();
-    // Recharts sizes bars from the container, which is zero-width on the
-    // first paint before the ResizeObserver fires.
-    expect(candleGeometry(
-      { open: 24_120, close: 24_180, low: 24_100, high: 24_200 },
-      { ...BOX, width: 0 })).toBeNull();
-  });
-});
-
-describe("the plotted series", () => {
-  it("carries the high-low range each candle is drawn into", () => {
-    const rows = toSeries(WED.slice(0, 3));
-    expect(rows[0].range).toEqual([WED[0].low, WED[0].high]);
-  });
-
-  it("gives a bar with no range no range to draw", () => {
-    const broken = { ...WED[0], high: null };
-    const rows = toSeries([broken]);
-    expect(rows[0].range).toBeNull();
-  });
-
-  it("offers candles and a line, and opens on candles", () => {
-    render(<PriceChart candles={WED} signal={null} />);
-    const group = screen.getByRole("group", { name: /price style/i });
-
-    const candles = within(group).getByRole("button", { name: "candles" });
-    const line = within(group).getByRole("button", { name: "line" });
-
-    expect(candles.getAttribute("aria-pressed")).toBe("true");
-    expect(line.getAttribute("aria-pressed")).toBe("false");
-
-    fireEvent.click(line);
-    expect(within(group).getByRole("button", { name: "line" })
-      .getAttribute("aria-pressed")).toBe("true");
-    expect(within(group).getByRole("button", { name: "candles" })
-      .getAttribute("aria-pressed")).toBe("false");
+    rerender(<PriceChart candles={[]} signal={null} style="line"
+                         price={liveTick(24999, LAST_BAR)} />);
+    await waitFor(() =>
+      expect(priceSeries().updates.at(-1)).toEqual(
+        { time: expect.any(Number), value: 24999 }));
   });
 });

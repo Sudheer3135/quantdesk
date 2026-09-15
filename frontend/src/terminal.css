@@ -597,3 +597,194 @@ a.news-headline:hover { color: var(--info); text-decoration: underline; }
 }
 .tag.bullish { color: var(--go); border-color: rgba(46,194,126,.4); }
 .tag.bearish { color: var(--stop); border-color: rgba(240,97,109,.4); }
+
+/* ------------------------------------------------- strike ladder */
+
+/* The ladder is a dense numeric table, so everything here is in service of
+   scanning down one column: monospace with tabular figures throughout, a
+   sticky header that survives the scroll, and shading that carries meaning
+   rather than decoration.
+
+   Three things are encoded in form as well as in digits — in-the-money
+   cells sit on a lifted ground, the open-interest cells carry a bar sized
+   to the number behind the text, and the row nearest the money is ruled on
+   both edges. Together they let the reader find spot, the walls and the
+   shape of the book without reading a single value. */
+
+.chain-panel { padding-bottom: 10px; }
+
+.chain-meta {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px;
+  font-size: 10px; color: var(--text-mute); margin: 0 0 8px;
+}
+.chain-meta .mono { color: var(--text-dim); }
+
+.chain-spans { margin-left: auto; display: flex; gap: 4px; }
+.span-btn {
+  font: inherit; font-family: var(--mono); font-size: 10px;
+  background: none; color: var(--text-mute);
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: 1px 6px; cursor: pointer;
+}
+.span-btn:hover { color: var(--text-dim); border-color: var(--text-mute); }
+.span-btn.on { color: var(--text); border-color: var(--info); background: rgba(59,130,246,.12); }
+.span-btn:focus-visible { outline: 2px solid var(--info); outline-offset: 1px; }
+
+/* Wide content scrolls inside its own box. The page body never moves
+   sideways, whatever the span control is set to. */
+.chain-scroll { overflow-x: auto; max-height: 460px; overflow-y: auto; }
+
+.chain-ladder {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--mono); font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.chain-ladder th, .chain-ladder td {
+  padding: 3px 8px; white-space: nowrap;
+  border-bottom: 1px solid var(--line-soft);
+}
+.chain-ladder thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-panel);
+  font-family: var(--ui); font-size: 9px; font-weight: 500;
+  text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-mute); text-align: right;
+  border-bottom: 1px solid var(--line);
+}
+.chain-ladder .chain-sides th { text-align: center; letter-spacing: .14em; }
+.chain-ladder .side-call { color: var(--stop); }
+.chain-ladder .side-put  { color: var(--go); }
+.chain-ladder .side-strike { text-align: center; color: var(--text-dim); }
+
+.chain-ladder td.num { text-align: right; color: var(--text-dim); }
+.chain-ladder td.ltp { color: var(--text); }
+.chain-ladder td.dim { color: var(--text-mute); }
+.chain-ladder td.up   { color: var(--go); }
+.chain-ladder td.down { color: var(--stop); }
+
+/* In the money. A lifted ground rather than a colour, so it never competes
+   with the green and red that already mean direction on this desk. */
+.chain-ladder td.itm { background: var(--bg-raise); }
+
+/* Open interest, with the magnitude drawn behind the number. The bar is a
+   hard gradient stop driven by --oi-fill, set per cell from that row's
+   share of the widest value on screen.
+
+   Both bars are anchored on the edge facing the strike column and grow
+   outward, so the two books open away from the money like a book laid
+   flat and the heavier side is obvious without reading a digit. */
+.chain-ladder td.oi {
+  position: relative; color: var(--text);
+  background-image: linear-gradient(to left, rgba(240,97,109,.20) var(--oi-fill, 0%), transparent var(--oi-fill, 0%));
+}
+.chain-ladder td.oi.itm {
+  background-image: linear-gradient(to left, rgba(240,97,109,.20) var(--oi-fill, 0%), transparent var(--oi-fill, 0%));
+  background-color: var(--bg-raise);
+}
+.chain-ladder td.put-oi {
+  background-image: linear-gradient(to right, rgba(46,194,126,.20) var(--oi-fill, 0%), transparent var(--oi-fill, 0%));
+}
+.chain-ladder td.put-oi.itm {
+  background-image: linear-gradient(to right, rgba(46,194,126,.20) var(--oi-fill, 0%), transparent var(--oi-fill, 0%));
+  background-color: var(--bg-raise);
+}
+.chain-ladder td.oi.wall { font-weight: 700; color: var(--text); }
+
+.chain-ladder td.strike {
+  text-align: center; font-weight: 600; color: var(--text);
+  background: var(--bg-sunk);
+  border-left: 1px solid var(--line); border-right: 1px solid var(--line);
+}
+.strike-flag {
+  display: inline-block; margin-left: 5px; font-style: normal;
+  font-family: var(--ui); font-size: 8px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--wait);
+}
+.strike-flag.pain { color: var(--text-mute); }
+
+.chain-ladder tr.row-atm td {
+  border-top: 1px solid rgba(224,167,47,.45);
+  border-bottom: 1px solid rgba(224,167,47,.45);
+}
+.chain-ladder tbody tr:hover td { background-color: rgba(255,255,255,.03); }
+
+.chain-foot {
+  font-size: 10px; color: var(--text-dim); line-height: 1.6;
+  margin: 8px 0 0; padding-top: 8px; border-top: 1px solid var(--line-soft);
+}
+.chain-foot + .chain-foot { border-top: 0; padding-top: 4px; margin-top: 4px; }
+.chain-foot b { color: var(--text); font-weight: 600; }
+.chain-foot.dim { color: var(--text-mute); }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chain-ladder tbody tr:hover td { transition: none; }
+}
+
+/* The chart canvas. lightweight-charts sizes itself to this box (autoSize),
+   so the height lives here rather than in JS — one place to change it, and
+   it can be a media query later without touching the component. */
+.chart-canvas {
+  width: 100%;
+  height: 340px;
+  min-height: 220px;
+}
+
+/* CANDLES / LINE. Sits in the panel head, right-aligned against the title. */
+.chart-toggle {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.chart-toggle button {
+  background: transparent;
+  border: 1px solid var(--line, #1c2128);
+  color: var(--dim, #7d8590);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.chart-toggle button:hover { color: var(--fg, #d8dee9); }
+
+.chart-toggle button.on {
+  background: var(--line, #1c2128);
+  color: var(--fg, #d8dee9);
+}
+
+.chart-empty {
+  height: 340px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim, #7d8590);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------- strategy v2 (paper) */
+
+.v2-panel .v2-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 12px; margin-bottom: 10px;
+}
+.v2-position {
+  border: 1px dashed var(--wait); border-radius: 3px;
+  padding: 8px 10px; margin-bottom: 10px; background: var(--wait-bg);
+}
+.v2-position .v2-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 6px; }
+.v2-position-head {
+  display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+}
+.v2-idle { margin-bottom: 8px; }
+.v2-idle .muted-body { margin: 4px 0 0; }
+.v2-counts { margin: 8px 0 0; }
+@media (max-width: 700px) {
+  .v2-panel .v2-grid, .v2-position .v2-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

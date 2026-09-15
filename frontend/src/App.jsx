@@ -1,16 +1,48 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import {
+  lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState,
+} from "react";
 
 /* Recharts is roughly three quarters of the bundle. Loading it lazily lets
    the verdict, the ledger and the live price paint immediately — those are
    what you actually read first — while the charts arrive a beat later. */
 const PriceChart = lazy(() => import("./PriceChart.jsx"));
-const OIProfile = lazy(() => import("./OIProfile.jsx"));
+/* Memoised on what the chart draws, not on its props' identity: it would
+   otherwise redraw a full Recharts SVG on every 0.05-point tick and every
+   chain push, for a picture that changes a few times an hour. */
+const OIProfile = memo(lazy(() => import("./OIProfile.jsx")), sameOIPicture);
+
+/* No charting library behind it, so it costs nothing to keep in the main
+   bundle and paints with the first frame rather than a beat later. */
+import OptionChain from "./OptionChain.jsx";
+import StrategyV2Panel from "./StrategyV2Panel.jsx";
+import { WS_URL, getJSON } from "./api.js";
 
 import TopBar from "./TopBar.jsx";
 import {
-  DecisionPanel, MarketOverview, NewsPanel, PerformanceStrip, SafetyMonitor,
-  SignalFeed, performanceFrom,
+  DecisionPanel as DecisionPanelView, MarketOverview as MarketOverviewView,
+  NewsPanel as NewsPanelView, PerformanceStrip as PerformanceStripView,
+  SafetyMonitor as SafetyMonitorView, SignalFeed as SignalFeedView,
+  performanceFrom,
 } from "./panels.jsx";
+import { sameOIPicture } from "./render-keys.js";
+
+/* The root re-renders on every price tick (~2.5/s), every pushed chain (up
+   to 4/s) and every second of the clock. Without these, each of those
+   redrew the whole terminal — the outcome ledger and the signal feed
+   included, neither of which reads a price. Memoised here, where the
+   re-rendering happens, rather than in panels.jsx, so the components stay
+   plain functions to test. Their props must be stable for this to hold;
+   see the useMemo calls in App. */
+const DecisionPanel = memo(DecisionPanelView);
+const MarketOverview = memo(MarketOverviewView);
+const NewsPanel = memo(NewsPanelView);
+const PerformanceStrip = memo(PerformanceStripView);
+const SafetyMonitor = memo(SafetyMonitorView);
+const SignalFeed = memo(SignalFeedView);
+
+/* One empty array for "none", so a missing list is the same list every
+   render instead of a new one that defeats every memo downstream. */
+const NONE = Object.freeze([]);
 
 function ChartFallback({ label }) {
   return (
@@ -21,14 +53,6 @@ function ChartFallback({ label }) {
   );
 }
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
-
-/* Set VITE_API_KEY when the backend has API_KEY set. Reads stay open, so
-   this is only needed for the live socket; leaving it unset is correct for
-   a localhost desk running without a key. */
-const API_KEY = import.meta.env.VITE_API_KEY || "";
-const WS_URL = API.replace(/^http/, "ws") + "/ws/signals"
-  + (API_KEY ? `?key=${encodeURIComponent(API_KEY)}` : "");
 
 const FALLBACK_POLL_MS = 60_000;   // only used if the socket cannot connect
 /* The price gets its own, much faster fallback. /market/price is a Redis
@@ -152,12 +176,6 @@ const num = (v, d = 2) =>
     minimumFractionDigits: d, maximumFractionDigits: d,
   });
 
-async function getJSON(path) {
-  const res = await fetch(`${API}${path}`);
-  if (!res.ok) throw new Error(`${path} returned ${res.status}`);
-  return res.json();
-}
-
 /* Pushed signals over a socket, with polling as a safety net.
 
    The agent produces one signal every five minutes. Polling on a timer meant
@@ -193,6 +211,14 @@ function useLiveSignal() {
      a frozen one as current. Every frame the server sends carries its own
      send time, so the offset is measurable rather than assumed, and every
      age below is corrected by it. */
+  /* The chain the socket pushed, if option streaming is on. Held here
+     rather than in useMarketData because it arrives on the same frame as
+     the price, and the whole point is that the two land together. */
+  const [streamChain, setStreamChain] = useState(null);
+  /* Strategy v2's paper account. Pushed every second while a position is
+     open, so its P&L moves with the premium rather than on a poll. */
+  const [v2, setV2] = useState(null);
+
   const noteServerClock = useCallback((serverIso) => {
     if (!serverIso) return;
     const server = new Date(serverIso).getTime();
@@ -206,13 +232,15 @@ function useLiveSignal() {
 
   const poll = useCallback(async () => {
     try {
-      const [sig, status, tick, condition] = await Promise.all([
+      const [sig, status, tick, condition, paper] = await Promise.all([
         getJSON("/signals/live?symbol=NIFTY&timeframe=5m"),
         getJSON("/market/status").catch(() => null),
         getJSON("/market/price").catch(() => null),
         getJSON("/market/regime").catch(() => null),
+        getJSON("/v2/status").catch(() => null),
       ]);
       setSignal(sig);
+      if (paper) setV2(paper);
       if (condition) setRegime(condition);
       /* The polled endpoint builds a signal from scratch, so its verdict was
          computed for this request — current by construction. */
@@ -237,6 +265,12 @@ function useLiveSignal() {
   const startPolling = useCallback(() => {
     if (pollTimer.current) return;
     setLink("polling");
+    /* Drop the pushed chain when the socket stops serving.
+       It is what tells useMarketData the chain is arriving on its own; left
+       set, the HTTP poll stays stood down and the ladder freezes at the last
+       pushed value while still looking live. Clearing it here restarts the
+       poll, and the next push repopulates it. */
+    setStreamChain(null);
     poll();
     pollPrice();
     pollTimer.current = setInterval(poll, FALLBACK_POLL_MS);
@@ -290,6 +324,12 @@ function useLiveSignal() {
         setPrice(msg.price);
         noteServerClock(msg.price.at);
       }
+      /* Arrives on both the connect snapshot and every chain publish. A
+         frame carrying no chain leaves the last one alone: the publisher
+         skips unchanged chains, so "no chain in this frame" means "nothing
+         new", not "the chain is gone". */
+      if (msg.chain) setStreamChain(msg.chain);
+      if (msg.v2) setV2(msg.v2);
       if (msg.signal) {
         setSignal(msg.signal);
         /* A signal that has just arrived was judged moments ago, so its own
@@ -327,25 +367,71 @@ function useLiveSignal() {
     };
   }, [connect, stopPolling]);
 
-  return { signal, price, market, riskNow, regime, link, skewMs, refresh: poll };
+  /* The paper trader publishes on its own cadence and only while the
+     backend runs it, so the panel asks once on load rather than waiting
+     for a push that may be a minute away. */
+  useEffect(() => {
+    getJSON("/v2/status").then((state) => state && setV2(state)).catch(() => {});
+  }, []);
+
+  return { signal, price, market, riskNow, regime, link, skewMs,
+           streamChain, v2, refresh: poll };
 }
+
+/* How often to ask for the chain, which depends on where the chain comes
+   from — and that is only knowable from the reply.
+
+   Polled, it is an NSE request behind a 120-second cache. Asking faster
+   than the cache spends the option collector's throttled budget for
+   nothing, which is precisely the standing order the cache gate was added
+   to stop, so the polled rate stays where it was.
+
+   Streamed, there is no upstream call at all: the endpoint reads a
+   dictionary this backend already holds and builds a frame over ~40
+   strikes. The whole argument for the socket is that it sits four hundred
+   milliseconds behind the exchange instead of a minute, and refreshing the
+   browser once a minute would throw that away on the last hop.
+
+   Three seconds is chosen, not measured. It is fast enough that the ladder
+   visibly moves and slow enough that twenty frame builds a minute stay a
+   rounding error against a desk already serving a price every five
+   seconds — but nobody has profiled the endpoint under load, and if that
+   measurement ever happens this is the number it should replace. */
+const CHAIN_POLL_MS = 60_000;
+const CHAIN_STREAM_POLL_MS = 3_000;
 
 /* The live price. Separate from the signal on purpose: the price moves
    every few seconds, the analysis every five minutes. Flashing the whole
    dashboard on every tick would make it unreadable. */
+
 /* Candles and the option chain change on the timeframe, not on every tick,
-   so they get their own slower loop rather than riding the price socket. */
-function useMarketData(intervalMs = 60_000) {
+   so they get their own slower loop rather than riding the price socket.
+
+   The two are fetched on separate timers rather than together. They were
+   one call for as long as both moved at the same rate; a streamed chain
+   moves three hundred times faster than a 5-minute candle, and sharing a
+   timer would mean either re-fetching two days of candles every three
+   seconds or leaving the socket's latency on the floor. Neither loop can
+   delay or fail the other. */
+function useMarketData(intervalMs = 60_000, streamChain = null) {
   const [candles, setCandles] = useState([]);
   const [chain, setChain] = useState(null);
+  const [chainMs, setChainMs] = useState(CHAIN_POLL_MS);
 
   const load = useCallback(async () => {
-    const [c, ch] = await Promise.all([
-      getJSON("/market/candles?symbol=NIFTY&interval=5m&days=2").catch(() => null),
-      getJSON("/market/option-chain?symbol=NIFTY").catch(() => null),
-    ]);
+    const c = await getJSON("/market/candles?symbol=NIFTY&interval=5m&days=2")
+      .catch(() => null);
     if (c?.candles) setCandles(c.candles);
-    if (ch) setChain(ch);
+  }, []);
+
+  const loadChain = useCallback(async () => {
+    const ch = await getJSON("/market/option-chain?symbol=NIFTY").catch(() => null);
+    if (!ch) return;
+    setChain(ch);
+    /* The rate follows the source the backend actually answered with, so
+       switching ANGEL_OPTIONS_ENABLED on or off needs no change here and
+       no reload there — the first reply after the switch retimes the loop. */
+    setChainMs(ch.transport === "stream" ? CHAIN_STREAM_POLL_MS : CHAIN_POLL_MS);
   }, []);
 
   useEffect(() => {
@@ -354,7 +440,27 @@ function useMarketData(intervalMs = 60_000) {
     return () => clearInterval(id);
   }, [load, intervalMs]);
 
-  return { candles, chain };
+  /* One fetch on mount regardless, so the panel fills before the first
+     push arrives. After that the interval only runs while nothing is being
+     pushed: a socket delivering chains makes the poll redundant, and
+     polling underneath it would spend requests to fetch what the browser
+     already has.
+
+     The poll is stood down, not torn out. If the socket drops, the push
+     stops, `pushed` goes false on the next render and the timer comes
+     back — the same degrade-to-polling path the price already takes. */
+  const pushed = Boolean(streamChain);
+  useEffect(() => {
+    loadChain();
+    if (pushed) return undefined;
+    const id = setInterval(loadChain, chainMs);
+    return () => clearInterval(id);
+  }, [loadChain, chainMs, pushed]);
+
+  /* The pushed chain wins whenever there is one. It came off the same
+     socket frame as the price, so preferring it is what keeps the two
+     feeds on one clock. */
+  return { candles, chain: streamChain || chain };
 }
 
 /* The slow-moving desk furniture: the journal, the outcome study, the data
@@ -529,7 +635,7 @@ function DataAge({ seconds, price, sessionLive }) {
   );
 }
 
-function Ledger({ checks, context, confidence, action }) {
+const Ledger = memo(function Ledger({ checks, context, confidence, action }) {
   const live = checks.filter((c) => !c.disabled);
 
   // Bars are scaled against the largest *weight*, not the largest observed
@@ -653,7 +759,7 @@ function Ledger({ checks, context, confidence, action }) {
       </dl>
     </section>
   );
-}
+});
 
 /* Which condition the desk thinks the market is in, at two levels.
 
@@ -790,7 +896,7 @@ function PlanLayers({ plan }) {
   );
 }
 
-function RegimePanel({ regime }) {
+const RegimePanel = memo(function RegimePanel({ regime }) {
   if (!regime || (!regime.day && !regime.hour)) {
     return (
       <div className="panel">
@@ -826,7 +932,7 @@ function RegimePanel({ regime }) {
       </p>
     </div>
   );
-}
+});
 
 function PlanPanel({ signal, marketOpen, riskNow }) {
   if (signal.action === "HOLD") {
@@ -949,7 +1055,7 @@ function ChainPanel({ summary, vix }) {
   );
 }
 
-function ContextPanel({ context }) {
+const ContextPanel = memo(function ContextPanel({ context }) {
   if (!context) return null;
   const pools = context.liquidity_pools || [];
   return (
@@ -979,12 +1085,12 @@ function ContextPanel({ context }) {
       )}
     </div>
   );
-}
+});
 
 export default function App() {
-  const { signal, price, market, riskNow, regime, link, skewMs, refresh } =
-    useLiveSignal();
-  const { candles, chain } = useMarketData();
+  const { signal, price, market, riskNow, regime, link, skewMs, streamChain,
+          v2, refresh } = useLiveSignal();
+  const { candles, chain } = useMarketData(60_000, streamChain);
   const { feed, study, quality, scheduler, priceFeed, coverage, vix, news } = useDeskData();
   const [clock, setClock] = useState(() => Date.now());
 
@@ -1025,8 +1131,10 @@ export default function App() {
     ? Math.max(0, (new Date(market.next_boundary).getTime() - (clock - skewMs)) / 1000)
     : null;
 
-  const perf = performanceFrom(study);
-  const outcomeRows = study?.outcomes ?? [];
+  /* Derived once per study, not once per render: a fresh object here
+     would re-render the strip and the feed on every tick of the clock. */
+  const perf = useMemo(() => performanceFrom(study), [study]);
+  const outcomeRows = useMemo(() => study?.outcomes ?? NONE, [study]);
 
   /* What the freshness pill says after the label. A fixed instant once the
      session is over, because the number stops moving when the thing it
@@ -1050,7 +1158,7 @@ export default function App() {
             describe the same market directly under it. */}
         <div className="col col-chart">
           <Suspense fallback={<ChartFallback label="NIFTY 50 · 5m" />}>
-            <PriceChart candles={candles} signal={signal} />
+            <PriceChart candles={candles} signal={signal} price={price} />
           </Suspense>
           <MarketOverview
             signal={signal} chain={chain} regime={regime} vix={vix} price={price}
@@ -1083,6 +1191,7 @@ export default function App() {
               </p>
             </section>
           )}
+          <StrategyV2Panel state={v2} />
           <SignalFeed rows={feed} outcomes={outcomeRows} />
         </div>
 
@@ -1121,7 +1230,7 @@ export default function App() {
         <section className="terminal-lower">
           <div className="lower-wide">
             <Ledger
-              checks={signal.checks || []}
+              checks={signal.checks || NONE}
               context={signal.context}
               confidence={signal.confidence}
               action={signal.action}
@@ -1137,6 +1246,23 @@ export default function App() {
             </Suspense>
           </div>
           <ContextPanel context={signal.context} />
+        </section>
+      )}
+
+      {/* The chain itself, as a ladder. Deliberately not gated on a signal:
+          the option book exists whether or not the agent has spoken yet,
+          and a desk opened before the first tick should still be able to
+          read where the writers are. */}
+      {chain && (
+        <section className="terminal-lower">
+          <div className="lower-wide">
+            <OptionChain
+              chain={chain}
+              spot={price?.price ?? signal?.price}
+              nowMs={clock}
+              skewMs={skewMs}
+            />
+          </div>
         </section>
       )}
 

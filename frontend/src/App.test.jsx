@@ -1144,3 +1144,49 @@ describe("bias and entry layers", () => {
     expect(enter.className).toContain("entry-ENTER_NOW");
   });
 });
+
+describe("the streamed option chain falls back when the socket drops", () => {
+  const chainFrame = (atm) => ({
+    type: "chain",
+    chain: {
+      symbol: "NIFTY", transport: "stream", live: true,
+      summary: { atm_strike: atm, pcr_oi: 0.8, max_pain: atm },
+      strikes: [{ strike: atm, call_oi: 1, put_oi: 1 }],
+      fetched_at: iso(0),
+    },
+  });
+
+  /* How many times the chain endpoint has been asked for. */
+  const chainCalls = () =>
+    fetchMock.mock.calls.filter(([u]) => String(u).includes("/market/option-chain"))
+      .length;
+
+  it("stands the poll down while chains are being pushed", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+
+    const before = chainCalls();
+    await tick(180_000);           // three minutes of the 60s poll interval
+    expect(chainCalls()).toBe(before);
+  });
+
+  it("restarts the poll when the socket degrades, instead of freezing", async () => {
+    /* The regression: nothing cleared the pushed chain, so the poll stayed
+       stood down for the life of the tab. The ladder froze at the last
+       pushed value while still rendering as live. */
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+
+    // Two closes: the dashboard degrades to polling on the second.
+    await act(async () => { FakeSocket.last.close(); });
+    await tick(2_000);
+    await act(async () => { FakeSocket.last?.close(); });
+    await tick(2_000);
+
+    const before = chainCalls();
+    await tick(180_000);
+    expect(chainCalls()).toBeGreaterThan(before);
+  });
+});
