@@ -8,11 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .api import backtest, data, health, journal, market, news, signals, stream
+from .api import strategy_v2 as strategy_v2_api
 from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
 from .security import verify_startup
-from .workers import agent, angel_feed, option_collector, ticker, watchdog
+from .strategy_v2 import paper as v2_paper
+from .workers import agent, angel_feed, chain_publisher, option_collector, ticker, watchdog
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
@@ -56,9 +58,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # whole API down with it.
     angel_feed.start()
 
+    # Fans the streamed chain out on the same socket as the price. Started
+    # after the feed so there is something to publish, and a no-op unless
+    # option streaming is switched on.
+    chain_publisher.start()
+
+    # Strategy v2 on paper. Last to start and first to stop: it reads the
+    # signal, the price, VIX and the chain, and owns none of them.
+    v2_paper.start()
+
     try:
         yield
     finally:
+        v2_paper.stop()
+        # Stop publishing before the feed that supplies it, so the last
+        # chain out is one the feed actually produced.
+        chain_publisher.stop()
         # Close the socket before the scheduler, so the ticker is still
         # alive to serve prices while the feed is shutting down.
         angel_feed.stop()
@@ -82,7 +97,7 @@ app.add_middleware(
 
 for router in (health.router, market.router, signals.router,
                journal.router, backtest.router, stream.router, data.router,
-               news.router):
+               news.router, strategy_v2_api.router):
     app.include_router(router)
 
 

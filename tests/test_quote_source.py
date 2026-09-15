@@ -198,3 +198,74 @@ def test_candles_are_untouched_by_the_quote_change(monkeypatch, broker):
     assert list(df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
     assert "interval=5m" in captured["url"]
     assert "range=5d" in captured["url"]
+
+
+# ---------------------------------------------------------------------------
+# Yahoo's stray duplicate row for the still-forming bar
+# ---------------------------------------------------------------------------
+
+def _candle_payload(rows):
+    """rows: list of (epoch, open, high, low, close, volume)."""
+    return {"chart": {"result": [{
+        "timestamp": [r[0] for r in rows],
+        "indicators": {"quote": [{
+            "open": [r[1] for r in rows], "high": [r[2] for r in rows],
+            "low": [r[3] for r in rows], "close": [r[4] for r in rows],
+            "volume": [r[5] for r in rows],
+        }]},
+    }]}}
+
+
+def test_a_stray_duplicate_of_the_forming_bar_is_folded_into_its_bucket(
+        monkeypatch, broker):
+    """Measured live on 15-Sep-2026: Yahoo returned a properly bucketed,
+    evolving row for [07:35, 07:40) UTC, then a second row for that same
+    window a few minutes later stamped 07:39:24 — off the 5-minute grid —
+    carrying a single print that discarded the first row's whole range.
+
+    Two rows for one bucket is what silently froze the live chart: a tick
+    inside that window buckets to 07:35:00, which read as *older* than the
+    stray row's 07:39:24 and was rejected as belonging to a bar already in
+    the past."""
+    closed = 1_800_000_000 - 300          # a normal, already-closed bar
+    aligned = 1_800_000_000               # the real bucket start
+    stray = aligned + 145                 # off-grid, same bucket
+
+    payload = _candle_payload([
+        (closed, 100.0, 101.0, 99.0, 100.5, 10),
+        (aligned, 100.5, 102.0, 100.0, 101.5, 20),
+        (stray, 101.0, 101.0, 101.0, 101.0, 1),
+    ])
+    monkeypatch.setattr(freedata.curl_requests, "get",
+                        lambda *a, **k: FakeResponse(payload))
+
+    df = broker.candles("NIFTY", "5m", days=1)
+
+    assert len(df) == 2, "the stray row must be folded, not kept as a third bar"
+    last = df.iloc[-1]
+    assert last["timestamp"] == pd.Timestamp(aligned, unit="s", tz="UTC")
+    assert last["open"] == 100.5      # the aligned row's open — unchanged
+    assert last["high"] == 102.0      # the aligned row's range — kept
+    assert last["low"] == 100.0
+    assert last["close"] == 101.0     # the stray row's price — the later print
+    assert last["volume"] == 21       # both rows' volume, summed
+
+    first = df.iloc[0]
+    assert first["timestamp"] == pd.Timestamp(closed, unit="s", tz="UTC")
+    assert first["close"] == 100.5, "an already-closed bar must be untouched"
+
+
+def test_a_forming_bar_already_on_the_grid_is_left_alone(monkeypatch, broker):
+    """The common case: Yahoo's last row already sits on the bucket start.
+    Nothing here should be merged away."""
+    rows = [(1_800_000_000 - 600, 100.0, 100.5, 99.5, 100.0, 10),
+            (1_800_000_000 - 300, 100.0, 101.0, 99.8, 100.8, 12),
+            (1_800_000_000, 100.8, 101.2, 100.5, 101.0, 8)]
+    payload = _candle_payload(rows)
+    monkeypatch.setattr(freedata.curl_requests, "get",
+                        lambda *a, **k: FakeResponse(payload))
+
+    df = broker.candles("NIFTY", "5m", days=1)
+
+    assert len(df) == 3
+    assert df.iloc[-1]["close"] == 101.0

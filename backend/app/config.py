@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     angel_nifty_token: str = "99926000"
     angel_exchange_type: int = 1        # 1 = NSE_CM in SmartWebSocketV2
 
+    # India VIX on NSE cash. Verified against Angel's instrument master on
+    # 14-Sep-2026 ("India VIX", AMXIDX, NSE). Subscribed on the index socket
+    # in LTP mode and routed by token, so a VIX print can never be published
+    # as the NIFTY price — both arrive on the same segment in the same shape.
+    angel_vix_token: str = "99926017"
+
     # A push feed proves it is alive by pushing. Past this with no tick
     # during market hours the feed is treated as down and the free-data
     # poller takes over. Angel's index feed prints about once a second, so
@@ -73,7 +79,10 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = 1.0
     max_trades_per_day: int = 2
     min_risk_reward: float = 2.0
-    lot_size: int = 75
+    # NIFTY lot size. 65 per Angel's instrument master on 14-Sep-2026 and
+    # confirmed by the desk owner; it was 75 until the exchange revised it.
+    # Changes by circular — check the master before trusting this.
+    lot_size: int = 65
 
     # The rest of the risk rulebook. These existed only as RiskConfig
     # defaults, which meant the README documented a kill switch nobody could
@@ -120,6 +129,85 @@ class Settings(BaseSettings):
     # gone the moment it is missed. Both are placeholders pending an agreed
     # figure — nothing has derived either one.
     index_coverage_min_backtest_pct: float = 90.0
+
+    # Consecutive unhealthy checks before the poller actually takes over.
+    #
+    # Without this the switch is instantaneous: one missed beat past
+    # ANGEL_STALE_SECONDS and the very next five-second poll publishes a
+    # Yahoo price, so the desk's `source` flips to the slower feed and back
+    # again on a single blip. The dashboard shows that flicker, and worse,
+    # a 2.2s-old polled quote briefly replaces a 0.4s-old streamed one.
+    #
+    # At two, a switch needs the feed to be quiet across two whole poll
+    # cycles — genuine silence, not one late tick. It costs one extra poll
+    # interval of delay on a real outage, which against a five-minute
+    # analysis pipeline is nothing.
+    angel_fallback_confirmations: int = 2
+
+    # ---- Angel live option chain --------------------------------------
+    #
+    # Off by default. The polled NSE chain keeps working either way; this
+    # replaces where the *live* chain is read from, and a desk that has not
+    # opted in should not silently change data source on upgrade.
+    angel_options_enabled: bool = False
+
+    # How many strikes either side of spot to subscribe. NIFTY strikes are
+    # 50 apart, so 20 is ±1000 points and about 82 contracts — wide enough
+    # that ordinary intraday drift never leaves the band, small enough that
+    # the socket is not carrying strikes nobody will trade.
+    angel_options_band: int = 20
+
+    # Re-centre when fewer than this many strikes of cover remain on one
+    # side. Re-subscribing costs a round trip and a gap in the series, so
+    # this is deliberately not eager.
+    angel_options_refresh_margin: int = 5
+
+    # A contract with nothing newer than this is dropped from the chain
+    # rather than reported. Far strikes legitimately go quiet for long
+    # stretches; this excludes yesterday's print, not a slow hour.
+    angel_options_max_age_seconds: float = 900.0
+
+    # ---- Angel historical backfill ------------------------------------
+    #
+    # Run by hand, never on a schedule, so these are a command's defaults
+    # rather than settings the running desk reads every tick.
+    #
+    # The window is the vendor's limit, not ours. `getCandleData` caps a
+    # FIVE_MINUTE request at 100 days and — measured, not documented —
+    # silently truncates anything longer to the most *recent* 100 days
+    # while still answering SUCCESS. A 200-day request therefore returns
+    # half the data with no error anywhere, which is why the pager walks
+    # backwards in windows that never exceed this.
+    angel_history_max_window_days: int = 100
+
+    # Seconds between calls. Measured: at 0.34s pacing fifteen consecutive
+    # requests all succeeded (~1.6 req/s end to end, each call ~300ms);
+    # with no pacing the twelfth was rejected. 0.6s is that measurement
+    # with room to spare, and the room is worth having because a
+    # rate-limited call comes back as a parse error rather than a clean
+    # 429 — easy to mistake for a corrupt response.
+    angel_history_pace_seconds: float = 0.6
+
+    # How many times a throttled call is retried before the run fails.
+    angel_history_max_retries: int = 3
+
+    # NIFTY 50 on NSE cash — the same token the websocket subscribes to,
+    # kept separate so backfilling a different index never means editing
+    # the live feed's configuration.
+    angel_history_index_token: str = "99926000"
+
+    # ---- Strategy v2, on paper -------------------------------------------
+    #
+    # Off unless switched on. v2 opens simulated positions only; nothing in
+    # it can reach a broker, and `live_trading` is not consulted because
+    # there is no order path to gate.
+    v2_paper_enabled: bool = False
+
+    # Strikes either side of spot streamed for v2's expiry when it is not
+    # the nearest one. v2 buys a 0.45–0.60 delta, which sits within a few
+    # strikes of the money; ten is room to drift, and far fewer tokens than
+    # the main band.
+    v2_options_band: int = 10
 
     agent_interval_minutes: int = 5
     # How often the price ticker polls.

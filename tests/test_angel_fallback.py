@@ -58,6 +58,9 @@ def make_feed_healthy(price=24_334.55):
     feed.stats.last_tick_at = datetime.now(UTC)
     feed.stats.last_source_time = datetime.now(UTC)
     feed.stats.last_price = price
+    # The singleton carries its debounce streak across tests, and a streak
+    # left over from a previous one would hand over on the first check here.
+    feed._unhealthy_streak = 0
     return feed
 
 
@@ -88,7 +91,9 @@ def test_the_ticker_polls_when_angel_has_gone_quiet(monkeypatch, redis):
     feed.stats.last_tick_at = datetime.now(UTC) - timedelta(seconds=30)
 
     monkeypatch.setattr(ticker, "get_broker", lambda: _broker(a_quote()))
-    ticker.tick()
+    ticker.tick()                     # held: one quiet check is not an outage
+    assert redis.published == [], "a single quiet check must not switch source"
+    ticker.tick()                     # confirmed
 
     assert len(redis.published) == 1
     channel, payload, cache_key, _ = redis.published[0]
@@ -106,7 +111,8 @@ def test_falling_back_is_recorded_rather_than_smoothed_over(monkeypatch, redis):
     feed.stats.last_tick_at = datetime.now(UTC) - timedelta(seconds=30)
 
     monkeypatch.setattr(ticker, "get_broker", lambda: _broker(a_quote()))
-    ticker.tick()
+    ticker.tick()                     # held
+    ticker.tick()                     # confirmed
 
     assert feed.stats.fallbacks == 1
     assert feed.stats.stale_events == 1
@@ -117,6 +123,8 @@ def test_the_ticker_polls_normally_when_angel_is_switched_off(monkeypatch, redis
     get_settings.cache_clear()
 
     monkeypatch.setattr(ticker, "get_broker", lambda: _broker(a_quote()))
+    # No debounce here, and there should not be: the poll is not a fallback
+    # from anything, it is the only source configured.
     ticker.tick()
 
     assert len(redis.published) == 1
@@ -141,7 +149,7 @@ def test_both_sources_publish_the_same_keys(monkeypatch, redis):
 
     prices.reset_previous()
     monkeypatch.setattr(ticker, "get_broker", lambda: _broker(a_quote()))
-    monkeypatch.setattr(angel_feed, "healthy", lambda: False)
+    monkeypatch.setattr(angel_feed, "should_poll", lambda: True)
     ticker.tick()
     from_poll = redis.published[-1][1]
 
@@ -160,7 +168,7 @@ def test_the_change_column_survives_a_failover(monkeypatch, redis):
     feed._on_data(None, {"token": "99926000", "last_traded_price": 2433455,
                          "exchange_timestamp": int(MOMENT.timestamp() * 1000)})
 
-    monkeypatch.setattr(angel_feed, "healthy", lambda: False)
+    monkeypatch.setattr(angel_feed, "should_poll", lambda: True)
     monkeypatch.setattr(ticker, "get_broker",
                         lambda: _broker(a_quote(price=24_340.55)))
     ticker.tick()
@@ -213,3 +221,152 @@ def _broker(quote):
 
 def _never_called():
     raise AssertionError("the ticker polled while the Angel feed was healthy")
+
+
+# ---- the anti-flap gate ------------------------------------------------
+#
+# The desk's source used to change on a single late tick: `healthy` is a
+# snapshot, the ticker read it directly, and one beat past
+# `angel_stale_seconds` published a Yahoo quote and flipped `source`. The
+# next tick flipped it back. These hold the debounce that stopped that.
+
+def _feed(monkeypatch, clock, confirmations=2):
+    from app.config import get_settings
+    from app.workers.angel_feed import AngelFeed
+
+    monkeypatch.setenv("ANGEL_ENABLED", "true")
+    monkeypatch.setenv("ANGEL_API_KEY", "k")
+    monkeypatch.setenv("ANGEL_CLIENT_CODE", "c")
+    monkeypatch.setenv("ANGEL_MPIN", "1234")
+    monkeypatch.setenv("ANGEL_TOTP_SECRET", "s")
+    monkeypatch.setenv("ANGEL_STALE_SECONDS", "10")
+    monkeypatch.setenv("ANGEL_FALLBACK_CONFIRMATIONS", str(confirmations))
+    get_settings.cache_clear()
+
+    feed = AngelFeed(login_fn=lambda: None, socket_factory=lambda s: None,
+                     publish_fn=lambda *a, **k: {}, clock=clock)
+    return feed
+
+
+def _tick(feed, moment, price=24000.0):
+    """Mark the feed as having just received a live tick."""
+    feed.stats.last_tick_at = moment
+    feed.stats.last_source_time = moment
+    feed.stats.last_price = price
+
+
+def test_a_single_late_tick_does_not_change_the_source(monkeypatch):
+    """The regression this whole gate exists for."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import get_settings
+
+    now = datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    clock = lambda: now                                    # noqa: E731
+    feed = _feed(monkeypatch, lambda: clock())
+
+    _tick(feed, now)
+    assert feed.should_poll() is False, "a healthy feed needs no poll"
+
+    # One beat late: past the stale threshold, but only once.
+    now = now + timedelta(seconds=12)
+    assert feed.should_poll() is False, (
+        "a single quiet check must not switch the desk to the slower feed")
+    assert feed.stats.held_through == 1
+    assert feed.stats.fallbacks == 0
+    assert feed.stats.stale_events == 0
+    get_settings.cache_clear()
+
+
+def test_sustained_silence_does_hand_over(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import get_settings
+
+    now = datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    feed = _feed(monkeypatch, lambda: now)
+    _tick(feed, now)
+    feed.should_poll()
+
+    now = now + timedelta(seconds=30)
+    assert feed.should_poll() is False, "first quiet check is held"
+    assert feed.should_poll() is True, "second confirms the outage"
+    assert feed.stats.fallbacks == 1
+    assert feed.stats.stale_events == 1
+    get_settings.cache_clear()
+
+
+def test_one_good_tick_restores_the_stream_immediately(monkeypatch):
+    """Recovery is not debounced.
+
+    Waiting to trust a feed that is demonstrably working would be latency
+    invented for its own sake.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import get_settings
+
+    now = datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    feed = _feed(monkeypatch, lambda: now)
+    _tick(feed, now)
+    feed.should_poll()
+
+    now = now + timedelta(seconds=30)
+    feed.should_poll()
+    assert feed.should_poll() is True                      # handed over
+
+    _tick(feed, now)                                       # one good tick
+    assert feed.should_poll() is False, "recovery must be immediate"
+    assert feed._unhealthy_streak == 0
+    get_settings.cache_clear()
+
+
+def test_a_flapping_feed_is_visible_in_the_counters(monkeypatch):
+    """held_through rising while stale_events stays flat is the gate working."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import get_settings
+
+    now = datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    feed = _feed(monkeypatch, lambda: now)
+
+    for _ in range(5):
+        _tick(feed, now)
+        feed.should_poll()                                 # healthy
+        now = now + timedelta(seconds=12)
+        feed.should_poll()                                 # one quiet check
+
+    assert feed.stats.held_through == 5
+    assert feed.stats.stale_events == 0, "no switch should have happened"
+    assert feed.stats.fallbacks == 0
+    get_settings.cache_clear()
+
+
+def test_with_angel_switched_off_the_poller_always_serves(monkeypatch):
+    from app.config import get_settings
+    from app.workers.angel_feed import AngelFeed
+
+    monkeypatch.setenv("ANGEL_ENABLED", "false")
+    get_settings.cache_clear()
+    feed = AngelFeed(login_fn=lambda: None, socket_factory=lambda s: None,
+                     publish_fn=lambda *a, **k: {})
+
+    assert feed.should_poll() is True
+    assert feed.stats.fallbacks == 0, "not a fallback — Angel was never on"
+    get_settings.cache_clear()
+
+
+def test_the_tick_gap_is_measured_against_its_own_threshold(monkeypatch):
+    """The 10s threshold was chosen, never derived. Now it is measurable."""
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+    feed = _feed(monkeypatch, lambda: now)
+    feed.stats.gap_ms.extend([400.0, 450.0, 500.0, 12000.0])
+
+    report = feed.status()["tick_gap_ms"]
+
+    assert report["p50"] == 500.0
+    assert report["max"] == 12000.0
+    assert report["threshold_ms"] == 10000.0
+    assert report["samples"] == 4

@@ -34,7 +34,7 @@ from ..brokers import angel as angel_api
 from ..brokers.angel import AngelError, AngelNotConfigured, MalformedTick
 from ..config import get_settings
 from ..market_hours import is_open as market_is_open
-from . import prices
+from . import option_chain_live, prices, vix_live
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +76,18 @@ class FeedStats:
     socket_errors: int = 0
     stale_events: int = 0
     fallbacks: int = 0
+    # Options ride the same socket but are counted apart. Folding them
+    # into `ticks` would let a busy chain disguise a silent index.
+    option_ticks: int = 0
+    option_malformed: int = 0
+    option_subscribes: int = 0
+    # India VIX shares the index subscription and is counted apart for the
+    # same reason options are.
+    vix_ticks: int = 0
+    # Polls the debounce suppressed: the feed was quiet but not yet
+    # quiet enough to justify changing source. A rising count here with
+    # stale_events flat is the anti-flap gate doing its job.
+    held_through: int = 0
     last_tick_at: datetime | None = None
     last_source_time: datetime | None = None
     last_price: float | None = None
@@ -85,6 +97,12 @@ class FeedStats:
     # would otherwise accumulate a list of every tick it ever saw.
     feed_latency_ms: list[float] = field(default_factory=list)
     publish_latency_ms: list[float] = field(default_factory=list)
+    # Time between consecutive ticks. This is what `angel_stale_seconds`
+    # is really a threshold on, and it was never measured — the 10s
+    # figure was chosen, not derived. A p99 well under it means the
+    # threshold is safe; a p99 near it means the feed was always going
+    # to flap and the number needs raising on evidence.
+    gap_ms: list[float] = field(default_factory=list)
 
 
 SAMPLE_LIMIT = 2000
@@ -115,10 +133,12 @@ class AngelFeed:
         self._session = None
         self._socket = None
         self._thread: threading.Thread | None = None
+        self._options_thread: threading.Thread | None = None
         self._stopping = threading.Event()
         self._lock = threading.Lock()
         self._last_publish_at: datetime | None = None
         self._was_healthy = False
+        self._unhealthy_streak = 0
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -153,6 +173,12 @@ class AngelFeed:
         self._thread = threading.Thread(
             target=self._supervise, name="angel-feed", daemon=True)
         self._thread.start()
+
+        if settings.angel_options_enabled:
+            self._options_thread = threading.Thread(
+                target=self._maintain_options, name="angel-options", daemon=True)
+            self._options_thread.start()
+
         log.info("Angel feed starting for token %s", settings.angel_nifty_token)
         return True
 
@@ -212,6 +238,45 @@ class AngelFeed:
             return False
         return (self._now() - printed).total_seconds() <= prices.DELAYED_SECONDS
 
+    def should_poll(self) -> bool:
+        """Whether the poller should serve a price this cycle.
+
+        The anti-flap gate, and the reason the source no longer changes on a
+        single missed beat. `healthy` is a snapshot — true or false right
+        now — and acting on it directly meant one late tick past
+        `angel_stale_seconds` published a polled quote, flipped `source` to
+        the slower feed, and flipped back on the next tick. The dashboard
+        showed that as fluctuation; underneath, a 2.2s-old Yahoo quote was
+        briefly replacing a 0.4s-old streamed one, which is a worse price by
+        the only measure that matters.
+
+        So a switch has to be *earned*: the feed must fail
+        `angel_fallback_confirmations` consecutive checks. Below that the
+        poller stands down and the last streamed price stands, which is
+        still the freshest thing anyone has.
+
+        Recovery is deliberately not debounced. One good tick and the
+        streamed feed is serving again — waiting to trust a feed that is
+        demonstrably working would be latency invented for its own sake.
+        """
+        if not get_settings().angel_enabled:
+            return True                     # Angel off: the poll is the source
+
+        if self.healthy:
+            self._unhealthy_streak = 0
+            self._was_healthy = True
+            return False
+
+        self._unhealthy_streak += 1
+        if self._unhealthy_streak < get_settings().angel_fallback_confirmations:
+            self.stats.held_through += 1
+            log.debug("Angel quiet for %d check(s) — holding the streamed "
+                      "price rather than switching", self._unhealthy_streak)
+            return False
+
+        self.note_fallback()
+        return True
+
     def note_fallback(self) -> None:
         """Record that the poller served a price because we could not.
 
@@ -267,6 +332,9 @@ class AngelFeed:
                 "socket_errors": stats.socket_errors,
                 "stale_events": stats.stale_events,
                 "fallbacks": stats.fallbacks,
+                "held_through": stats.held_through,
+                "option_ticks": stats.option_ticks,
+                "vix_ticks": stats.vix_ticks,
             },
             "latency_ms": {
                 "feed_p50": _percentile(stats.feed_latency_ms, 50),
@@ -274,6 +342,15 @@ class AngelFeed:
                 "publish_p50": _percentile(stats.publish_latency_ms, 50),
                 "publish_p95": _percentile(stats.publish_latency_ms, 95),
                 "samples": len(stats.feed_latency_ms),
+            },
+            # What `angel_stale_seconds` is actually a threshold on.
+            "tick_gap_ms": {
+                "p50": _percentile(stats.gap_ms, 50),
+                "p95": _percentile(stats.gap_ms, 95),
+                "p99": _percentile(stats.gap_ms, 99),
+                "max": round(max(stats.gap_ms), 2) if stats.gap_ms else None,
+                "threshold_ms": get_settings().angel_stale_seconds * 1000,
+                "samples": len(stats.gap_ms),
             },
             "session": self._session.redacted if self._session else None,
             "last_error": stats.last_error,
@@ -359,18 +436,29 @@ class AngelFeed:
         feed that still reports itself connected.
         """
         settings = get_settings()
+        # India VIX rides the index subscription: same segment, same mode,
+        # one round trip. `_on_data` routes it by token before the index
+        # path, so it cannot be published as the NIFTY price.
+        tokens = [settings.angel_nifty_token]
+        if settings.angel_vix_token:
+            tokens.append(settings.angel_vix_token)
         try:
             self._socket.subscribe(
                 "quantdesk-nifty", angel_api.LTP_MODE,
-                angel_api.token_list(settings.angel_nifty_token,
-                                     settings.angel_exchange_type))
+                [{"exchangeType": int(settings.angel_exchange_type),
+                  "tokens": [str(t) for t in tokens]}])
             self.stats.subscribes += 1
             self.stats.state = LIVE
-            log.info("Angel feed subscribed to token %s (LTP), subscription #%d",
-                     settings.angel_nifty_token, self.stats.subscribes)
+            log.info("Angel feed subscribed to %s (LTP), subscription #%d",
+                     ", ".join(tokens), self.stats.subscribes)
         except Exception as exc:                          # noqa: BLE001
             self.stats.last_error = f"subscribe failed: {exc}"
             log.error("Angel subscribe failed: %s", exc)
+
+        # After the index, and in its own try: the price is why this socket
+        # exists, and a chain that fails to subscribe must not take it down.
+        if settings.angel_options_enabled:
+            self._subscribe_options()
 
     def _on_error(self, *args) -> None:
         self.stats.socket_errors += 1
@@ -390,6 +478,17 @@ class AngelFeed:
         """
         payload = message if message is not None else _wsapp
         received_at = self._now()
+
+        # Options arrive on the same socket in a different mode. Routed
+        # before the index decoder rather than after, because an option
+        # frame carries a zero LTP whenever the strike has not traded and
+        # `decode_tick` — correctly, for an index — rejects that as
+        # unusable. Sending option frames down that path would report every
+        # quiet strike as a malformed tick.
+        if self._is_option_frame(payload):
+            self._on_option_data(payload, received_at)
+            return
+
         try:
             tick = angel_api.decode_tick(payload, now=received_at)
         except MalformedTick as exc:
@@ -403,7 +502,19 @@ class AngelFeed:
             log.warning("Angel tick handler failed: %s", exc)
             return
 
+        # Before anything touches the index's state. A VIX print counted as
+        # an index tick would hold `healthy` up on a dead NIFTY feed, and one
+        # published would draw the index at fifteen.
+        vix_token = get_settings().angel_vix_token
+        if vix_token and tick.token == str(vix_token):
+            self.stats.vix_ticks += 1
+            vix_live.VIX.update(tick)
+            return
+
         with self._lock:
+            if self.stats.last_tick_at is not None:
+                _record(self.stats.gap_ms,
+                        (received_at - self.stats.last_tick_at).total_seconds() * 1000)
             self.stats.ticks += 1
             self.stats.last_tick_at = received_at
             self.stats.last_source_time = tick.source_time
@@ -434,6 +545,191 @@ class AngelFeed:
         _record(self.stats.feed_latency_ms, published.get("feed_latency_ms"))
         _record(self.stats.publish_latency_ms, published.get("publish_latency_ms"))
 
+    # ---- options -------------------------------------------------------
+
+    def _maintain_options(self, master_fn=None, interval: float = 30.0) -> None:
+        """Choose the contracts to watch, and re-choose when spot drifts.
+
+        Its own thread for two reasons. Building a universe means fetching
+        the instrument master — some 140k rows and about ten seconds — and
+        doing that on the reader thread would drop ticks; doing it in
+        `_supervise` would delay the reconnect that loop exists to perform.
+
+        Waits for a price before choosing anything. The band is centred on
+        spot, so a universe built before the first tick would be centred on
+        a guess.
+        """
+        from ..data import option_universe
+
+        master = None
+        while not self._stopping.is_set():
+            settings = get_settings()
+            spot = self.stats.last_price
+            if not settings.angel_options_enabled or spot is None:
+                self._stopping.wait(interval)
+                continue
+
+            current = option_chain_live.CHAIN.universe
+            if current and not current.needs_refresh(
+                    spot, margin=settings.angel_options_refresh_margin):
+                if master is not None and settings.v2_paper_enabled:
+                    self._maintain_v2_universe(master, spot, settings)
+                self._stopping.wait(interval)
+                continue
+
+            try:
+                if master is None:
+                    loader = master_fn or _load_master
+                    master = loader()
+                universe = option_universe.build(
+                    master, spot, underlying=settings.watch_symbol,
+                    band=settings.angel_options_band)
+            except Exception as exc:                      # noqa: BLE001
+                # The chain is an enhancement; the price is the product.
+                # A master that will not load leaves the desk on the polled
+                # chain and says so, rather than taking the feed with it.
+                self.stats.last_error = f"option universe: {type(exc).__name__}: {exc}"
+                log.warning("could not build the option universe: %s", exc)
+                self._stopping.wait(interval)
+                continue
+
+            if universe.contracts:
+                option_chain_live.CHAIN.max_age_seconds = \
+                    settings.angel_options_max_age_seconds
+                option_chain_live.CHAIN.set_universe(universe)
+                if self._socket is not None:
+                    self._subscribe_options()
+                log.info("option universe re-centred on %.2f: %s",
+                         spot, universe.to_dict())
+            if settings.v2_paper_enabled:
+                self._maintain_v2_universe(master, spot, settings)
+            self._stopping.wait(interval)
+
+    @staticmethod
+    def _is_option_frame(payload) -> bool:
+        """Does this frame belong to the option chain rather than the index?
+
+        Decided on the exchange segment, not the mode. The index is NSE_CM
+        and the options are NSE_FO, and that stays true whatever mode either
+        is subscribed in — whereas keying on SNAP_QUOTE would misroute the
+        moment the index subscription is ever widened.
+        """
+        if not isinstance(payload, dict):
+            return False
+        return payload.get("exchange_type") == angel_api.NSE_FO
+
+    def _on_option_data(self, payload, received_at: datetime) -> None:
+        """One SNAP_QUOTE frame into the live chain. Never raises.
+
+        Option ticks are not published to the price channel and never touch
+        `last_price` or the health state. The index feed's liveness is what
+        `healthy()` means, and letting a busy option chain hold that flag up
+        would mask a dead index feed behind a lively one.
+        """
+        try:
+            tick = angel_api.decode_option_tick(payload, now=received_at)
+        except MalformedTick as exc:
+            self.stats.option_malformed += 1
+            log.debug("discarded a malformed Angel option tick: %s", exc)
+            return
+        except Exception as exc:                          # noqa: BLE001
+            self.stats.option_malformed += 1
+            self.stats.last_error = f"option tick: {type(exc).__name__}: {exc}"
+            log.warning("Angel option tick handler failed: %s", exc)
+            return
+
+        # v2's contracts live in their own store when they are on a later
+        # expiry. Asked first by membership, so the main chain's unknown-
+        # token counter keeps meaning "a token nobody subscribed".
+        store = (option_chain_live.V2_CHAIN
+                 if option_chain_live.V2_CHAIN.knows(tick.token)
+                 and not option_chain_live.CHAIN.knows(tick.token)
+                 else option_chain_live.CHAIN)
+        if store.update(tick):
+            self.stats.option_ticks += 1
+
+    def _subscribe_options(self) -> None:
+        """Subscribe the option universe, if one has been built.
+
+        Called from `_on_open`, so it is also the resubscribe path. A
+        failure here is logged and swallowed: the index feed is the reason
+        this socket exists, and losing the chain must not cost the price.
+        """
+        self._subscribe_v2_options()
+        universe = option_chain_live.CHAIN.universe
+        if not universe or not universe.tokens:
+            return
+        try:
+            self._socket.subscribe(
+                "quantdesk-options", angel_api.SNAP_QUOTE,
+                angel_api.token_lists({angel_api.NSE_FO: universe.tokens}))
+            self.stats.option_subscribes += 1
+            log.info("Angel feed subscribed to %d option contracts "
+                     "(SNAP_QUOTE), expiry %s",
+                     len(universe.tokens), universe.expiry)
+        except Exception as exc:                          # noqa: BLE001
+            self.stats.last_error = f"option subscribe failed: {exc}"
+            log.error("Angel option subscribe failed: %s", exc)
+
+    def _subscribe_v2_options(self) -> None:
+        """Subscribe v2's later-expiry contracts, when it has any."""
+        universe = option_chain_live.V2_CHAIN.universe
+        main = option_chain_live.CHAIN.universe
+        if not universe or not universe.tokens:
+            return
+        if main is not None and main.expiry == universe.expiry:
+            return
+        try:
+            self._socket.subscribe(
+                "quantdesk-options-v2", angel_api.SNAP_QUOTE,
+                angel_api.token_lists({angel_api.NSE_FO: universe.tokens}))
+            self.stats.option_subscribes += 1
+            log.info("Angel feed subscribed to %d v2 option contracts, expiry %s",
+                     len(universe.tokens), universe.expiry)
+        except Exception as exc:                          # noqa: BLE001
+            self.stats.last_error = f"v2 option subscribe failed: {exc}"
+            log.error("Angel v2 option subscribe failed: %s", exc)
+
+    def _maintain_v2_universe(self, master, spot: float, settings) -> None:
+        """Keep v2's expiry streamed when it is not the nearest one.
+
+        Never raises into the options thread: v2 is paper, and the main
+        chain it shares a thread with is what the signal engine reads.
+        """
+        from ..data import option_universe
+        from ..market_hours import trading_date
+        from ..strategy_v2 import rules
+        from ..strategy_v2.config import DEFAULT
+
+        try:
+            today = trading_date()
+            listed = option_universe.expiries(
+                option_universe.index_options(master, settings.watch_symbol), on=today)
+            option_chain_live.LISTED.set(listed)
+            wanted = rules.choose_expiry(listed, today, DEFAULT)
+            main = option_chain_live.CHAIN.universe
+            store = option_chain_live.V2_CHAIN
+            if wanted is None or (main is not None and main.expiry == wanted):
+                if store.universe is not None and store.universe.contracts:
+                    store.set_universe(option_universe.Universe(
+                        contracts=[], expiry=wanted, centre=spot,
+                        band=settings.v2_options_band))
+                return
+            current = store.universe
+            if (current is not None and current.expiry == wanted
+                    and not current.needs_refresh(spot, margin=3)):
+                return
+            universe = option_universe.build(
+                master, spot, underlying=settings.watch_symbol,
+                band=settings.v2_options_band, expiry=wanted)
+            if universe.contracts:
+                store.max_age_seconds = settings.angel_options_max_age_seconds
+                store.set_universe(universe)
+                if self._socket is not None:
+                    self._subscribe_v2_options()
+        except Exception as exc:                          # noqa: BLE001
+            log.warning("could not maintain the v2 option universe: %s", exc)
+
     def _throttled(self, moment: datetime) -> bool:
         """Is this tick inside the minimum gap between publishes?
 
@@ -454,6 +750,16 @@ def _record(samples: list[float], value) -> None:
     samples.append(float(value))
     if len(samples) > SAMPLE_LIMIT:
         del samples[: len(samples) - SAMPLE_LIMIT]
+
+
+def _load_master():
+    """The instrument master, fetched once per process.
+
+    Indirected through a function so the option-universe thread can be
+    tested without a ten-second download.
+    """
+    from ..data.angel_history import load_master
+    return load_master()
 
 
 def _build_socket(session):
@@ -497,6 +803,11 @@ def healthy() -> bool:
     declines to poll a closed market, so nothing polls in its place.
     """
     return FEED.healthy
+
+
+def should_poll() -> bool:
+    """Whether the polled source should serve this cycle."""
+    return FEED.should_poll()
 
 
 def note_fallback() -> None:

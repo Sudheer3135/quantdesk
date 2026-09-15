@@ -31,6 +31,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from ..config import get_settings
 
@@ -282,13 +283,22 @@ def _smart_connect(api_key: str):
     return SmartConnect(api_key=api_key)
 
 
-def login(credentials: AngelCredentials | None = None, *,
-          connect_factory=None) -> AngelSession:
-    """Generate an Angel session. Returns the tokens the websocket needs.
+def login_with_client(credentials: AngelCredentials | None = None, *,
+                      connect_factory=None) -> tuple[AngelSession, Any]:
+    """Generate a session and keep the client that made it.
 
-    `connect_factory` exists so the whole path — TOTP, the call, the shape
-    of the response, the failure modes — is testable without a live account
-    and without the SDK installed.
+    The websocket needs only the tokens, so `login` throws the client away.
+    The REST endpoints — `getCandleData` above all — are methods *on the
+    client*, and the tokens alone cannot reach them: there is no supported
+    way to rebuild an authenticated `SmartConnect` from a JWT. So a caller
+    that wants history has to hold the same object the login produced.
+
+    Returned as a tuple rather than stored on `AngelSession` deliberately.
+    `AngelSession` is a value: it is logged, compared and carried around,
+    and its `__repr__` exists to guarantee no token is ever rendered. An
+    open HTTP client hanging off it would make a value object own a
+    connection, and the first `repr()` of one in a traceback would start
+    printing whatever the SDK's own repr decides to print.
     """
     credentials = credentials or load_credentials()
     # Before the first call, not after: the SDK logs the request body on a
@@ -307,7 +317,19 @@ def login(credentials: AngelCredentials | None = None, *,
         log.warning("Angel generateSession failed: %s", type(exc).__name__)
         raise AngelError(f"Angel login failed: {type(exc).__name__}") from exc
 
-    return session_from_response(response, client, credentials)
+    return session_from_response(response, client, credentials), client
+
+
+def login(credentials: AngelCredentials | None = None, *,
+          connect_factory=None) -> AngelSession:
+    """Generate an Angel session. Returns the tokens the websocket needs.
+
+    `connect_factory` exists so the whole path — TOTP, the call, the shape
+    of the response, the failure modes — is testable without a live account
+    and without the SDK installed.
+    """
+    session, _ = login_with_client(credentials, connect_factory=connect_factory)
+    return session
 
 
 def session_from_response(response, client, credentials: AngelCredentials
@@ -439,3 +461,136 @@ def decode_tick(message, *, now: datetime | None = None) -> Tick:
 def token_list(token: str, exchange_type: int = NSE_CM) -> list[dict]:
     """The subscription shape SmartWebSocketV2 expects."""
     return [{"exchangeType": int(exchange_type), "tokens": [str(token)]}]
+
+
+# --------------------------------------------------------------------------
+# option ticks
+# --------------------------------------------------------------------------
+
+# NSE futures and options. Options are a different exchange segment from the
+# index, so a subscription that reuses NSE_CM silently matches nothing.
+NSE_FO = 2
+
+# The only mode that carries open interest. LTP mode is four times smaller
+# on the wire, but a chain without OI cannot answer the one question the
+# option check asks — where the writers are — so the extra bytes are the
+# price of the feature, not an indulgence.
+SNAP_QUOTE = 3
+
+
+@dataclass(frozen=True)
+class OptionTick:
+    """One decoded SNAP_QUOTE print for a single contract.
+
+    `open_interest` is contracts, not lots, and is the running total rather
+    than a change. `bid`/`ask` are the top of book only: the SDK parses five
+    levels and this keeps one, because everything downstream reasons about
+    a spread and none of it reasons about depth.
+    """
+    token: str
+    price: float
+    source_time: datetime
+    open_interest: float | None = None
+    volume: float | None = None
+    bid: float | None = None
+    ask: float | None = None
+    sequence: int | None = None
+
+    @property
+    def spread(self) -> float | None:
+        if self.bid is None or self.ask is None or self.ask <= 0:
+            return None
+        return round(self.ask - self.bid, 2)
+
+
+def _best_price(levels, want_buy: bool) -> float | None:
+    """Top of book from the SDK's best-5 block.
+
+    The block carries both sides in one list, flagged by `buy_sell_flag`,
+    and pads unused levels with zeros. A zero is an absent level, not a
+    price of nothing, so it is dropped rather than returned as 0.0.
+    """
+    if not isinstance(levels, list):
+        return None
+    prices = [
+        float(level.get("price", 0)) / PAISE
+        for level in levels
+        if isinstance(level, dict)
+        and bool(level.get("buy_sell_flag")) == want_buy
+        and float(level.get("price", 0) or 0) > 0
+    ]
+    if not prices:
+        return None
+    # The best bid is the highest someone will pay; the best ask the lowest
+    # anyone will take.
+    return round(max(prices) if want_buy else min(prices), 2)
+
+
+def decode_option_tick(message, *, now: datetime | None = None) -> OptionTick:
+    """One SNAP_QUOTE frame into a contract's live state.
+
+    Reuses `decode_tick` for the fields the two modes share, so the paise
+    conversion and the asymmetric timestamp guard cannot drift apart between
+    the index feed and the option feed.
+
+    Unlike the index, a zero last-traded-price is *expected* here: a strike
+    far from the money may not trade for hours while its quotes and open
+    interest keep moving. So a zero LTP falls back to the mid of the book
+    when there is one, and only a contract with neither a trade nor a quote
+    is rejected.
+    """
+    if not isinstance(message, dict):
+        raise MalformedTick(f"expected a dict, got {type(message).__name__}")
+
+    bid = _best_price(message.get("best_5_buy_data"), want_buy=True)
+    ask = _best_price(message.get("best_5_sell_data"), want_buy=False)
+
+    raw_price = message.get("last_traded_price")
+    traded = None
+    try:
+        traded = float(raw_price) / PAISE if raw_price is not None else None
+    except (TypeError, ValueError) as exc:
+        raise MalformedTick(
+            f"last_traded_price {raw_price!r} is not a number") from exc
+
+    price = traded if traded and traded > 0 else None
+    if price is None and bid is not None and ask is not None:
+        price = round((bid + ask) / 2, 2)
+    if price is None:
+        raise MalformedTick(
+            "the contract has neither a traded price nor a two-sided quote")
+
+    # Borrow the index decoder's timestamp handling by handing it a message
+    # it can read. A stub price keeps it from rejecting an untraded strike.
+    stamp_probe = {"token": message.get("token"),
+                   "last_traded_price": 1,
+                   "exchange_timestamp": message.get("exchange_timestamp"),
+                   "sequence_number": message.get("sequence_number")}
+    base = decode_tick(stamp_probe, now=now)
+
+    oi = message.get("open_interest")
+    volume = message.get("volume_trade_for_the_day")
+
+    return OptionTick(
+        token=base.token,
+        price=round(price, 2),
+        source_time=base.source_time,
+        open_interest=float(oi) if oi is not None else None,
+        volume=float(volume) if volume is not None else None,
+        bid=bid, ask=ask,
+        sequence=base.sequence,
+    )
+
+
+def token_lists(groups: dict[int, list[str]]) -> list[dict]:
+    """A multi-segment subscription: {exchange_type: [tokens]}.
+
+    `token_list` handles the index's single token. Options arrive in
+    hundreds and on a different segment, and the SDK wants one entry per
+    exchange type rather than one per token.
+    """
+    return [
+        {"exchangeType": int(exchange), "tokens": [str(t) for t in tokens]}
+        for exchange, tokens in sorted(groups.items())
+        if tokens
+    ]

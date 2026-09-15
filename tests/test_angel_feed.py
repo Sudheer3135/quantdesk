@@ -337,7 +337,8 @@ def test_connecting_subscribes_to_the_configured_token():
 
     correlation, mode, tokens = socket.subscriptions[0]
     assert mode == 1                                   # LTP
-    assert tokens == [{"exchangeType": 1, "tokens": ["99926000"]}]
+    # India VIX rides the same subscription, routed apart by token.
+    assert tokens == [{"exchangeType": 1, "tokens": ["99926000", "99926017"]}]
     assert feed.stats.subscribes == 1
     assert feed.stats.state == LIVE
 

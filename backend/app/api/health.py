@@ -62,9 +62,24 @@ def feed_health():
     """
     status = angel_feed.status()
     settings = get_settings()
-    return {
+    payload = {
         "live_price_source": status["source"],
         "transport": status["transport"],
         "fallback_broker": settings.broker,
         "angel": status,
     }
+    if settings.angel_options_enabled:
+        # Reported beside the price feed, never folded into its health. The
+        # chain is an enhancement riding the same socket, and a busy chain
+        # must not be able to make a silent index look alive.
+        from ..workers import chain_publisher
+        from ..workers.option_chain_live import CHAIN
+        payload["option_chain"] = {"transport": "stream", "ready": CHAIN.ready,
+                                   **CHAIN.status(),
+                                   # How the chain reaches the browser, as
+                                   # opposed to how it reaches us. A chain
+                                   # streaming into a publisher that is not
+                                   # running is still three seconds from the
+                                   # screen.
+                                   "publisher": chain_publisher.status()}
+    return payload

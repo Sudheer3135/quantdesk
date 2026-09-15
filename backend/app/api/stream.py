@@ -37,6 +37,12 @@ router = APIRouter(tags=["stream"])
 
 SIGNAL_CHANNEL = "signals"
 PRICE_CHANNEL = "prices"
+# The streamed option chain rides the same socket as the price, so both
+# feeds reach the dashboard on one connection and one cadence.
+CHAIN_CHANNEL = "chain"
+# Strategy v2's paper account. Published every second while a position is
+# open, so its live P&L moves with the premium rather than on a poll.
+V2_CHANNEL = "v2"
 HEARTBEAT_SECONDS = 20
 
 
@@ -84,9 +90,10 @@ class Hub:
                 client = aioredis.from_url(get_settings().redis_url,
                                            decode_responses=True)
                 pubsub = client.pubsub()
-                await pubsub.subscribe(SIGNAL_CHANNEL, PRICE_CHANNEL)
-                log.info("live stream subscribed to %r and %r",
-                         SIGNAL_CHANNEL, PRICE_CHANNEL)
+                await pubsub.subscribe(
+                    SIGNAL_CHANNEL, PRICE_CHANNEL, CHAIN_CHANNEL, V2_CHANNEL)
+                log.info("live stream subscribed to %r, %r, %r and %r",
+                         SIGNAL_CHANNEL, PRICE_CHANNEL, CHAIN_CHANNEL, V2_CHANNEL)
 
                 async for message in pubsub.listen():
                     if not self.clients:
@@ -103,6 +110,12 @@ class Hub:
                     # ticker without redrawing the whole analysis.
                     if message.get("channel") == PRICE_CHANNEL:
                         await self.broadcast({"type": "price", "price": payload})
+                    elif message.get("channel") == CHAIN_CHANNEL:
+                        # Tagged separately so the dashboard repaints the
+                        # chain without redrawing the analysis around it.
+                        await self.broadcast({"type": "chain", "chain": payload})
+                    elif message.get("channel") == V2_CHANNEL:
+                        await self.broadcast({"type": "v2", "v2": payload})
                     else:
                         await self.broadcast({
                             "type": "signal",
@@ -204,6 +217,10 @@ async def stream_signals(ws: WebSocket, key: str | None = Query(default=None)) -
             "type": "snapshot",
             "signal": snapshot_signal,
             "price": snapshot_price,
+            # A browser connecting between publishes gets the last streamed
+            # chain rather than an empty panel it has to poll to fill.
+            "chain": get_json("chain:stream:latest"),
+            "v2": get_json("v2:latest"),
             "market": market_status(),
             # The signal's own verdict was true when it was published, which
             # may have been fifteen minutes ago — the cache TTL. The journal

@@ -28,6 +28,7 @@ import pandas as pd
 from curl_cffi import requests as curl_requests
 
 from .. import net
+from ..data.importer import TIMEFRAME_MINUTES
 from .base import Broker, UnknownSymbol
 from .nse import NSEClient, parse_index_value, parse_nse_timestamp, parse_option_chain
 
@@ -150,7 +151,47 @@ class FreeDataBroker(Broker):
                 "typical-price average.", ticker)
             df["volume"] = 1.0
 
-        return df.sort_values("timestamp").reset_index(drop=True)
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Yahoo occasionally appends one row beyond its own 5-minute grid:
+        # the still-forming bar, stamped at the instant of its last refresh
+        # rather than at the bucket it belongs to, and carrying a single
+        # print (open=high=low=close) that discards every tick the
+        # *properly* bucketed row already holds for that same window.
+        #
+        # Measured live on 15-Sep-2026: the row for [07:35, 07:40) UTC
+        # arrived correctly aligned and evolving (open 23308.90, high
+        # 23315.75, low 23303.45), and a second row for the same window
+        # followed a few minutes later stamped 07:39:24 with a single print
+        # (23307.40 on all four fields) — the real bucket's range gone,
+        # replaced by a doji sitting off the 5-minute grid.
+        #
+        # Two rows for one bucket is what breaks a live chart's tick merge:
+        # the desk buckets a fresh tick by flooring its own timestamp, so a
+        # tick inside [07:35, 07:40) floors to 07:35:00 — earlier than the
+        # stray row's 07:39:24 — and is silently rejected as belonging to a
+        # bar already in the past. Folding the stray row back into its
+        # bucket fixes that at the source: the aligned row's range wins,
+        # the stray row's price becomes the close since it is the later
+        # print, and the row count only ever shrinks by the duplicate.
+        minutes = TIMEFRAME_MINUTES.get(interval)
+        if minutes and len(df) >= 2:
+            bucket = df["timestamp"].dt.floor(f"{minutes}min")
+            stray = (bucket.iloc[-1] == bucket.iloc[-2]
+                    and df["timestamp"].iloc[-1] != bucket.iloc[-1])
+            if stray:
+                tail = df.iloc[-2:]
+                merged = pd.DataFrame([{
+                    "timestamp": bucket.iloc[-1],
+                    "open": tail["open"].iloc[0],
+                    "high": tail["high"].max(),
+                    "low": tail["low"].min(),
+                    "close": tail["close"].iloc[-1],
+                    "volume": tail["volume"].sum(),
+                }])
+                df = pd.concat([df.iloc[:-2], merged], ignore_index=True)
+
+        return df
 
     def _yahoo_quote(self, symbol: str) -> dict:
         """Yahoo's chart metadata — one small request carrying a real clock.

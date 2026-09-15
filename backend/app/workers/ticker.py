@@ -57,11 +57,14 @@ def tick() -> None:
     # Asked once, here, rather than inside the publish path. A poll that is
     # started and then discarded has already spent the request and already
     # taken the slot that `max_instances=1` protects.
+    # One question, asked of the feed itself: should the poller serve this
+    # cycle? Previously this read `healthy()` directly and fell back the
+    # instant a tick was late, which made the desk's source flip to Yahoo
+    # and back on a single blip. The feed now debounces that decision and
+    # counts what it suppressed; see `AngelFeed.should_poll`.
     from . import angel_feed
-    if angel_feed.healthy():
+    if not angel_feed.should_poll():
         return
-    if settings.angel_enabled:
-        angel_feed.note_fallback()
 
     symbol = settings.watch_symbol
     try:
