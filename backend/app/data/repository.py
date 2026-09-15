@@ -14,6 +14,7 @@ to "do you actually have the window I asked for?".
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
@@ -206,6 +207,8 @@ def load_index_candles(
     start: datetime | date | None = None,
     end: datetime | date | None = None,
     limit: int | None = None,
+    sources: Sequence[str] | None = None,
+    newest: bool = False,
 ) -> pd.DataFrame:
     """Candles in the platform's standard shape, oldest first.
 
@@ -214,12 +217,33 @@ def load_index_candles(
     this codebase expects exactly six columns, and adding a seventh would
     put provenance one careless `df.iloc` away from being treated as price
     data.
+
+    `newest` changes which end `limit` takes from. By default the limit is
+    applied to the oldest rows, which is what a backtest wants — the window
+    starts where the history starts. A chart being panned backwards wants
+    the opposite: the newest rows *below* a cursor. Without this the only
+    way to get them is to load the whole archive and discard the front of
+    it, which is O(all history) per request and becomes the dominant cost
+    the moment a real backfill lands. The frame is still returned
+    oldest-first either way.
+
+    `sources` restricts the read to particular vendors. It defaults to None,
+    meaning all of them, which is correct while the archive holds one row
+    per bar: `uq_candle` is unique on (symbol, timeframe, timestamp), so no
+    two sources can currently describe the same bar and an unfiltered read
+    cannot double-count. The parameter exists for the day that changes —
+    `HistoricalFeed.__init__` raises on duplicate timestamps, so if the
+    unique key ever gains `source`, every caller here needs a way to pick
+    one vendor before a backtest can run at all.
     """
     stmt = (
         select(CandleRecord)
         .where(CandleRecord.symbol == symbol, CandleRecord.timeframe == timeframe)
-        .order_by(CandleRecord.timestamp)
+        .order_by(CandleRecord.timestamp.desc() if newest
+                  else CandleRecord.timestamp)
     )
+    if sources:
+        stmt = stmt.where(CandleRecord.source.in_(list(sources)))
     if start is not None:
         stmt = stmt.where(CandleRecord.timestamp >= _to_datetime(start))
     if end is not None:
@@ -228,6 +252,10 @@ def load_index_candles(
         stmt = stmt.limit(limit)
 
     rows = db.scalars(stmt).all()
+    if newest:
+        # Selected newest-first so the database could apply the limit; the
+        # contract is oldest-first, so it is restored here.
+        rows = list(reversed(rows))
     if not rows:
         empty = pd.DataFrame(columns=CANDLE_COLUMNS)
         empty.attrs[PROVENANCE] = {"rows": 0, "sources": {}, "volume_is_synthetic": False}

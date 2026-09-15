@@ -48,9 +48,24 @@ HOLIDAYS: dict[int, frozenset[date]] = {
     # Entries carrying a "verified" note were checked line-by-line against
     # the NSE F&O trading-holiday circular on the date given. The rest are
     # transcribed and still listed in PROVISIONAL_YEARS below.
+    # Corrected 14-Sep-2026, on the day the gap was felt: Ganesh Chaturthi
+    # was missing, so the desk reported the market OPEN on a closed
+    # exchange. The agent wrote signals from Friday's frozen candles, the
+    # collectors polled all day, and the Angel feed was reported "stale"
+    # for staying correctly silent. Checking the rest of the year against
+    # two independent broker listings (Zerodha, Upstox) found five more
+    # errors: four holidays missing and Holi a day late.
     2026: frozenset({
-        date(2026, 1, 26), date(2026, 3, 4), date(2026, 3, 26),
-        date(2026, 4, 3), date(2026, 4, 14), date(2026, 5, 1),
+        # Not in the annual circular — added days before by a separate
+        # exchange notice, which is why the first transcription missed it.
+        date(2026, 1, 15),      # Maharashtra municipal elections
+        date(2026, 1, 26),      # Republic Day
+        date(2026, 3, 3),       # Holi — was wrongly listed as 4-Mar
+        date(2026, 3, 26),      # Shri Ram Navami
+        date(2026, 3, 31),      # Shri Mahavir Jayanti — was missing
+        date(2026, 4, 3),       # Good Friday
+        date(2026, 4, 14),      # Dr. Baba Saheb Ambedkar Jayanti
+        date(2026, 5, 1),       # Maharashtra Day
         # Verified against the NSE F&O 2026 circular on 17-Aug-2026.
         # Both were absent from this list, so the archive reported two
         # clean sessions as an outage and the whole dataset as unusable —
@@ -58,8 +73,13 @@ HOLIDAYS: dict[int, frozenset[date]] = {
         # from the data alone.
         date(2026, 5, 28),      # Bakri Id       — verified 17-Aug-2026
         date(2026, 6, 26),      # Muharram       — verified 17-Aug-2026
-        date(2026, 8, 15), date(2026, 10, 2), date(2026, 11, 10),
-        date(2026, 12, 25),
+        date(2026, 8, 15),      # Independence Day (a Saturday)
+        date(2026, 9, 14),      # Ganesh Chaturthi — was missing
+        date(2026, 10, 2),      # Mahatma Gandhi Jayanti
+        date(2026, 10, 20),     # Dussehra — was missing
+        date(2026, 11, 10),     # Diwali-Balipratipada
+        date(2026, 11, 24),     # Prakash Gurpurb Sri Guru Nanak Dev — was missing
+        date(2026, 12, 25),     # Christmas
     }),
 }
 
@@ -70,8 +90,13 @@ HOLIDAYS: dict[int, frozenset[date]] = {
 # confirmed.
 #
 # 2026 stays here on purpose. Two of its entries (28-May and 26-Jun) were
-# confirmed against the circular on 17-Aug-2026; the remaining eight were
-# not, and a year is only as trustworthy as its least-checked date. The
+# confirmed against the circular on 17-Aug-2026. On 14-Sep-2026 the whole
+# year was cross-checked against the Zerodha and Upstox holiday listings,
+# which agree with each other and with news reports of the 14-Sep closure
+# — but those are brokers' transcriptions of the circular, not the circular
+# itself, which nseindia.com would not serve. That is strong evidence and
+# still not the standard this set exists to mark, and a year is only as
+# trustworthy as its least-checked date. The
 # caveat costs one info-level finding and nothing else: `is_holiday` still
 # answers True or False for 2026, so a genuinely missing session is still
 # reported as an error rather than excused.

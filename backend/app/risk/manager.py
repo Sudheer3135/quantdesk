@@ -145,12 +145,27 @@ def evaluate(
         return RiskDecision(False, reasons)
 
     rr = reward_per_unit / risk_per_unit
-    # Compare with a tolerance. Entry, stop and target are rounded to two
-    # decimals upstream, so an intended 1:2 often lands at 1.9999999 and a
-    # bare `<` would reject a trade that meets the rule exactly.
-    if rr < config.min_risk_reward - 1e-6:
+    # Compare with a tolerance sized to the rounding that actually happens.
+    #
+    # The signal engine rounds the stop and the target to two decimals but
+    # leaves the entry at the raw price, so a trade built as exactly 1:2
+    # lands a little either side of it. The tolerance here used to be 1e-6,
+    # on the belief that all three levels were rounded and the error was
+    # float noise. It is not: each rounded level can move by up to 0.005,
+    # which on a 25-point stop is an RR error near 0.0006 — six hundred times
+    # the old tolerance. Measured across the signal table on 14-Sep-2026, 37
+    # of 630 trade signals were refused as "1:2.00, below the 1:2.0 floor",
+    # every one between 1.99936 and 1.99996.
+    #
+    # So the allowance is the most that rounding can move this trade's RR,
+    # doubled for margin — and no more. It shrinks as the stop widens, so a
+    # trade genuinely short of the floor is still refused.
+    rounding = 0.01 * (1 + rr) / risk_per_unit
+    if rr < config.min_risk_reward - max(rounding, 1e-6):
         reasons.append(
-            f"Reward:risk is 1:{rr:.2f}, below the "
+            # Three decimals: at two, a refused 1.999 prints as "1:2.00" and
+            # the reason contradicts itself.
+            f"Reward:risk is 1:{rr:.3f}, below the "
             f"1:{config.min_risk_reward:.1f} floor."
         )
 

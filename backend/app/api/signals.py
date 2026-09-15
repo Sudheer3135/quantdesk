@@ -198,9 +198,14 @@ def signal_outcomes(symbol: str = "NIFTY", timeframe: str = "5m",
     is not a result.
     """
     symbol = validate_symbol(symbol)
-    report = outcome_study.evaluate(
-        db, symbol, timeframe, include_outcomes=include_signals)
-    return report.to_dict()
+    # Kept until a signal or a candle lands. A pure replay of stored rows
+    # against stored rows, recomputed every minute by an open dashboard —
+    # see `report_cache` for why that is safe and what bounds it.
+    from ..data import report_cache
+    return report_cache.memoise(
+        ("outcomes", symbol, timeframe, include_signals), db,
+        lambda: outcome_study.evaluate(
+            db, symbol, timeframe, include_outcomes=include_signals).to_dict())
 
 
 @router.get("/outcomes/by-regime")
