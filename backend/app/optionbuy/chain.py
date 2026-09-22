@@ -28,6 +28,7 @@ Two further rules, both about not passing off one price as another:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -52,7 +53,7 @@ SNAPSHOT = "snapshot"
 # different fact about a different market.
 DEFAULT_STALENESS_MINUTES = 10
 
-HASH_VERSION = "1"
+HASH_VERSION = "2"
 
 
 class OptionLookaheadError(RuntimeError):
@@ -82,6 +83,7 @@ class ContractMeta:
     lot_size: int | None
     tradingsymbol: str | None
     source: str
+    first_seen: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,7 @@ class OptionBar:
     source: str
     samples: int | None
     session_date: date | None
+    available_at: datetime | None = None
 
     @property
     def observed_tape(self) -> bool:
@@ -122,6 +125,7 @@ class OptionBar:
             "contract_id": self.contract_id,
             "contract": self.key.label(),
             "bar_timestamp": self.timestamp.isoformat(),
+            "available_at": self.available_at.isoformat() if self.available_at else None,
             "bar_kind": self.bar_kind,
             "samples": self.samples,
             "source": self.source,
@@ -150,8 +154,14 @@ class ChainStore:
         timeframe: str = "5m",
         staleness_minutes: int = DEFAULT_STALENESS_MINUTES,
     ) -> None:
-        self._bars = {k: sorted(v, key=lambda b: b.timestamp) for k, v in bars.items()}
-        self._stamps = {k: [b.timestamp for b in v] for k, v in self._bars.items()}
+        from ..analytics.indicators import TIMEFRAME_MINUTES
+        duration = timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
+        def available(bar):
+            return max(_as_utc(bar.timestamp) + duration,
+                       _as_utc(bar.available_at) if bar.available_at else _as_utc(bar.timestamp),
+                       _as_utc(contracts[bar.key].first_seen) if bar.key in contracts and contracts[bar.key].first_seen else _as_utc(bar.timestamp))
+        self._bars = {k: sorted(v, key=available) for k, v in bars.items()}
+        self._stamps = {k: [available(b) for b in v] for k, v in self._bars.items()}
         self.contracts = contracts
         self.underlying = underlying
         self.timeframe = timeframe
@@ -313,12 +323,28 @@ class ChainStore:
         digest = hashlib.sha256()
         digest.update(f"{HASH_VERSION}|{self.underlying}|{self.timeframe}\n".encode())
         for key in sorted(self._bars):
+            meta = self.contracts.get(key)
+            contract = {
+                "expiry": key.expiry.isoformat(), "strike": float(key.strike),
+                "option_type": key.option_type,
+                "lot_size": meta.lot_size if meta else None,
+                "tradingsymbol": meta.tradingsymbol if meta else None,
+                "source": meta.source if meta else None,
+            }
+            digest.update((json.dumps(contract, sort_keys=True) + "\n").encode())
             for bar in self._bars[key]:
-                digest.update((
-                    f"{key.expiry.isoformat()}|{key.strike:.2f}|{key.option_type}|"
-                    f"{bar.timestamp.isoformat()}|{bar.open:.4f}|{bar.high:.4f}|"
-                    f"{bar.low:.4f}|{bar.close:.4f}|{bar.bar_kind}\n"
-                ).encode())
+                # Prices alone do not identify a dataset: IV drives sizing,
+                # OI/volume/spread drive eligibility, and samples drive coverage.
+                # Preserve precision and NULLs; exclude database surrogate IDs.
+                row = {name: (float(getattr(bar, name))
+                              if getattr(bar, name) is not None else None)
+                       for name in ("open", "high", "low", "close", "volume",
+                                    "open_interest", "iv", "bid", "ask", "underlying_close")}
+                row.update(
+                    timestamp=_as_utc(bar.timestamp).astimezone(UTC).isoformat(),
+                    bar_kind=bar.bar_kind, source=bar.source, samples=bar.samples,
+                    session_date=(bar.session_date or _session_of(bar.timestamp)).isoformat())
+                digest.update((json.dumps(row, sort_keys=True) + "\n").encode())
 
         first, last = self.span()
         return {
@@ -372,7 +398,8 @@ def load(
                           option_type=contract.option_type)
         contracts.setdefault(key, ContractMeta(
             contract_id=contract.id, key=key, lot_size=contract.lot_size,
-            tradingsymbol=contract.tradingsymbol, source=contract.source))
+            tradingsymbol=contract.tradingsymbol, source=contract.source,
+            first_seen=_as_utc(contract.first_seen)))
         bars.setdefault(key, []).append(OptionBar(
             row_id=candle.id,
             contract_id=candle.contract_id,
@@ -385,6 +412,7 @@ def load(
             underlying_close=candle.underlying_close,
             bar_kind=candle.bar_kind, source=candle.source,
             samples=candle.samples, session_date=candle.session_date,
+            available_at=_as_utc(candle.ingested_at) if candle.ingested_at else None,
         ))
 
     log.info("loaded %d option bars over %d contracts for %s",

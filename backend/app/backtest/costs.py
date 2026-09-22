@@ -139,6 +139,9 @@ class SlippageModel:
     # mid-to-touch distance — optimistic for a resting book, roughly right
     # for a liquid weekly strike.
     spread_fraction: float = 0.5
+    execution_model: str = "ltp_slippage"  # or conservative_spread
+    estimated_spread_pct: float = 1.0
+    impact_ticks: float = 0.0
 
     # Slippage on the index itself, as a percentage. Used by the index
     # backtest, where there is no premium and no book.
@@ -170,8 +173,7 @@ class Fill:
 def buy_fill(price: float, model: SlippageModel,
              bid: float | None = None, ask: float | None = None) -> Fill:
     """A buy fills worse than quoted — higher."""
-    slip, basis = model.per_unit(bid, ask)
-    return Fill(requested=price, filled=price + slip, slippage=slip, basis=basis)
+    return _execution_fill(price, model, bid, ask, buying=True)
 
 
 def sell_fill(price: float, model: SlippageModel,
@@ -182,9 +184,32 @@ def sell_fill(price: float, model: SlippageModel,
     near-worthless contract plus slippage produces a negative exit price,
     which shows up as a *profit* on a losing trade.
     """
-    slip, basis = model.per_unit(bid, ask)
-    return Fill(requested=price, filled=max(0.0, price - slip),
-                slippage=slip, basis=basis)
+    return _execution_fill(price, model, bid, ask, buying=False)
+
+
+def _execution_fill(price, model, bid, ask, *, buying):
+    import math
+    if not math.isfinite(price) or price < 0:
+        raise ValueError("invalid reference premium")
+    if model.execution_model not in ("ltp_slippage", "conservative_spread"):
+        raise ValueError("unknown execution model")
+    if min(model.ticks, model.estimated_spread_pct, model.impact_ticks, model.tick_size) < 0:
+        raise ValueError("execution friction cannot be negative")
+    impact = model.impact_ticks * model.tick_size
+    if bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask:
+        # Reference is midpoint, never arbitrary LTP. Crossing the spread is friction.
+        reference = (bid + ask) / 2
+        filled = ask + impact if buying else max(0, bid - impact)
+        basis = "quoted_touch_estimated_impact"
+    else:
+        reference = price
+        slip = model.ticks * model.tick_size + impact
+        if model.execution_model == "conservative_spread":
+            slip += price * model.estimated_spread_pct / 200
+        filled = price + slip if buying else max(0, price - slip)
+        basis = "estimated_" + model.execution_model
+    return Fill(requested=reference, filled=filled,
+                slippage=abs(filled-reference), basis=basis)
 
 
 @dataclass(frozen=True)

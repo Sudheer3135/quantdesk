@@ -56,6 +56,12 @@ class Greeks:
     gamma: float
     theta: float          # premium lost per trading day
     vega: float           # premium change per 1 point of IV
+    # Premium change per 1 percentage point of the risk-free rate, scaled
+    # the same way vega is so the two read on one scale. Smallest of the
+    # greeks by far at these tenors — a weekly option's rho is rounding
+    # error against its theta — and carried because the ladder shows it,
+    # not because it should change a decision.
+    rho: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -95,7 +101,7 @@ def greeks(spot: float, strike: float, years: float, iv: float = DEFAULT_IV,
         return Greeks(
             price=intrinsic,
             delta=(1.0 if kind == "CE" else -1.0) if in_the_money else 0.0,
-            gamma=0.0, theta=0.0, vega=0.0,
+            gamma=0.0, theta=0.0, vega=0.0, rho=0.0,
         )
 
     d1, d2 = _d1_d2(spot, strike, years, iv, rate)
@@ -113,12 +119,18 @@ def greeks(spot: float, strike: float, years: float, iv: float = DEFAULT_IV,
     else:
         annual_theta = common + rate * strike * discount * _norm_cdf(-d2)
 
+    if kind == "CE":
+        rho = strike * years * discount * _norm_cdf(d2) / 100
+    else:
+        rho = -strike * years * discount * _norm_cdf(-d2) / 100
+
     return Greeks(
         price=price(spot, strike, years, iv, rate, kind),
         delta=delta,
         gamma=gamma,
         theta=annual_theta / TRADING_DAYS_PER_YEAR,
         vega=spot * pdf * math.sqrt(years) / 100,
+        rho=rho,
     )
 
 

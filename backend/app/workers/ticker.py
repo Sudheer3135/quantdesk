@@ -30,6 +30,7 @@ Honest limits of the polled path, unchanged:
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -75,6 +76,15 @@ def tick() -> None:
         with net.budget(net.budget_for(settings.ticker_interval_seconds),
                         label="price-ticker"):
             quote = get_broker().quote(symbol)
+        # Stamped the moment the response landed, before any parsing, so it
+        # measures the network and not us. The push feed has always set
+        # this; the poller did not, which left the two sources publishing
+        # different shapes — the one thing `prices.publish_price` exists to
+        # prevent. The gap was invisible until the dashboard began reading
+        # `received_at`, at which point a fallback to the poller would have
+        # silently dropped it back to ageing against the coarse
+        # `source_time`.
+        received_at = datetime.now(UTC)
         price = float(quote["last_price"])
     except Exception as exc:
         # A failed price poll is routine — NSE throttles, networks blip.
@@ -87,6 +97,7 @@ def tick() -> None:
         symbol, price,
         source=quote.get("source", settings.broker),
         source_time=quote.get("source_time"),
+        received_at=received_at,
         transport="poll")
 
 

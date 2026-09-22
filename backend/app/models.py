@@ -92,6 +92,10 @@ class TradeRecord(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # Entry and realisation can belong to different trading days. Older
+    # journal rows have no recorded close time; do not invent one on upgrade.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True,
+                                                      index=True)
     symbol: Mapped[str] = mapped_column(String(48), index=True)
     side: Mapped[str] = mapped_column(String(8))
     quantity: Mapped[int] = mapped_column(Integer)

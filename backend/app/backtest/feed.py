@@ -167,7 +167,24 @@ class HistoricalFeed:
         """
         self._guard(index, "view")
         start = max(0, index + 1 - self.analysis_window)
-        return self._frame.iloc[start : index + 1]
+        window = self._frame.iloc[start : index + 1].copy()
+        window.attrs["decision_time"] = self.close_time(index).isoformat()
+        return window
+
+    def close_time(self, index: int) -> pd.Timestamp:
+        self._guard(index, "close_time")
+        return self._frame["timestamp"].iloc[index] + pd.Timedelta(minutes=5)
+
+    def can_enter(self, index: int, session_exit_minutes: int = 15 * 60 + 15) -> bool:
+        self._guard(index, "can_enter")
+        if index >= len(self) - 1:
+            return False
+        current = self.close_time(index)
+        nxt = self._frame.timestamp.iloc[index + 1]
+        # A missing bucket is not an executable next open. No overnight entry.
+        local = current.tz_convert("Asia/Kolkata")
+        return (nxt == current and local.hour * 60 + local.minute < session_exit_minutes
+                and local.hour * 60 + local.minute >= 9 * 60 + 15)
 
     def timestamp(self, index: int) -> pd.Timestamp:
         self._guard(index, "timestamp")
@@ -212,8 +229,7 @@ class HistoricalFeed:
         on bars after `i` is one that cannot be computed in real time, and a
         backtest using it is measuring hindsight.
         """
-        columns = tuple(c for c in self._frame.columns
-                        if c not in ("timestamp", "open", "high", "low", "close", "volume"))
+        columns = ("ema20", "ema50", "ema100", "ema200", "atr14", "vwap", "vwap_upper", "vwap_lower", "rvol")
         report = CausalityReport(columns=columns)
         if len(self._frame) < 60 or not columns:
             return report

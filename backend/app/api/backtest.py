@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..backtest import diagnostics
+from ..backtest.costs import CostModel, SlippageModel
 from ..backtest.engine import run
 from ..backtest.option_engine import run as run_options
 from ..config import get_settings
@@ -258,6 +259,8 @@ class OptionBuyIn(BaseModel):
     where it exists, labels every fill with the evidence behind it, and
     refuses the run outright when the history the policy requires is missing.
     """
+    costs: CostModel = Field(default_factory=CostModel)
+    execution: SlippageModel = Field(default_factory=SlippageModel)
     symbol: str = "NIFTY"
     timeframe: str = "5m"
     start: date | None = None
@@ -306,6 +309,7 @@ class OptionBuyIn(BaseModel):
 def _optionbuy_request(payload: OptionBuyIn) -> optionbuy_runner.OptionBuyRequest:
     settings = get_settings()
     return optionbuy_runner.OptionBuyRequest(
+        costs=payload.costs, execution=payload.execution,
         symbol=payload.symbol,
         timeframe=payload.timeframe,
         start=payload.start,

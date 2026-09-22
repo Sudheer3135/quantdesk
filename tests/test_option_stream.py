@@ -116,10 +116,56 @@ def test_the_band_is_refreshed_only_once_spot_nears_its_edge():
     universe = ou.build(master(), spot=24000.0, band=10,
                         on=datetime(2026, 8, 29).date())
 
-    assert not universe.needs_refresh(24000.0, margin=5)
-    assert not universe.needs_refresh(24200.0, margin=5)
-    assert universe.needs_refresh(24300.0, margin=5), "spot at the edge"
-    assert universe.needs_refresh(23600.0, margin=5)
+    # Pinned to a day inside the contracts' life so this tests drift and
+    # only drift. Left unpinned it silently became a calendar test: once
+    # the fixture's expiry fell into the past every assertion here was
+    # answered by the expiry check before drift was ever consulted.
+    live = universe.expiry
+
+    assert not universe.needs_refresh(24000.0, margin=5, on=live)
+    assert not universe.needs_refresh(24200.0, margin=5, on=live)
+    assert universe.needs_refresh(24300.0, margin=5, on=live), "spot at the edge"
+    assert universe.needs_refresh(23600.0, margin=5, on=live)
+
+
+def test_a_universe_is_rebuilt_once_its_expiry_has_passed():
+    """The morning-after bug, and why drift could never catch it.
+
+    Measured 16-Sep-2026: the desk was still subscribed to eighty
+    15-Sep contracts the day after they expired. Those tokens never
+    print again, so the live chain sat at 0 of 80 quoted for the whole
+    session and every option silently fell back to the 60-second NSE
+    poll — roughly 150x slower than the stream it replaced.
+
+    Drift cannot see this. The strikes are still perfectly centred on
+    spot; they are simply dead. An expiry is a fact about the calendar,
+    so it has to be asked about separately or it is never asked at all.
+    """
+    universe = ou.build(master(), spot=24000.0, band=10,
+                        on=datetime(2026, 8, 29).date())
+    expiry = universe.expiry
+
+    # Perfectly centred, and on any day up to the expiry that is enough.
+    assert not universe.needs_refresh(24000.0, margin=5, on=expiry)
+
+    # The next morning the same well-centred band is worthless.
+    assert universe.needs_refresh(
+        24000.0, margin=5, on=expiry + timedelta(days=1)), (
+        "a universe whose contracts have expired must be rebuilt even "
+        "though spot has not moved")
+
+
+def test_expiry_day_itself_is_still_a_trading_day():
+    """`<` and not `<=`.
+
+    Contracts settle at the close, so they trade all through their own
+    expiry — and that is their heaviest session. Rebuilding at 09:15 on
+    the expiry would throw away the most active day the universe has.
+    """
+    universe = ou.build(master(), spot=24000.0, band=10,
+                        on=datetime(2026, 8, 29).date())
+
+    assert not universe.needs_refresh(24000.0, margin=5, on=universe.expiry)
 
 
 # ---- decoding ---------------------------------------------------------

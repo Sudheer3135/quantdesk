@@ -11,6 +11,8 @@ import logging
 import numpy as np
 import pandas as pd
 
+from .. import market_hours
+
 REQUIRED_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
@@ -50,44 +52,52 @@ def session_key(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.Series:
     return df["timestamp"].dt.tz_convert(tz).dt.date
 
 
-def vwap(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.Series:
-    """Session-anchored VWAP. Resets every trading day."""
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    key = session_key(df, tz)
-    pv = (typical * df["volume"]).groupby(key).cumsum()
-    vol = df["volume"].groupby(key).cumsum().replace(0, np.nan)
-    return pv / vol
-
-
-def vwap_bands(df: pd.DataFrame, stdevs: float = 1.0, tz: str = "Asia/Kolkata"):
-    """Returns (vwap, upper, lower). Bands use volume-weighted variance."""
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    key = session_key(df, tz)
-    vw = vwap(df, tz)
-    sq = ((typical - vw) ** 2 * df["volume"]).groupby(key).cumsum()
-    vol = df["volume"].groupby(key).cumsum().replace(0, np.nan)
-    dev = np.sqrt(sq / vol)
-    return vw, vw + stdevs * dev, vw - stdevs * dev
+def volume_weights(df: pd.DataFrame) -> pd.Series:
+    """Never infer traded volume from the index feed's 0/1/2 placeholders."""
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    valid = volume.notna() & (volume > 2)
+    if "volume_is_synthetic" in df:
+        valid &= ~df["volume_is_synthetic"].fillna(True).astype(bool)
+    # Repository provenance is conservative for mixed-source frames.
+    if any(isinstance(v, dict) and v.get("volume_is_synthetic")
+           for v in df.attrs.values()):
+        valid[:] = False
+    if df.attrs.get("volume_is_synthetic"):
+        valid[:] = False
+    return volume.where(valid)
 
 
 def has_real_volume(df: pd.DataFrame) -> bool:
-    """Is the volume column actual traded volume, or a placeholder?
+    return not df.empty and bool(volume_weights(df).notna().all())
 
-    Yahoo Finance reports zero volume for Indian index tickers like ^NSEI.
-    The free broker substitutes a constant so VWAP does not divide by zero,
-    but constant volume is not information — anything derived from it must
-    be treated as unavailable, not as a neutral reading.
+
+def vwap_bands(df: pd.DataFrame, stdevs: float = 1.0, tz: str = "Asia/Kolkata"):
+    """Weighted population variance E[p²] - E[p]², reset per IST session.
+
+    A missing/placeholder weight invalidates that session's cumulative VWAP
+    from that point forward. We do not interpolate missing traded volume.
     """
-    vol = df["volume"].dropna()
-    return len(vol) > 1 and vol.nunique() > 1
+    price = (df["high"] + df["low"] + df["close"]) / 3
+    key = session_key(df, tz)
+    weights = volume_weights(df)
+    complete = weights.notna().groupby(key).cummin()
+    total = weights.fillna(0).groupby(key).cumsum().replace(0, np.nan)
+    mean = ((price * weights).fillna(0).groupby(key).cumsum() / total).where(complete)
+    second = ((price**2 * weights).fillna(0).groupby(key).cumsum() / total).where(complete)
+    deviation = np.sqrt((second - mean**2).clip(lower=0))
+    return mean, mean + stdevs * deviation, mean - stdevs * deviation
+
+
+def vwap(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.Series:
+    return vwap_bands(df, tz=tz)[0]
 
 
 def relative_volume(df: pd.DataFrame, length: int = 20) -> pd.Series:
     """Current bar volume divided by its recent average. >1.5 is a real push."""
-    if not has_real_volume(df):
-        return pd.Series(np.nan, index=df.index)
-    avg = df["volume"].rolling(length, min_periods=max(2, length // 2)).mean()
-    return df["volume"] / avg.replace(0, np.nan)
+    weights = volume_weights(df)
+    avg = weights.rolling(length, min_periods=max(2, length // 2)).mean()
+    complete = weights.notna().rolling(length, min_periods=1).min().astype(bool)
+    return (weights / avg.replace(0, np.nan)).where(complete)
 
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
@@ -112,11 +122,6 @@ TIMEFRAME_MINUTES = {
 }
 
 
-# NSE cash and index sessions. Anything outside this never happened.
-MARKET_OPEN = (9, 15)
-MARKET_CLOSE = (15, 30)
-
-
 def drop_outside_session(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.DataFrame:
     """Remove candles from weekends and from outside 09:15-15:30 IST.
 
@@ -134,8 +139,14 @@ def drop_outside_session(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.DataF
 
     local = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(tz)
     weekday = local.dt.dayofweek < 5                      # Monday-Friday
-    open_t = pd.Timestamp(*(2000, 1, 1), *MARKET_OPEN).time()
-    close_t = pd.Timestamp(*(2000, 1, 1), *MARKET_CLOSE).time()
+    # market_hours.MARKET_OPEN/CLOSE are already plain `time` objects — this
+    # used to restate the exchange's open and close as its own (hour,
+    # minute) tuples and rebuild a time from a throwaway Timestamp, one more
+    # copy of the session boundary the market-hours guard test could not
+    # see because it only looked for a `datetime.time(...)` constructor
+    # call, not a bare tuple written out the same way.
+    open_t = market_hours.MARKET_OPEN
+    close_t = market_hours.MARKET_CLOSE
     in_hours = (local.dt.time >= open_t) & (local.dt.time <= close_t)
 
     keep = weekday & in_hours
@@ -167,7 +178,7 @@ def drop_future(df: pd.DataFrame) -> pd.DataFrame:
     return df[keep].reset_index(drop=True)
 
 
-def drop_unclosed(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+def drop_unclosed(df: pd.DataFrame, timeframe: str, as_of=None) -> pd.DataFrame:
     """Remove candles that have not finished forming.
 
     A live feed hands you the bar currently in progress. Its high, low and
@@ -200,4 +211,8 @@ def drop_unclosed(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
         for bad in ts[~aligned]:
             logging.getLogger(__name__).info("dropping unclosed %s candle at %s", timeframe, bad)
 
-    return df[aligned].reset_index(drop=True)
+    now = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC")
+    if now.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    complete = ts + pd.Timedelta(minutes=minutes) <= now
+    return df[aligned & complete].reset_index(drop=True)

@@ -14,17 +14,42 @@ owns the shape, the previous-price memory, and the clocks.
 of them is how a stale price looks current:
 
     source_time   when the exchange printed this price. The only basis on
-                  which staleness can honestly be judged.
+                  which staleness can honestly be judged — but see the
+                  resolution caveat below before deriving anything
+                  sub-second from it.
     received_at   when this process first held it. On a push feed that is
                   the socket callback; on a poll it is the HTTP response.
+                  Stamped by us, so it is the only one of the four with
+                  reliably fine resolution.
     at            when we published it to Redis.
     age_seconds   at - source_time. What the desk is actually looking at.
+
+**A timestamp cannot be read more finely than it was written.** Angel
+quantises `exchange_timestamp` to a whole second, so every quantity derived
+from `source_time` inherits up to 1000ms of rounding that sweeps uniformly
+rather than settling. At the 15s and 60s thresholds `classify_age` uses,
+that is noise and can be ignored. At the one-second resolution a dashboard
+renders an age in, it is the entire signal: on 15-Sep-2026 the freshness
+pill flickered "just now" / "1s ago" / "just now" on consecutive seconds
+while the feed sat provably steady at 97ms between ticks with no
+reconnects and no fallbacks.
+
+The rule that follows, and the reason `source_time_quantum_ms` is
+published alongside the latency: judge *staleness* from `source_time`, at
+coarse thresholds, where rounding does not reach. Measure *how long since
+data last arrived* from `received_at`, which we stamp ourselves. Never
+render a sub-second age from `source_time`.
 
 The two differences between them are worth naming separately, because they
 fail for different reasons and have different fixes:
 
     feed_latency_ms     received_at - source_time. The exchange, the vendor
-                        and the network. Nothing here can improve it.
+                        and the network. Nothing here can improve it — and
+                        on a single tick it is dominated by the rounding
+                        described above, so read it with
+                        `source_time_quantum_ms` beside it and prefer the
+                        rolling minimum in `AngelFeed.status()` when the
+                        question is how fast the feed actually is.
     publish_latency_ms  at - received_at. Ours. Parsing, throttling, and
                         the hop to Redis. If this is large, we are the
                         problem.
@@ -106,6 +131,39 @@ def _millis(later: datetime, earlier: datetime | None) -> float | None:
     return round(max(0.0, (later - earlier).total_seconds()) * 1000, 2)
 
 
+def source_quantum_ms(printed: datetime | None) -> float | None:
+    """How coarse the source's own clock is, in milliseconds.
+
+    A latency is only as precise as the timestamp it is measured from, and
+    Angel's is a whole second: across 167 consecutive index ticks sampled
+    on 15-Sep-2026 not one `exchange_timestamp` carried a sub-second digit,
+    and the resulting `feed_latency_ms` was spread dead flat across every
+    100ms bucket from 0 to 1000 — 12, 12, 18, 16, 14, 14, 20, 11, 15, 23,
+    12. Real transit time does not look like that; it clusters with a tail.
+    A flat band exactly one second wide is the shape of a rounded clock,
+    not of a network.
+
+    So `feed_latency_ms` on any single tick is the true transit plus up to
+    a second of rounding, and on that sample the rounding was most of it:
+    p50 562ms against a floor of 56ms, on a feed whose ticks were 97ms
+    apart with no reconnects. Publishing 562ms to two decimal places
+    invites someone to act on a number that is mostly an artefact.
+
+    This reports the width of that uncertainty rather than hiding it.
+    Detected per tick instead of hard-coded, so it costs nothing if Angel
+    starts sending milliseconds and it stays correct for the polled
+    sources, whose timestamps are their own business.
+
+    A genuine millisecond stamp lands exactly on a second about once in a
+    thousand ticks and is briefly reported as coarse. That is the harmless
+    direction: it overstates the uncertainty of one reading and never
+    understates it.
+    """
+    if printed is None:
+        return None
+    return 1000.0 if printed.microsecond == 0 else 0.0
+
+
 def build_payload(
     symbol: str,
     price: float,
@@ -152,6 +210,13 @@ def build_payload(
         "age_seconds": age,
         "freshness": classify_age(age),
         "feed_latency_ms": _millis(received_at, printed) if received_at else None,
+        # The uncertainty attached to the number above, because the number
+        # above is not measurable more finely than this. 1000.0 means the
+        # true feed latency is somewhere in a one-second window and this
+        # tick cannot say where; 0.0 means the source dated itself finely
+        # enough to be believed. Anything rendering a sub-second age must
+        # read `received_at`, which we stamp ourselves, not `source_time`.
+        "source_time_quantum_ms": source_quantum_ms(printed),
         "publish_latency_ms": _millis(published, received_at),
         "market_open": market_is_open(),
     }

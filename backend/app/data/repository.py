@@ -16,13 +16,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..market_hours import trading_date
+from ..market_hours import IST, trading_date
 from ..models import CandleRecord, TradeRecord
 
 log = logging.getLogger(__name__)
@@ -338,3 +338,17 @@ def open_trades(db: Session) -> list[TradeRecord]:
     one day it matters most.
     """
     return list(db.scalars(select(TradeRecord).where(TradeRecord.status == "open")).all())
+
+
+def closed_trades(db: Session, day: date) -> list[TradeRecord]:
+    """Trades realised on this IST day, independent of their entry dates.
+
+    Legacy rows have no exit timestamp. For those alone retain the former
+    entry-day attribution; their actual realisation day cannot be recovered.
+    Use UTC bounds on both databases, whose stored timestamps are UTC.
+    """
+    start = datetime.combine(day, datetime.min.time(), tzinfo=IST).astimezone(UTC)
+    stamp = func.coalesce(TradeRecord.closed_at, TradeRecord.created_at)
+    return list(db.scalars(select(TradeRecord).where(
+        TradeRecord.status == "closed", stamp >= start,
+        stamp < start + timedelta(days=1)).order_by(stamp, TradeRecord.id)).all())

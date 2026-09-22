@@ -307,3 +307,104 @@ describe("OptionChain ladder", () => {
     expect(within(row).getAllByText("—")).toHaveLength(2);   // call LTP and call IV
   });
 })
+
+describe("greeks", () => {
+  /* The backend derives IV and the greeks from the traded premium (see
+     `analytics/chain_greeks.py`), so both transports now carry the same
+     columns. What is asserted here is that the ladder mirrors them
+     correctly around the strike — calls reading outward-in, puts
+     reading inward-out — because a table where delta sits above the
+     gamma header on one side only is worse than no greeks at all. */
+
+  const withGreeks = (over = {}) => ({
+    ...polled(),
+    strikes: polled().strikes.map((r, i) => ({
+      ...r,
+      call_delta: 0.6 - i * 0.1, call_gamma: 0.0010, call_theta: -13.28,
+      call_vega: 12.1, call_rho: 2.0,
+      put_delta: -0.4 - i * 0.1, put_gamma: 0.0010, put_theta: -11.2,
+      put_vega: 12.1, put_rho: -1.9,
+    })),
+    ...over,
+  });
+
+  const headers = () =>
+    [...document.querySelectorAll("thead tr:last-child th")]
+      .map((th) => th.textContent.trim());
+
+  it("mirrors the greeks around the strike column", () => {
+    render(<OptionChain chain={withGreeks()} spot={24334.55} nowMs={NOW} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /greeks/i }));
+    const head = headers();
+    const strike = head.indexOf("Price");        // the strike price column
+    const left = head.slice(0, strike);
+    const right = head.slice(strike + 1);
+
+    // Calls: greeks furthest out, premium against the strike.
+    expect(left.slice(0, 5)).toEqual(
+      ["Rho", "Vega", "Gamma", "Theta", "Delta"]);
+    expect(left[left.length - 1]).toBe("LTP");
+
+    // Puts: the exact mirror.
+    expect(right.slice(-5)).toEqual(
+      ["Delta", "Theta", "Gamma", "Vega", "Rho"]);
+    expect(right[0]).toBe("LTP");
+  });
+
+  it("renders a delta on both sides of a strike", () => {
+    render(<OptionChain chain={withGreeks()} spot={24334.55} nowMs={NOW} />);
+    fireEvent.click(screen.getByRole("button", { name: /greeks/i }));
+    const row = [...document.querySelectorAll("tbody tr")]
+      .find((tr) => tr.querySelector("td.strike")?.textContent.startsWith("24,350"));
+    const cells = within(row).getAllByText(/^-?0\.\d\d$/);
+    // one call delta, one put delta
+    expect(cells.length).toBeGreaterThanOrEqual(2);
+    expect(cells.some((c) => c.textContent.startsWith("-"))).toBe(true);
+  });
+
+  it("folds the greeks away on request and gives the width back", () => {
+    render(<OptionChain chain={withGreeks()} spot={24334.55} nowMs={NOW} />);
+    expect(headers()).not.toContain("Gamma");
+    fireEvent.click(screen.getByRole("button", { name: /greeks/i }));
+    expect(headers()).toContain("Gamma");
+
+    fireEvent.click(screen.getByRole("button", { name: /greeks/i }));
+
+    expect(headers()).not.toContain("Gamma");
+    expect(headers()).toContain("LTP");      // the rest of the ladder stays
+  });
+
+  it("shows no greek columns at all when the chain carries none", () => {
+    /* Not a row of dashes. A column of "—" costs width and says
+       nothing that its absence does not say more quietly. */
+    render(<OptionChain chain={polled()} spot={24334.55} nowMs={NOW} />);
+    expect(headers()).not.toContain("Delta");
+    expect(screen.queryByRole("button", { name: /greeks/i })).toBeNull();
+  });
+});
+
+describe("the spot marker", () => {
+  it("draws the live price between the two strikes it sits between", () => {
+    /* Spot almost never lands on a strike. Without this the ladder
+       locates the money only to the nearest fifty points, which on a
+       weekly is most of a delta. */
+    render(<OptionChain chain={polled()} spot={24334.55} nowMs={NOW} />);
+
+    const marker = document.querySelector(".chain-spot");
+    expect(marker).toBeTruthy();
+    expect(marker.textContent).toContain("24,334.55");
+
+    // It sits after 24,300 and before 24,350 — not on either.
+    const rows = [...document.querySelectorAll("tbody tr")];
+    const at = rows.indexOf(marker);
+    expect(rows[at - 1].textContent).toContain("24,300");
+    expect(rows[at + 1].textContent).toContain("24,350");
+  });
+
+  it("is not drawn when there is no spot to draw", () => {
+    const blind = { ...polled(), summary: {} };
+    render(<OptionChain chain={blind} spot={null} nowMs={NOW} />);
+    expect(document.querySelector(".chain-spot")).toBeNull();
+  });
+});

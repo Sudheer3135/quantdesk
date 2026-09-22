@@ -60,7 +60,7 @@ export default function TopBar({
   return (
     <header className="topbar">
       <div className="brand">
-        <span className="brand-mark" aria-hidden="true" />
+        <span className="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 16L9 11L13 14L20 6M15 6H20V11" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
         <span className="brand-name">Quant<b>Desk</b></span>
         <span className="brand-sub">options signal platform</span>
       </div>
@@ -98,7 +98,7 @@ export default function TopBar({
           <i className="dot" />{link}
         </span>
         <span className="clock mono">{istTime(clock, true)} IST</span>
-        <button className="ghost-btn" onClick={onRefresh}>refresh</button>
+        <button className="ghost-btn" onClick={onRefresh}><svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 7v5h-5M19 12a7 7 0 1 0-2 5M20 12l-3-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>refresh</button>
       </div>
     </header>
   );

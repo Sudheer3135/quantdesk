@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ..analytics import indicators, options, smc, structure
+from ..analytics import chain_greeks, indicators, options, smc, structure
 from ..brokers.base import UnknownSymbol
 from ..cache import get_json, set_json
 from ..config import get_settings
@@ -211,11 +211,20 @@ def live_chain() -> dict | None:
         frame = snap["frame"]
         if len(frame) < 3:
             return None
+        # Far strikes may be quiet for minutes, but a whole chain with no
+        # fresh quote has stopped streaming. Let HTTP use its polled source
+        # even when the index feed and browser websocket remain healthy.
+        newest_age = snap.get("newest_age_seconds")
+        if newest_age is not None and newest_age > 15:
+            return None
         price = _chain_spot(frame)
         return {
             "symbol": get_settings().watch_symbol,
             "summary": options.summarise(frame, price).to_dict(),
-            "strikes": jsonable_records(frame),
+            # Angel's stream carries no IV and no greeks, so they are
+            # derived here rather than left blank — see chain_greeks.
+            "strikes": chain_greeks.enrich(
+                jsonable_records(frame), price, snap["expiry"]),
             "fetched_at": snap["at"],
             "live": True,
             "transport": "stream",
@@ -294,9 +303,18 @@ def option_chain(symbol: str = "NIFTY", expiry: str | None = None):
         # Same guard as the candle endpoint. NSE returns no IV for untraded
         # strikes, and a chain wide enough to include them would otherwise
         # 500 on the same NaN.
-        "strikes": jsonable_records(chain),
+        # NSE states its own IV, which is believed; the greeks are
+        # derived from it so both transports carry the same columns.
+        "strikes": chain_greeks.enrich(
+            jsonable_records(chain), spot,
+            expiry or chain.attrs.get("expiry")),
         "fetched_at": utc_now().isoformat(),
         "live": live,
+        # Stated on this path too. Without it the dashboard read "Expiry
+        # unstated" whenever the stream fell back — the moment you most
+        # want to know which series you are looking at.
+        "expiry": expiry or chain.attrs.get("expiry"),
+        "transport": "poll",
     }
     # The short cache only exists to absorb an open market's repeat polls;
     # out of hours the day-long key is the one that must answer, and writing

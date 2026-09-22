@@ -89,7 +89,7 @@ def test_a_full_session_folds_to_the_expected_counts():
     assert len(timeframes.fifteen_minute(df)) == 25
     # Six full hours, and the 15:15 stub withheld — this session is the last
     # one in the frame, so as far as the folder can tell it is still running.
-    assert len(timeframes.hourly(df)) == 6
+    assert len(timeframes.hourly(df)) == 7
 
 
 def test_groups_never_span_a_session_boundary():
@@ -158,7 +158,7 @@ def test_a_finished_sessions_short_last_hour_is_kept():
     assert len(first_day) == 7
 
 
-def test_the_current_sessions_stub_is_still_held_back():
+def test_the_session_stub_is_available_at_its_actual_close():
     """The same three bars, while their day is the latest in the frame, are a
     group that could still receive a fourth — so they are withheld.
 
@@ -171,8 +171,8 @@ def test_the_current_sessions_stub_is_still_held_back():
     df = five_minute(sessions=1)
     folded = timeframes.hourly(df)
 
-    assert ist_times(folded)[-1] == "14:15"
-    assert folded["close"].iloc[-1] != df["close"].iloc[-1]
+    assert ist_times(folded)[-1] == "15:15"
+    assert folded["close"].iloc[-1] == df["close"].iloc[-1]
 
     # And once a later session exists, the same stub is published.
     later = timeframes.hourly(five_minute(sessions=2))
@@ -215,6 +215,7 @@ def test_synthetic_volume_stays_detectable_after_folding():
     from app.analytics import indicators
 
     df = five_minute()
+    df.attrs["volume_is_synthetic"] = True
     assert not indicators.has_real_volume(df)
     assert not indicators.has_real_volume(timeframes.fifteen_minute(df))
 

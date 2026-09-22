@@ -25,6 +25,25 @@ function makeSeries(kind, options) {
     setData: vi.fn(function (d) { this.data = d; }),
     updates: [],
     update: vi.fn(function (bar) {
+      /* lightweight-charts' real contract, enforced here on purpose.
+         `update()` may only touch the last bar or append after it; handed
+         anything earlier the library throws
+
+             Cannot update oldest data, last time=…, new time=…
+
+         and with no error boundary above it that unmounts the whole desk
+         and leaves a black page. This double used to accept a backwards
+         update silently, which is exactly why a suite of 276 green tests
+         sat alongside a dashboard that crashed on every refresh. A test
+         double that is more forgiving than the real thing does not test
+         the real thing. */
+      const last = this.data && this.data.length
+        ? this.data[this.data.length - 1] : null;
+      if (last && bar.time < last.time) {
+        throw new Error(
+          `Cannot update oldest data, last time=${last.time}, `
+          + `new time=${bar.time}`);
+      }
       this.updates.push(bar);
       if (!this.data) return;
       const i = this.data.findIndex((b) => b.time === bar.time);
@@ -82,7 +101,7 @@ const { createChart } = await import("lightweight-charts");
 const getJSON = vi.fn();
 vi.mock("./api.js", () => ({ getJSON: (...a) => getJSON(...a) }));
 
-const { default: PriceChart } = await import("./PriceChart.jsx");
+const { default: PriceChart, RECENT_REFRESH_MS } = await import("./PriceChart.jsx");
 
 /* ---- fixtures ------------------------------------------------------- */
 
@@ -219,6 +238,68 @@ describe("series", () => {
     getJSON.mockResolvedValue(page(shared));
     await renderChart(<PriceChart candles={shared} signal={null} />);
     await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+  });
+});
+
+describe("the recent-window refresh", () => {
+  /* The bug this covers: mergeLive strips indicators from any bar the
+     archive-loaded window has not seen, and nothing re-fetched that window
+     after mount. The overlays showed "—" and stopped drawing wherever a
+     browser tab had been open longer than one bar's worth of time. */
+  beforeEach(() => { vi.useFakeTimers({ shouldAdvanceTime: true }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // ema20 is the only overlay drawn dashed (see OVERLAYS in PriceChart.jsx),
+  // so its LineStyle.Dashed value (2, from the mocked module) picks it out
+  // without depending on series creation order.
+  const ema20Series = () => chart().series.find(
+    (s) => s.kind === "LineSeries" && s.options.lineStyle === 2);
+
+  it("fills in indicators once the archive catches up to a live-only bar", async () => {
+    const { rerender } = await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(priceSeries()?.data).toHaveLength(60));
+
+    // A bar the archive has not enriched yet — exactly what mergeLive hands
+    // a forming candle: OHLC only, no vwap/ema/atr.
+    const newIso = "2026-08-28T08:45:00+00:00";
+    const newTime = Math.floor(new Date(newIso).getTime() / 1000);
+    rerender(<PriceChart candles={[{
+      timestamp: newIso, open: 24200, high: 24210, low: 24190, close: 24205,
+    }]} signal={null} />);
+    await waitFor(() => expect(priceSeries().data.length).toBe(61));
+
+    // Confirmed gap: nothing plotted for the new bar on the overlay yet.
+    expect(ema20Series().data.some((p) => p.time === newTime)).toBe(false);
+
+    // The archive has since caught up and enriched that bar — what the
+    // next `GET /candles/history` (no `before`) would now answer.
+    getJSON.mockResolvedValue(page([...bars(60), {
+      timestamp: newIso, open: 24200, high: 24210, low: 24190, close: 24205,
+      vwap: 24201, ema20: 24202, ema50: 24203, ema200: 24204, atr14: 13,
+    }]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(RECENT_REFRESH_MS); });
+
+    await waitFor(() => expect(
+      ema20Series().data.find((p) => p.time === newTime)?.value).toBe(24202));
+  });
+
+  it("does not ask again before the interval elapses", async () => {
+    await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECENT_REFRESH_MS - 1_000);
+    });
+    expect(getJSON).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops refreshing once the chart unmounts", async () => {
+    const { unmount } = await renderChart(<PriceChart candles={[]} signal={null} />);
+    await waitFor(() => expect(getJSON).toHaveBeenCalledTimes(1));
+    unmount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECENT_REFRESH_MS * 3);
+    });
+    expect(getJSON).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -510,5 +591,58 @@ describe("the forming candle moves with the feed", () => {
     await waitFor(() =>
       expect(priceSeries().updates.at(-1)).toEqual(
         { time: expect.any(Number), value: 24999 }));
+  });
+});
+
+describe("a last bar that does not sit on the bucket grid", () => {
+  /* The black-screen crash, reproduced.
+
+     A source can hand back a still-forming bar stamped at the instant of
+     its own refresh rather than at its bucket start. When the live tick
+     merge then emitted the bucket start, it asked lightweight-charts to
+     move its last bar *backwards* — and the library refuses:
+
+         Cannot update oldest data, last time=…, new time=…
+
+     Nothing caught it, so the throw unmounted the whole dashboard and left
+     a black page until the bucket rolled over a few minutes later and the
+     condition cleared on its own. Reported from the browser console on
+     15-Sep-2026 at PriceChart.jsx:316, the `series.update()` call below.
+
+     The stray stamp is corrected at the source now (see the bucket
+     snapping in `brokers/freedata.py`), this keeps the renderer safe if
+     one ever gets through again, and `PanelBoundary` keeps a chart throw
+     from costing the desk. Belt, braces, and a net — the failure was
+     total and silent, and one guard is not enough for that. */
+  it("merges in place instead of asking the renderer to go backwards", async () => {
+    const FIVE = 300_000;
+    const bucket = Date.parse("2026-09-15T07:40:00Z");
+    const rows = [
+      { timestamp: new Date(bucket - 2 * FIVE).toISOString(),
+        open: 100, high: 101, low: 99, close: 100 },
+      { timestamp: new Date(bucket - FIVE).toISOString(),
+        open: 100, high: 101, low: 99, close: 100.5 },
+      // the forming bar, stamped 3m12s into its own bucket
+      { timestamp: new Date(bucket + 192_000).toISOString(),
+        open: 100.5, high: 102, low: 100, close: 101.5 },
+    ];
+
+    const { rerender } = render(
+      <PriceChart candles={rows} signal={null} price={null} />);
+    await act(async () => {});
+
+    const series = made.series.find((s) => s.kind === "CandlestickSeries");
+    const before = series.data[series.data.length - 1].time;
+
+    // a tick inside that same bucket, a few seconds later
+    rerender(<PriceChart candles={rows} signal={null} price={{
+      price: 101.75, market_open: true,
+      source_time: new Date(bucket + 240_000).toISOString(),
+    }} />);
+    await act(async () => {});
+
+    const after = series.data[series.data.length - 1];
+    expect(after.time).toBe(before);       // never moved backwards
+    expect(after.close).toBe(101.75);      // and the tick still landed
   });
 });

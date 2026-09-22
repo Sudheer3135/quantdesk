@@ -163,7 +163,7 @@ describe.skipIf(!present)("the terminal against live payloads", () => {
        to catch. */
     await mount();
     const chain = read("chain");
-    expect(screen.getByText("Strike ladder")).toBeTruthy();
+    expect(screen.getByText("Option chain")).toBeTruthy();
     expect(screen.getByText(new RegExp(`of ${chain.strikes.length} strikes`))).toBeTruthy();
 
     // Named by its caption — the desk renders several tables and this must
@@ -179,10 +179,24 @@ describe.skipIf(!present)("the terminal against live payloads", () => {
         { minimumFractionDigits: 2, maximumFractionDigits: 2 })).length)
       .toBeGreaterThan(0);
 
-    // The capture is a polled NSE snapshot, so both optional columns are
-    // carried and must be drawn.
-    expect(screen.getAllByText("ΔOI")).toHaveLength(2);
-    expect(screen.getAllByText("IV")).toHaveLength(2);
+    /* The two optional columns are drawn exactly when the capture carries
+       them, which is a property of the transport rather than of the desk:
+       a polled NSE snapshot brings change-in-OI and implied volatility,
+       the streamed Angel chain brings neither because SNAP_QUOTE does not
+       publish them.
+
+       Asserting "both are present" hard-coded the polled shape, and the
+       test broke the day the fixtures were re-captured from the live
+       stream — reporting a fixture change as a rendering fault. Deriving
+       the expectation from the capture keeps it honest under either
+       transport, which is the only reason a fixture refreshed from the
+       running desk is worth having. */
+    const carries = (key) => chain.strikes.some((row) => row[key] != null);
+    const expected = (key) => (carries(key) ? 2 : 0);
+
+    expect(screen.queryAllByText("ΔOI"))
+      .toHaveLength(expected("call_oi_change"));
+    expect(screen.queryAllByText("IV")).toHaveLength(expected("call_iv"));
   });
 
   it("renders real headlines with real tone readings", async () => {

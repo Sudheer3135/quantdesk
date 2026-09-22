@@ -138,7 +138,7 @@ def check_structure(state: structure.StructureState, current_index: int,
 def check_vwap(row: pd.Series) -> Check:
     price, vw = float(row["close"]), float(row["vwap"])
     if pd.isna(vw):
-        return Check("vwap", 0.0, WEIGHTS["vwap"], "VWAP not available yet.")
+        return Check("vwap", 0.0, WEIGHTS["vwap"], "VWAP unavailable: valid traded volume is required.", disabled=True)
     dist = (price - vw) / vw * 100
     if abs(dist) < 0.05:
         return Check("vwap", 0.0, WEIGHTS["vwap"],
@@ -282,6 +282,8 @@ def generate(
     rr_target: float = 2.0,
     atr_stop_multiple: float = 1.2,
 ) -> Signal:
+    decision_time = candles.attrs.get("decision_time", pd.Timestamp.now(tz="UTC"))
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
     df = indicators.enrich(candles)
     if len(df) < 30:
         raise ValueError("need at least 30 candles to read structure reliably")
@@ -338,6 +340,13 @@ def generate(
         price=price,
         checks=checks,
         context={
+            "timing": {
+                "bar_open_time": row["timestamp"].isoformat(),
+                "bar_close_time": (row["timestamp"] + pd.Timedelta(
+                    minutes=indicators.TIMEFRAME_MINUTES[timeframe])).isoformat(),
+                "signal_time": pd.Timestamp(decision_time).isoformat(),
+                "earliest_execution_time": pd.Timestamp(decision_time).isoformat(),
+            },
             "trend": state.trend,
             "last_structure_event": structure.last_event(state).to_dict()
             if structure.last_event(state) else None,

@@ -100,6 +100,7 @@ def stats(trades: Sequence, curve: Sequence[float],
     gross = np.array([t.gross_pnl for t in trades], dtype=float)
     rs = np.array([t.r_multiple for t in trades], dtype=float)
     charges = np.array([t.costs.get("total", 0.0) for t in trades], dtype=float)
+    friction = np.array([t.execution_friction for t in trades], dtype=float)
     decay = np.array([t.decay_cost for t in trades], dtype=float)
 
     wins, losses = pnls[pnls > 0], pnls[pnls <= 0]
@@ -124,7 +125,9 @@ def stats(trades: Sequence, curve: Sequence[float],
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2),
         "net_pnl": round(float(pnls.sum()), 2),
         "gross_pnl": round(float(gross.sum()), 2),
-        "total_costs": round(float(charges.sum()), 2),
+        "fees_taxes": round(float(charges.sum()), 2),
+        "execution_friction": round(float(friction.sum()), 2),
+        "total_costs": round(float(charges.sum() + friction.sum()), 2),
         "cost_per_trade": round(float(charges.mean()), 2),
         "return_pct": round(float(pnls.sum()) / starting_capital * 100, 2),
         "expectancy_per_trade": round(float(pnls.mean()), 2),

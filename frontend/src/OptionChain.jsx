@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 
 import { chainSource, ageText } from "./chain-source.js";
+import { spotBand } from "./render-keys.js";
 
 /* The strike ladder.
 
@@ -39,6 +40,31 @@ const premium = (v) =>
 const iv = (v) =>
   Number(v) > 0 ? `${Number(v).toFixed(1)}` : "—";
 
+/* The greeks, each at the precision it is actually read to.
+
+   Gamma needs four places because an ATM NIFTY weekly runs about
+   0.0010 and the digit that matters is the fourth; delta needs two and
+   would be noise at four. Formatting them all alike would either bury
+   gamma in rounding or print six meaningless places on delta. */
+const g2 = (v) =>
+  v === null || v === undefined || !Number.isFinite(Number(v))
+    ? "—" : Number(v).toFixed(2);
+const g4 = (v) =>
+  v === null || v === undefined || !Number.isFinite(Number(v))
+    ? "—" : Number(v).toFixed(4);
+
+/* Greeks columns, outermost first, so calls read right-to-left into the
+   strike and puts read left-to-right out of it. Declared once and
+   mirrored rather than written twice: two hand-written orders is how
+   the delta column ends up above the gamma header on one side only. */
+const GREEKS = [
+  { key: "rho", label: "Rho", fmt: g2 },
+  { key: "vega", label: "Vega", fmt: g2 },
+  { key: "gamma", label: "Gamma", fmt: g4 },
+  { key: "theta", label: "Theta", fmt: g2 },
+  { key: "delta", label: "Delta", fmt: g2 },
+];
+
 const oiChange = (v) => {
   if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
   const n = Number(v);
@@ -60,6 +86,8 @@ function spreadTitle(bid, ask) {
 
 export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 0 }) {
   const [span, setSpan] = useState(SPANS[0]);
+  /* Start with the core chain; the existing control reveals all Greeks. */
+  const [showGreeks, setShowGreeks] = useState(false);
 
   const source = chainSource(chain, nowMs, skewMs);
 
@@ -72,6 +100,15 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
     ? Number(spot)
     : Number(chain?.summary?.spot) || null;
 
+  /* Keyed on the spot's *band*, not the spot.
+
+     Which strikes are nearest can only change where the spot crosses a
+     strike or the midpoint between two. Keyed on the raw price this
+     sorted forty strikes twice on every tick — several times a second —
+     to produce the identical list. `anchor` is still what does the
+     sorting; the band only decides when the sorting is worth redoing,
+     and every spot inside one band yields the same order. */
+  const band = spotBand(anchor);
   const rows = useMemo(() => {
     const all = chain?.strikes ?? [];
     if (!all.length) return [];
@@ -80,13 +117,14 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
       .sort((a, b) => Math.abs(a.strike - anchor) - Math.abs(b.strike - anchor))
       .slice(0, span * 2)
       .sort((a, b) => a.strike - b.strike);
-  }, [chain, anchor, span]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chain, band, span]);
 
   if (!chain || !rows.length) {
     return (
       <div className="panel">
         <div className="panel-head">
-          <h3>Strike ladder</h3>
+          <h3>Option chain</h3>
           <span className={`pill tone-${source.tone}`}>{source.label}</span>
         </div>
         <p className="muted-body">
@@ -105,6 +143,10 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
   const hasChange = rows.some((r) =>
     Number.isFinite(Number(r.call_oi_change)) || Number.isFinite(Number(r.put_oi_change)));
   const hasIV = rows.some((r) => Number(r.call_iv) > 0 || Number(r.put_iv) > 0);
+  /* Derived from the premium, so they arrive with IV or not at all. */
+  const hasGreeks = rows.some((r) => Number.isFinite(Number(r.call_delta))
+                                  || Number.isFinite(Number(r.put_delta)));
+  const greeks = hasGreeks && showGreeks;
 
   /* The scale for the open-interest bars. One scale across both sides and
      every visible row, because a bar that rescales per column would make a
@@ -127,6 +169,12 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
 
   const bar = (value) => ({ "--oi-fill": `${((Number(value) || 0) / widest) * 100}%` });
 
+  /* Counted once. Both sides carry the same columns by construction, so
+     a single number keeps the two `colSpan`s from drifting apart when a
+     column is toggled. */
+  const sideCols = (greeks ? GREEKS.length : 0) + (hasIV ? 1 : 0)
+    + (hasChange ? 1 : 0) + 2;
+
   const expiry = chain.expiry
     ? new Date(chain.expiry).toLocaleDateString("en-IN",
         { timeZone: "Asia/Kolkata", day: "2-digit", month: "short" })
@@ -135,7 +183,7 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
   return (
     <div className="panel chain-panel">
       <div className="panel-head">
-        <h3>Strike ladder</h3>
+        <h3>Option chain</h3>
         <span className={`pill tone-${source.tone}`} title={
           source.streamed
             ? "Assembled from Angel websocket ticks. Each strike carries its own age; the badge shows the oldest print on screen."
@@ -156,6 +204,15 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
           <span className="dim">{chain.dropped_stale} dropped as stale</span>
         )}
         <span className="chain-spans">
+          {hasGreeks && (
+            <button
+              type="button"
+              className={`span-btn greek-btn${showGreeks ? " on" : ""}`}
+              aria-pressed={showGreeks}
+              onClick={() => setShowGreeks((v) => !v)}
+              title="Delta, gamma, theta, vega and rho, derived from the traded premium"
+            >Greeks</button>
+          )}
           {SPANS.map((n) => (
             <button
               key={n} type="button"
@@ -167,36 +224,80 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
         </span>
       </div>
 
-      <div className="chain-scroll">
-        <table className="chain-ladder">
+      <div className="chain-guide">
+        <span><i className="itm-key" /> In the money</span>
+        <span><i className="atm-key" /> ATM · nearest strike</span>
+        <span>OI & ΔOI in lakhs · premiums in ₹ · IV in %</span>
+      </div>
+      <div className="chain-scroll" tabIndex={0} role="region" aria-label="Option chain table, scroll for more strikes and columns">
+
+        <table className={`chain-ladder${greeks ? " with-greeks" : ""}`}>
           <caption className="sr-only">
             NIFTY option chain, calls left and puts right, by strike
           </caption>
           <thead>
             <tr className="chain-sides">
-              <th colSpan={2 + (hasChange ? 1 : 0) + (hasIV ? 1 : 0)} className="side-call">Calls</th>
+              <th colSpan={sideCols} scope="colgroup" className="side-call">Calls · CE</th>
               <th className="side-strike">Strike</th>
-              <th colSpan={2 + (hasChange ? 1 : 0) + (hasIV ? 1 : 0)} className="side-put">Puts</th>
+              <th colSpan={sideCols} scope="colgroup" className="side-put">Puts · PE</th>
             </tr>
             <tr>
+              {/* Calls read outward-in: the greeks furthest from the
+                  strike, premium against it. Puts mirror it, so the two
+                  books open away from the money and the eye compares
+                  like against like across the centre. */}
+              {greeks && GREEKS.map((g) => (
+                <th key={`c-${g.key}`} className="num greek">{g.label}</th>
+              ))}
+              {hasIV && <th className="num greek">IV</th>}
               <th className="num">OI</th>
               {hasChange && <th className="num">ΔOI</th>}
-              {hasIV && <th className="num">IV</th>}
               <th className="num">LTP</th>
-              <th className="side-strike"></th>
+              <th scope="col" className="side-strike">Price</th>
               <th className="num">LTP</th>
-              {hasIV && <th className="num">IV</th>}
               {hasChange && <th className="num">ΔOI</th>}
               <th className="num">OI</th>
+              {hasIV && <th className="num greek">IV</th>}
+              {greeks && [...GREEKS].reverse().map((g) => (
+                <th key={`p-${g.key}`} className="num greek">{g.label}</th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {rows.map((r) => {
+            {rows.map((r, i) => {
               const isAtm = atm && r.strike === atm.strike;
               const callItm = anchor ? r.strike < anchor : false;
               const putItm = anchor ? r.strike > anchor : false;
+              /* Spot almost never lands on a strike, so the live price is
+                 drawn *between* the two it sits between rather than on
+                 either. Without it the ladder tells you where the money
+                 is only to the nearest fifty points, which on a weekly
+                 is most of a delta. */
+              const prev = rows[i - 1];
+              const crossesSpot = anchor && prev
+                && prev.strike < anchor && r.strike >= anchor;
               return (
-                <tr key={r.strike} className={isAtm ? "row-atm" : ""}>
+                <Fragment key={r.strike}>
+                {crossesSpot && (
+                  <tr className="chain-spot" aria-hidden="true">
+                    <td colSpan={sideCols * 2 + 1}>
+                      <span className="chain-spot-badge mono">
+                        {"Spot "}
+                        {Number(anchor).toLocaleString("en-IN",
+                          { minimumFractionDigits: 2,
+                            maximumFractionDigits: 2 })}
+                      </span>
+                    </td>
+                  </tr>
+                )}
+                <tr className={isAtm ? "row-atm" : ""}>
+                  {greeks && GREEKS.map((g) => (
+                    <td key={`c-${g.key}`}
+                        className={`num greek${callItm ? " itm" : ""}`}>
+                      {g.fmt(r[`call_${g.key}`])}
+                    </td>
+                  ))}
+                  {hasIV && <td className={`num greek${callItm ? " itm" : ""}`}>{iv(r.call_iv)}</td>}
                   <td className={`num oi${callItm ? " itm" : ""}${r.strike === callWall.strike ? " wall" : ""}`}
                       style={bar(r.call_oi)}>
                     <span>{lakh(r.call_oi)}</span>
@@ -206,7 +307,6 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
                       {oiChange(r.call_oi_change)}
                     </td>
                   )}
-                  {hasIV && <td className={`num dim${callItm ? " itm" : ""}`}>{iv(r.call_iv)}</td>}
                   <td className={`num ltp${callItm ? " itm" : ""}`}
                       title={spreadTitle(r.call_bid, r.call_ask)}>
                     {premium(r.call_ltp)}
@@ -222,7 +322,6 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
                       title={spreadTitle(r.put_bid, r.put_ask)}>
                     {premium(r.put_ltp)}
                   </td>
-                  {hasIV && <td className={`num dim${putItm ? " itm" : ""}`}>{iv(r.put_iv)}</td>}
                   {hasChange && (
                     <td className={`num ${Number(r.put_oi_change) > 0 ? "up" : Number(r.put_oi_change) < 0 ? "down" : ""}${putItm ? " itm" : ""}`}>
                       {oiChange(r.put_oi_change)}
@@ -232,7 +331,15 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
                       style={bar(r.put_oi)}>
                     <span>{lakh(r.put_oi)}</span>
                   </td>
+                  {hasIV && <td className={`num greek${putItm ? " itm" : ""}`}>{iv(r.put_iv)}</td>}
+                  {greeks && [...GREEKS].reverse().map((g) => (
+                    <td key={`p-${g.key}`}
+                        className={`num greek${putItm ? " itm" : ""}`}>
+                      {g.fmt(r[`put_${g.key}`])}
+                    </td>
+                  ))}
                 </tr>
+                </Fragment>
               );
             })}
           </tbody>

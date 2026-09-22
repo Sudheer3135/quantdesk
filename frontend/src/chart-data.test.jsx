@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   LOAD_MORE_THRESHOLD_BARS, applyTick, bucketStart, formatStampIST,
   formatTickIST, istDateKey,
-  mergeLive, mergeOlder, priceLines, shouldLoadOlder, sortDedupe,
-  toCandleSeries, toCloseSeries, toEpochSeconds, toLineSeries,
+  mergeLive, mergeOlder, mergeRecent, priceLines, shouldLoadOlder,
+  sortDedupe, toCandleSeries, toCloseSeries, toEpochSeconds, toLineSeries,
   toSessionSeries,
 } from "./chart-data.js";
 
@@ -171,6 +171,53 @@ describe("mergeLive", () => {
   });
 });
 
+describe("mergeRecent", () => {
+  const ts = "2026-08-28T09:50:00+00:00";
+
+  it("replaces a bar mergeLive left price-only, indicators included", () => {
+    // The exact shape of the bug: mergeLive strips indicators from a bar
+    // the archive-loaded window has not seen. mergeRecent is what is
+    // supposed to come back later and fill them in, once the archive has
+    // caught up — a full-row replace, not a field patch like mergeLive's.
+    const priceOnly = [bar(ts, { close: 155 })];
+    const enriched = [bar(ts, { close: 155, ema20: 24102, vwap: 24100 })];
+    const merged = mergeRecent(priceOnly, enriched);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].ema20).toBe(24102);
+    expect(merged[0].vwap).toBe(24100);
+  });
+
+  it("is the same precedence as mergeLive, unlike mergeOlder", () => {
+    const existing = [bar(ts, { close: 100 })];
+    const recent = [bar(ts, { close: 155 })];
+    expect(mergeRecent(existing, recent)[0].close).toBe(155);
+    expect(mergeOlder(existing, recent)[0].close).toBe(100);
+  });
+
+  it("does not touch a bar the recent window does not mention", () => {
+    // The still-forming bar: not yet in the archive at all, so refreshing
+    // the recent window must leave whatever mergeLive last wrote for it
+    // alone rather than deleting it.
+    const forming = "2026-08-28T09:55:00+00:00";
+    const merged = mergeRecent(
+      [bar(ts), bar(forming, { close: 999 })],
+      [bar(ts, { ema20: 24102 })]);
+    expect(merged).toHaveLength(2);
+    expect(merged.find((r) => r.timestamp === forming).close).toBe(999);
+  });
+
+  it("appends a bar the recent window has that was never loaded", () => {
+    const merged = mergeRecent([bar("2026-08-28T09:45:00+00:00")], [bar(ts)]);
+    expect(merged).toHaveLength(2);
+    expect(merged[1].timestamp).toBe(ts);
+  });
+
+  it("keeps the loaded rows when the recent window is empty", () => {
+    expect(mergeRecent([bar(ts)], [])).toHaveLength(1);
+    expect(mergeRecent([bar(ts)], null)).toHaveLength(1);
+  });
+});
+
 describe("applyTick — the forming candle", () => {
   const T = "2026-08-31T04:35:00+00:00";          // 10:05 IST
   const slot = bucketStart(toEpochSeconds(T));
@@ -255,9 +302,21 @@ describe("applyTick — the forming candle", () => {
                       low: 24025, close: 24035 };
 
     const same = applyTick(offGrid, tick(24050, "2026-08-31T04:38:00+00:00"));
-    expect(same.time).toBe(slot);            // snapped back onto the grid
+    expect(same).not.toBeNull();             // accepted, not frozen out
     expect(same.open).toBe(24030);
     expect(same.close).toBe(24050);
+
+    /* And it merges *in place*, at the bar's own stamp.
+
+       Returning the bucket start here instead looked like a tidy-up — it
+       pulled the stray bar back onto the grid — but it asks the renderer
+       to move its last bar backwards, and lightweight-charts refuses
+       with "Cannot update oldest data". Uncaught, that unmounted the
+       dashboard and left a black page until the bucket rolled over. The
+       stray stamp is corrected at the source instead; see the bucket
+       snapping in `brokers/freedata.py`. */
+    expect(same.time).toBe(offGrid.time);
+    expect(same.time).toBeGreaterThanOrEqual(offGrid.time);
 
     const next = applyTick(offGrid, tick(24060, "2026-08-31T04:41:00+00:00"));
     expect(next.time).toBe(slot + 300);      // the following bucket

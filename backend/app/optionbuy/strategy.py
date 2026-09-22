@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, time
 
 import pandas as pd
@@ -61,6 +61,7 @@ from ..backtest.costs import (
     sell_fill,
 )
 from ..backtest.feed import HistoricalFeed
+from ..backtest.measurement import PositionLedger, provenance
 from ..risk.manager import DayState, RiskConfig, evaluate
 from . import contracts as contract_module
 from . import pricing as pricing_module
@@ -183,6 +184,10 @@ class OptionTrade:
     evidence: str = MODELLED
     entry_evidence: str = MODELLED
     exit_evidence: str = MODELLED
+    execution_friction: float = 0.0
+    fees: float = 0.0
+    timing: dict = field(default_factory=dict)
+    execution_accuracy: str = "estimated_bar_resolution"
     entry_quote: dict = field(default_factory=dict)
     exit_quote: dict = field(default_factory=dict)
     sizing_basis: str = "modelled"
@@ -284,7 +289,7 @@ def run(
     store = store if store is not None else empty_store()
     use_archive = cfg.pricing_policy != MODELLED_ONLY
 
-    risk = risk_config or RiskConfig(capital=cfg.starting_capital,
+    risk = replace(risk_config) if risk_config else RiskConfig(capital=cfg.starting_capital,
                                      lot_size=cfg.lot_size)
     costs = cost_model or CostModel()
     slippage = slippage_model or SlippageModel()
@@ -304,11 +309,13 @@ def run(
     rejections = Rejections()
     day_states: dict[date, DayState] = {}
     open_trade: dict | None = None
+    ledger = PositionLedger()
+    initial_risk = asdict(risk)
 
-    for i in feed.walk(cfg.warmup):
+    for i in feed.walk(cfg.warmup, reserve=0):
         bar = feed.bar(i)
-        stamp = feed.timestamp(i)
-        ist = feed.ist(i).to_pydatetime()
+        stamp = feed.close_time(i)
+        ist = stamp.tz_convert("Asia/Kolkata").to_pydatetime()
         store.advance(stamp.to_pydatetime())
         state = day_states.setdefault(ist.date(), DayState(trading_day=ist.date()))
 
@@ -317,7 +324,8 @@ def run(
                                  model, costs, slippage)
             if closed is not None:
                 trade, pnl = closed
-                equity += pnl
+                equity = cfg.starting_capital + sum(t.pnl for t in trades) + trade.pnl
+                ledger.close(stamp, trade.exit_reason, trade.pnl)
                 curve.append(equity)
                 trades.append(trade)
                 # The same state `record_fill` incremented: entries whose
@@ -330,12 +338,16 @@ def run(
 
         if open_trade is not None:
             continue
+        if not feed.can_enter(i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute):
+            rejections.add(FILL_CROSSES_SESSION, "No contiguous executable bar before the session cutoff.")
+            continue
 
         opened = _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state,
                               equity, costs, slippage, signal_fn, plan_fn,
                               rejections, use_archive)
         if opened is not None:
             open_trade = opened
+            ledger.enter(stamp, opened["entry_time"], opened["quantity"])
             state.record_fill()
 
     labels = [t.evidence for t in trades]
@@ -352,7 +364,11 @@ def run(
         evidence=evidence | {"gate": gate.to_dict()},
         rejections=rejections.to_dict(),
         assumptions=_assumptions(cfg, sel, model, costs, slippage),
-        dataset=dataset or {},
+        dataset=(dataset or {}) | {"reproducibility": provenance(candles,
+            {"strategy": cfg.to_dict(), "selection": sel.to_dict(), "model": model.to_dict(),
+             "risk": initial_risk, "execution": describe(costs, slippage),
+             "option_data": store.fingerprint()}, signal_fn),
+            "positions": ledger.finish(trades, cfg.starting_capital, equity)},
         coverage=coverage or {},
         limitations=_limitations(cfg, evidence),
     )
@@ -436,7 +452,7 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
         return None
 
     chosen, rejected = contract_module.select(
-        action=signal.action, spot=index_entry, moment=ist, store=store,
+        action=signal.action, spot=float(feed.bar(i)["close"]), moment=ist, store=store,
         config=sel, use_archive=use_archive, iv=model.iv)
     if chosen is None:
         rejections.add(rejected.code, rejected.detail)
@@ -520,6 +536,8 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
 
     return {
         "signal": signal, "selection": chosen, "quote": quote,
+        "entry_reference": fill.requested, "entry_friction": fill.slippage,
+        "timing": {"bar_open_time": feed.timestamp(i).isoformat(), "bar_close_time": feed.close_time(i).isoformat(), "signal_time": ist.isoformat(), "earliest_execution_time": fill_stamp.isoformat()},
         "entry_basis": entry_basis,
         "direction": signal.action,
         "index_entry": index_entry,
@@ -570,7 +588,8 @@ def _exit_trigger(trade, bar, ist, i, cfg):
     hit_target = bar["high"] >= target if long_index else bar["low"] <= target
 
     if hit_stop:
-        return stop, STOP, stop
+        fill = min(stop, float(bar["open"])) if long_index else max(stop, float(bar["open"]))
+        return fill, ("stop_gap" if fill != stop else STOP), stop
     if hit_target:
         return target, TARGET, target
     if i - trade["entry_index"] >= cfg.max_bars_in_trade:
@@ -584,6 +603,9 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
                 slippage):
     """Close the trade if a rule fires, and price the exit honestly."""
     index_exit, reason, trigger = _exit_trigger(trade, bar, ist, i, cfg)
+    if index_exit is None and (i == len(feed) - 1 or (not cfg.hold_overnight and not feed.can_enter(i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute))):
+        index_exit = float(bar["close"])
+        reason = "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
     if index_exit is None:
         return None
 
@@ -648,7 +670,7 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
         expiry=key.expiry.isoformat(),
         contract=key.label(),
         entry_time=trade["entry_time"],
-        exit_time=feed.timestamp(i).isoformat(),
+        exit_time=feed.close_time(i).isoformat(),
         direction=trade["direction"],
         index_entry=round(trade["index_entry"], 2),
         index_stop=round(trade["index_stop"], 2),
@@ -660,7 +682,9 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
         premium_target=round(trade["premium_target"], 2),
         premium_exit=round(premium_exit, 2),
         lots=trade["lots"], quantity=quantity,
-        gross_pnl=round(gross, 2),
+        gross_pnl=round((fill.requested - trade["entry_reference"]) * quantity, 2),
+        execution_friction=round((fill.slippage + trade["entry_friction"]) * quantity, 2),
+        fees=round(charges.total, 2), timing=trade["timing"],
         costs=charges.to_dict(),
         pnl=round(pnl, 2),
         r_multiple=round(pnl / risk_amount, 3) if risk_amount else 0.0,

@@ -15,10 +15,12 @@ an imagined one, and they are the ones that matter:
 Every network call here is a fake. The one test that touches the real API
 is skipped unless ANGEL_LIVE_TEST=1.
 """
+import json
 import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -738,3 +740,148 @@ def test_gap_fill_ignores_bars_on_days_that_were_not_short(db):
     assert set(report.per_day_added) == {"2025-01-07", "2025-01-09"}
     assert {r.source for r in stored_rows(db)
             if ah._session_date(r.timestamp) in (date(2025, 1, 6), date(2025, 1, 8))} == {"free"}
+
+
+# ---- the instrument master, and why it is cached ---------------------------
+#
+# Measured on 15-Sep-2026. Angel's instrument master is a single ~34MB JSON
+# over one connection, and it truncated twice that afternoon — at 23.1MB and
+# at 8.4MB — each time as a clean 200 whose body simply stopped. There was no
+# retry and no cache, so each failure left the desk with no option universe
+# at all for the rest of the session.
+#
+# That is not a cosmetic outage. With no universe the live option chain never
+# subscribes, and the desk silently serves the polled NSE snapshot instead:
+# roughly 60 seconds behind the market where the stream is roughly 400ms. The
+# only trace was one WARNING in the log. These tests hold the three
+# behaviours that close that hole.
+
+MASTER_ROWS = [{"token": "1", "name": "NIFTY", "exch_seg": "NFO",
+                "instrumenttype": "OPTIDX", "expiry": "22SEP2026",
+                "strike": "2320000", "symbol": "NIFTY22SEP2623200CE"}]
+
+
+class FlakyMaster:
+    """Angel's download: truncates a few times, then completes."""
+
+    def __init__(self, fail_times, body=None):
+        self.fail_times = fail_times
+        self.calls = 0
+        self.body = json.dumps(body if body is not None else MASTER_ROWS)
+
+    def __call__(self, url, timeout=None):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError(
+                "peer closed connection without sending complete message "
+                "body (received 8415974 bytes, expected 34576518)")
+        return SimpleNamespace(text=self.body, raise_for_status=lambda: None)
+
+
+@pytest.fixture
+def instant_retries(monkeypatch):
+    """The retry pause, skipped — the backoff is tested by call count."""
+    monkeypatch.setattr(ah.time, "sleep", lambda _s: None)
+
+
+def test_todays_cached_master_is_used_without_touching_the_network(tmp_path):
+    """A restart must not spend 34MB re-fetching this morning's file.
+
+    This is what made the outage so easy to hit: every restart paid the
+    download again, so every restart was another chance to truncate.
+    """
+    day = date(2026, 9, 15)
+    cached = tmp_path / f"instrument-master-{day.isoformat()}.json"
+    cached.write_text(json.dumps(MASTER_ROWS))
+
+    def explode(*a, **k):                       # pragma: no cover
+        raise AssertionError("the network was touched despite a fresh cache")
+
+    import httpx
+    original = httpx.get
+    httpx.get = explode
+    try:
+        rows = ah.load_master(cache_dir=tmp_path, on=day)
+    finally:
+        httpx.get = original
+
+    assert rows == MASTER_ROWS
+
+
+def test_a_truncated_download_is_retried_rather_than_abandoned(
+        tmp_path, instant_retries, monkeypatch):
+    """Two truncations then a good body must still produce a master."""
+    import httpx
+    flaky = FlakyMaster(fail_times=2)
+    monkeypatch.setattr(httpx, "get", flaky)
+
+    rows = ah.load_master(cache_dir=tmp_path, on=date(2026, 9, 15))
+
+    assert rows == MASTER_ROWS
+    assert flaky.calls == 3, "the download must be retried, not abandoned"
+
+
+def test_a_completed_download_is_cached_for_the_day(
+        tmp_path, instant_retries, monkeypatch):
+    import httpx
+    flaky = FlakyMaster(fail_times=0)
+    monkeypatch.setattr(httpx, "get", flaky)
+    day = date(2026, 9, 15)
+
+    ah.load_master(cache_dir=tmp_path, on=day)
+    ah.load_master(cache_dir=tmp_path, on=day)
+
+    assert flaky.calls == 1, "the second call must be served from the cache"
+    assert (tmp_path / f"instrument-master-{day.isoformat()}.json").exists()
+
+
+def test_a_master_that_will_not_download_falls_back_to_yesterdays(
+        tmp_path, instant_retries, monkeypatch):
+    """The judgement call, stated plainly.
+
+    Yesterday's tokens are still today's tokens — an expiry does not move
+    and a contract does not get renumbered. The only thing an old master
+    can lack is something listed this morning. Serving the live option
+    chain from slightly old contract list beats dropping every option to a
+    sixty-second poll, so long as it says so.
+    """
+    import httpx
+    yesterday = date(2026, 9, 14)
+    (tmp_path / f"instrument-master-{yesterday.isoformat()}.json").write_text(
+        json.dumps(MASTER_ROWS))
+    monkeypatch.setattr(httpx, "get", FlakyMaster(fail_times=99))
+
+    rows = ah.load_master(cache_dir=tmp_path, on=date(2026, 9, 15))
+
+    assert rows == MASTER_ROWS
+
+
+def test_a_master_that_will_not_download_with_no_cache_raises(
+        tmp_path, instant_retries, monkeypatch):
+    """With nothing to fall back on it must fail loudly, not return []."""
+    import httpx
+    monkeypatch.setattr(httpx, "get", FlakyMaster(fail_times=99))
+
+    with pytest.raises(ah.AngelHistoryError):
+        ah.load_master(cache_dir=tmp_path, on=date(2026, 9, 15))
+
+
+def test_a_corrupt_cache_is_discarded_rather_than_served(
+        tmp_path, instant_retries, monkeypatch):
+    """A half-written file must not poison the whole session."""
+    import httpx
+    day = date(2026, 9, 15)
+    corrupt = tmp_path / f"instrument-master-{day.isoformat()}.json"
+    corrupt.write_text('[{"token": "1", "na')        # truncated mid-row
+    flaky = FlakyMaster(fail_times=0)
+    monkeypatch.setattr(httpx, "get", flaky)
+
+    rows = ah.load_master(cache_dir=tmp_path, on=day)
+
+    assert rows == MASTER_ROWS
+    assert flaky.calls == 1
+
+
+def test_the_fetch_seam_still_bypasses_all_of_it(tmp_path):
+    """Existing callers that inject their own fetch are untouched."""
+    assert ah.load_master(fetch=lambda: MASTER_ROWS) == MASTER_ROWS

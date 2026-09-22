@@ -9,6 +9,7 @@ plausible, permanent edge with nothing in the output to flag it.
 So these tests are about refusals, not about arithmetic.
 """
 import sys
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from app.optionbuy import chain as chain_module
 from app.optionbuy.chain import (
     ChainStore,
     ContractKey,
+    ContractMeta,
     OptionLookaheadError,
 )
 from optionbuy_fixtures import (
@@ -152,6 +154,44 @@ def test_the_fingerprint_changes_when_the_archive_grows():
     two_days = ChainStore(option_bars(DAYS, EXPIRY), {})
     assert one_day.fingerprint()["hash"] != two_days.fingerprint()["hash"]
     assert two_days.fingerprint()["sessions"] == 2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("iv", 0.8), ("open_interest", 0.0), ("volume", 0.0),
+    ("bid", 1.0), ("ask", 999.0), ("underlying_close", 26000.0),
+    ("samples", 1), ("source", "other"), ("bar_kind", "ohlc"),
+    ("session_date", date(2025, 6, 3)), ("iv", None),
+])
+def test_fingerprint_covers_material_option_inputs(field, value):
+    bars = option_bars(DAYS, EXPIRY)
+    before = ChainStore(bars, {}).fingerprint()["hash"]
+    first = bars[KEY][0]
+    assert getattr(first, field) != value
+    bars[KEY][0] = replace(first, **{field: value})
+    assert ChainStore(bars, {}).fingerprint()["hash"] != before
+
+
+def test_fingerprint_covers_contract_terms_without_database_ids():
+    bars = option_bars(DAYS, EXPIRY)
+    meta = ContractMeta(1, KEY, 65, "NIFTY", "test")
+    original = ChainStore(bars, {KEY: meta}).fingerprint()["hash"]
+    assert ChainStore(bars, {KEY: replace(meta, lot_size=75)}).fingerprint()["hash"] != original
+    changed_ids = {key: [replace(b, row_id=b.row_id + 1000, contract_id=999) for b in rows]
+                   for key, rows in reversed(list(bars.items()))}
+    assert ChainStore(changed_ids, {KEY: replace(meta, contract_id=999)}).fingerprint()[
+        "hash"] == original
+
+
+def test_fingerprint_normalises_timezone_without_rounding_prices():
+    from app.market_hours import IST
+
+    bars = option_bars(DAYS, EXPIRY)
+    original = ChainStore(bars, {}).fingerprint()["hash"]
+    first = bars[KEY][0]
+    bars[KEY][0] = replace(first, timestamp=first.timestamp.astimezone(IST))
+    assert ChainStore(bars, {}).fingerprint()["hash"] == original
+    bars[KEY][0] = replace(first, close=first.close + 0.00001)
+    assert ChainStore(bars, {}).fingerprint()["hash"] != original
 
 
 def test_polls_per_bucket_counts_one_poll_once_across_the_chain():

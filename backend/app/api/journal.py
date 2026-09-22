@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import TradeRecord
+from ..models import TradeRecord, utc_now
 from ..security import require_api_key
 
 router = APIRouter(prefix="/journal", tags=["journal"])
@@ -53,6 +53,7 @@ def close_trade(trade_id: int, payload: TradeClose, db: Session = Depends(get_db
     risk = abs(trade.entry - trade.stop_loss) * trade.quantity
     trade.r_multiple = round(trade.pnl / risk, 3) if risk else None
     trade.status = "closed"
+    trade.closed_at = utc_now()
     for field in ("plan_followed", "mistakes", "lesson", "score"):
         value = getattr(payload, field)
         if value is not None:

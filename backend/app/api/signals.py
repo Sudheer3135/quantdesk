@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from ..analytics import options as option_analytics
 from ..analytics import plan as plan_builder
-from ..analytics import signal_engine
+from ..analytics import signal_engine, indicators
+import pandas as pd
 from ..brokers.base import UnknownSymbol
 from ..db import get_db
 from ..deps import get_broker
@@ -48,14 +49,31 @@ def build_analysis(symbol: str, timeframe: str, days: int = 5) -> Analysis:
     symbol = validate_symbol(symbol)
     broker = get_broker()
     candles = broker.candles(symbol, timeframe, days)
+    decision_time = pd.Timestamp.now(tz="UTC")
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
+    candles.attrs["decision_time"] = decision_time.isoformat()
     try:
         chain = broker.option_chain(symbol)
     except Exception:
         chain = None
 
+    vix = broker.india_vix()
+    decision_time = pd.Timestamp.now(tz="UTC")
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
+    candles.attrs["decision_time"] = decision_time.isoformat()
+    if chain is not None:
+        source_time = chain.attrs.get("source_time")
+        try:
+            source_time = pd.Timestamp(source_time) if source_time else None
+            if (source_time is None or source_time.tzinfo is None
+                    or source_time > decision_time
+                    or decision_time - source_time > pd.Timedelta(minutes=5)):
+                chain = None
+        except (ValueError, TypeError):
+            chain = None
     signal = signal_engine.generate(
         candles, symbol=symbol, timeframe=timeframe,
-        chain=chain, india_vix=broker.india_vix(),
+        chain=chain, india_vix=vix,
     )
 
     plan = None

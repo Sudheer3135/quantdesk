@@ -3,6 +3,7 @@ import {
   Bar, BarChart, Cell, ReferenceLine, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from "recharts";
+import { THEME } from "./theme.js";
 
 /* Consistent units. The old formatter only switched to lakhs above 1e5, so
    one axis carried "74893" and "2.2L" side by side and the reader had to
@@ -113,37 +114,37 @@ export default function OIProfile({ strikes, summary, spot, span = 14 }) {
           <XAxis
             type="number" domain={[-widest, widest]} ticks={ticks}
             tickFormatter={lakh}
-            tick={{ fill: "#7c8899", fontSize: 10 }} axisLine={false} tickLine={false}
+            tick={{ fill: THEME.dim, fontSize: 10 }} axisLine={false} tickLine={false}
           />
           <YAxis
             type="category" dataKey="strike" width={54}
             tickFormatter={strikeLabel}
-            tick={{ fill: "#7c8899", fontSize: 10 }} axisLine={false} tickLine={false}
+            tick={{ fill: THEME.dim, fontSize: 10 }} axisLine={false} tickLine={false}
           />
-          <Tooltip content={<Callout />} cursor={{ fill: "#ffffff08" }} />
-          <ReferenceLine x={0} stroke="#232d3a" />
+          <Tooltip content={<Callout />} cursor={{ fill: THEME.raise }} />
+          <ReferenceLine x={0} stroke={THEME.grid} />
 
           <ReferenceLine
-            y={atm.strike} stroke="#e8b339" strokeDasharray="3 3"
+            y={atm.strike} stroke={THEME.wait} strokeDasharray="3 3"
             label={{ value: `spot ${strikeLabel(spot)}`, position: "insideTopRight",
-                     fill: "#e8b339", fontSize: 9 }}
+                     fill: THEME.wait, fontSize: 9 }}
           />
           {maxPainInView && maxPain !== atm.strike && (
             <ReferenceLine
-              y={maxPain} stroke="#7c8899" strokeDasharray="2 4"
+              y={maxPain} stroke={THEME.dim} strokeDasharray="2 4"
               label={{ value: "max pain", position: "insideTopRight",
-                       fill: "#7c8899", fontSize: 9 }}
+                       fill: THEME.dim, fontSize: 9 }}
             />
           )}
 
           <Bar dataKey="call" isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill="#d9614c" fillOpacity={d.aboveSpot ? 0.85 : 0.3} />
+              <Cell key={i} fill={THEME.down} fillOpacity={d.aboveSpot ? 0.85 : 0.3} />
             ))}
           </Bar>
           <Bar dataKey="put" isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill="#45b880" fillOpacity={d.aboveSpot ? 0.3 : 0.85} />
+              <Cell key={i} fill={THEME.up} fillOpacity={d.aboveSpot ? 0.3 : 0.85} />
             ))}
           </Bar>
         </BarChart>

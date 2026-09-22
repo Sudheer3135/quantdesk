@@ -113,16 +113,31 @@ export function applyTick(last, tick, seconds = 300) {
      future and silently swallowing every tick until the real bucket rolls
      over — measured live on 15-Sep-2026, a forming bar stamped a few
      minutes past its own bucket start froze the chart until the next
-     5-minute boundary. Emitting `slot` rather than `last.time` below also
-     self-heals an off-grid last bar the moment a tick arrives. */
+     5-minute boundary. */
   const lastSlot = last ? bucketStart(last.time, seconds) : null;
 
   /* Out-of-order ticks happen on a reconnect, when the feed replays. */
   if (last && slot < lastSlot) return null;
 
   if (last && slot === lastSlot) {
+    /* `last.time`, not `slot`.
+
+       The comparison above is on buckets so an off-grid bar cannot swallow
+       every tick, but the *emitted* time has to stay where the renderer
+       already has the bar. Returning `slot` here looked tidier — it
+       quietly pulled a stray bar back onto the grid — and it asked
+       lightweight-charts to move its last bar backwards, from 07:43:12 to
+       07:40:00, which it refuses outright:
+
+           Cannot update oldest data, last time=…, new time=…
+
+       Uncaught, that unmounted the entire dashboard and left a black page
+       until the bucket rolled over. Merging in place keeps the bar moving
+       without ever going backwards, and the source is where an off-grid
+       stamp gets corrected — see the bucket snapping in
+       `brokers/freedata.py`. */
     return {
-      time: slot,
+      time: last.time,
       open: last.open,
       high: Math.max(last.high, price),
       low: Math.min(last.low, price),
@@ -213,6 +228,27 @@ export function mergeLive(existing, live) {
   return [...byTime.entries()]
     .sort((x, y) => x[0] - y[0])
     .map(([, row]) => row);
+}
+
+/* The archive's recent window, replacing whatever this chart is holding at
+   the same timestamps.
+
+   `mergeLive` promises the overlays stop "one bar short of the forming
+   candle" — true only while the archive-loaded window keeps pace with the
+   clock. It does not: the initial load runs once, on mount, and after that
+   nothing ever asks the archive for its recent end again. Every bar formed
+   since then arrives solely through the live feed and is stripped to
+   prices by `priceOnly`, so a browser tab left open for an hour accumulates
+   an hour of indicator-less bars — not one, and the gap only grows. The
+   archive itself is current the whole time; nothing was fetching it.
+
+   `recent` is the answer to `GET /candles/history` with no `before`, which
+   is fully enriched. It wins outright — full row, not a field-by-field
+   patch like `mergeLive` — because there is nothing to protect it from:
+   this is exactly the data `mergeLive`'s "known" branch is trying to
+   approximate, arriving late instead of never. */
+export function mergeRecent(existing, recent) {
+  return merge(existing, recent, "b");
 }
 
 /* How close to the left edge the user must pan before older bars are

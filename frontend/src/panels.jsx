@@ -107,11 +107,11 @@ export function PerformanceStrip({ perf }) {
   const rTone = (v) => (v === null ? "" : v > 0 ? "up" : v < 0 ? "down" : "");
   return (
     <section className="perf-strip">
-      <Cell label="Trades" value={perf.trades} />
+      <Cell label="Outcomes" value={perf.trades} />
       <Cell label="Wins" value={perf.wins} tone="up" />
       <Cell label="Losses" value={perf.losses} tone="down" />
       <Cell label="Win rate" value={pct(perf.winRate, 1)} />
-      <Cell label="Net R" value={signed(perf.totalR, 1)} tone={rTone(perf.totalR)} />
+      <Cell label="Sum R" value={signed(perf.totalR, 1)} tone={rTone(perf.totalR)} />
       <Cell
         label="Avg win"
         value={perf.avgWinR === null ? UNAVAILABLE : `${signed(perf.avgWinR)}R`}

@@ -13,9 +13,11 @@ const OIProfile = memo(lazy(() => import("./OIProfile.jsx")), sameOIPicture);
 
 /* No charting library behind it, so it costs nothing to keep in the main
    bundle and paints with the first frame rather than a beat later. */
-import OptionChain from "./OptionChain.jsx";
+import OptionChainView from "./OptionChain.jsx";
 import StrategyV2Panel from "./StrategyV2Panel.jsx";
 import { WS_URL, getJSON } from "./api.js";
+import PanelBoundary from "./PanelBoundary.jsx";
+import EngineRisk from "./EngineRisk.jsx";
 
 import TopBar from "./TopBar.jsx";
 import {
@@ -24,7 +26,7 @@ import {
   SafetyMonitor as SafetyMonitorView, SignalFeed as SignalFeedView,
   performanceFrom,
 } from "./panels.jsx";
-import { sameOIPicture } from "./render-keys.js";
+import { sameLadder, sameOIPicture } from "./render-keys.js";
 
 /* The root re-renders on every price tick (~2.5/s), every pushed chain (up
    to 4/s) and every second of the clock. Without these, each of those
@@ -39,6 +41,11 @@ const NewsPanel = memo(NewsPanelView);
 const PerformanceStrip = memo(PerformanceStripView);
 const SafetyMonitor = memo(SafetyMonitorView);
 const SignalFeed = memo(SignalFeedView);
+/* The densest panel on the desk — up to eighty cells of streaming
+   premium — and the last one still redrawing on every price tick.
+   See `sameLadder`: a tick that has not crossed a strike changes
+   nothing it draws. */
+const OptionChain = memo(OptionChainView, sameLadder);
 
 /* One empty array for "none", so a missing list is the same list every
    render instead of a new one that defeats every memo downstream. */
@@ -62,6 +69,8 @@ const FALLBACK_POLL_MS = 60_000;   // only used if the socket cannot connect
    analysis, so a working feed still read "delayed 44s ago". */
 const PRICE_POLL_MS = 5_000;
 const MAX_RECONNECT_MS = 30_000;
+// A connected browser socket does not prove option ticks are still arriving.
+const CHAIN_PUSH_TIMEOUT_MS = 15_000;
 
 /* Mirrors LIVE_SECONDS / DELAYED_SECONDS in backend/app/workers/ticker.py.
    Both ends classify the same way so the dashboard and the API never
@@ -201,6 +210,7 @@ function useLiveSignal() {
   const attempts = useRef(0);
   const pollTimer = useRef(null);
   const priceTimer = useRef(null);
+  const chainTimer = useRef(null);
   const closed = useRef(false);
 
   /* How far this browser's clock sits from the server's.
@@ -328,7 +338,13 @@ function useLiveSignal() {
          frame carrying no chain leaves the last one alone: the publisher
          skips unchanged chains, so "no chain in this frame" means "nothing
          new", not "the chain is gone". */
-      if (msg.chain) setStreamChain(msg.chain);
+      if (msg.chain) {
+        setStreamChain(msg.chain);
+        clearTimeout(chainTimer.current);
+        chainTimer.current = setTimeout(() => {
+          setStreamChain(null);
+        }, CHAIN_PUSH_TIMEOUT_MS);
+      }
       if (msg.v2) setV2(msg.v2);
       if (msg.signal) {
         setSignal(msg.signal);
@@ -346,6 +362,8 @@ function useLiveSignal() {
 
     ws.onclose = () => {
       if (closed.current) return;
+      clearTimeout(chainTimer.current);
+      setStreamChain(null);
       // Back off, but keep the last signal visible and fall back to polling
       // so the dashboard degrades instead of silently freezing.
       const wait = Math.min(1000 * 2 ** attempts.current, MAX_RECONNECT_MS);
@@ -363,6 +381,7 @@ function useLiveSignal() {
     return () => {
       closed.current = true;
       stopPolling();
+      clearTimeout(chainTimer.current);
       socket.current?.close();
     };
   }, [connect, stopPolling]);
@@ -447,8 +466,8 @@ function useMarketData(intervalMs = 60_000, streamChain = null) {
      already has.
 
      The poll is stood down, not torn out. If the socket drops, the push
-     stops, `pushed` goes false on the next render and the timer comes
-     back — the same degrade-to-polling path the price already takes. */
+     stops, or no option frame arrives for 15 seconds, `pushed` goes false
+     and the HTTP timer comes back even if price/heartbeat frames continue. */
   const pushed = Boolean(streamChain);
   useEffect(() => {
     loadChain();
@@ -489,7 +508,11 @@ function useDeskData(intervalMs = 60_000) {
     // deliberately not the same thing as `feed`, the signal journal.
     const [history, outcomes, qual, sched, feedStatus, cov, vixRes, headlines] =
       await Promise.all([
-      getJSON("/signals/history?limit=25").catch(() => null),
+      /* Deep enough for the engine/risk chart to show a trend rather
+         than a handful of points — three weeks at this rate. The
+         journal below it still lists only the most recent few; one
+         request serves both rather than two that can disagree. */
+      getJSON("/signals/history?limit=200").catch(() => null),
       getJSON("/signals/outcomes?symbol=NIFTY&include_signals=true").catch(() => null),
       getJSON("/data/quality?symbol=NIFTY").catch(() => null),
       getJSON("/health/scheduler").catch(() => null),
@@ -610,8 +633,15 @@ function SessionClock({ market, secondsToBoundary }) {
    analysis are two different clocks, and the dashboard used to imply they
    were one: a five-minute-old signal sat beside a live price under a single
    "updated" label, so whichever was staler was the one you could not see. */
-function DataAge({ seconds, price, sessionLive }) {
-  const state = classifyAge(seconds, sessionLive);
+/* `seconds` is what the reader sees; `alarmSeconds` is what decides the
+   colour. They are usually the same number and default to it, but on the
+   live price they are not: the shown age is measured from `received_at`
+   at full resolution, while the alarm additionally answers to the coarse
+   exchange stamp so a feed pushing stale prints cannot read as live. One
+   prop for both is how a fresh-looking arrival time used to be able to
+   paint a ninety-second-old print green. */
+function DataAge({ seconds, price, sessionLive, alarmSeconds }) {
+  const state = classifyAge(alarmSeconds ?? seconds, sessionLive);
   if (!price) {
     return (
       <p className="data-age age-unknown">
@@ -1107,10 +1137,58 @@ export default function App() {
   /* Age of the price on screen, in seconds, measured between absolute
      instants and corrected for this browser's clock offset. Never derived
      from the rendered HH:MM string — that would fold in the timezone
-     conversion and quietly report a 5.5-hour error as fresh data. */
-  const priceAge = price?.source_time
+     conversion and quietly report a 5.5-hour error as fresh data.
+
+     Measured from `received_at` — the instant this desk first held the
+     tick, which we stamp ourselves at microsecond resolution — and
+     deliberately NOT from `source_time`.
+
+     `source_time` is Angel's `exchange_timestamp`, and Angel quantises it
+     to a whole second: across 167 consecutive ticks on 15-Sep-2026 not one
+     carried a sub-second digit. Deriving a sub-second age from a
+     1-second-resolution stamp and then redrawing it once a second beats
+     two 1-second grids against each other, and the reading sawtooths
+     through a full second of phantom age. On a feed that was provably
+     steady that day — 97ms between ticks, zero reconnects, zero
+     fallbacks — this pill still read "just now", "1s ago", "just now" on
+     consecutive seconds. That flicker was arithmetic, not the feed.
+
+     `received_at` answers the question the pill actually asks — "is data
+     still arriving?" — at full precision, so the reading is smooth. It
+     keeps the property the source_time version was written for: only a
+     real tick moves it, so a heartbeat still cannot forge freshness.
+
+     What `received_at` alone would miss is a feed that keeps pushing but
+     pushes *old* prints — it would stay young while the market moved away
+     underneath. `exchangeLag` below is the guard for that, and
+     `classifyAge` is handed the worse of the two. */
+  const streamAge = price?.received_at
+    ? (clock - skewMs - new Date(price.received_at).getTime()) / 1000
+    : null;
+
+  /* How far the print itself is behind the exchange, as opposed to how
+     long since we last heard anything. Still built from the quantised
+     stamp, so it carries up to a second of rounding — which is why it is
+     only ever compared against the 15s/60s thresholds, where a second is
+     noise, and is never rendered as the age. */
+  const exchangeLag = price?.source_time
     ? (clock - skewMs - new Date(price.source_time).getTime()) / 1000
     : null;
+
+  /* What gets *shown*: the smooth reading. Never the quantised one — that
+     is the whole point of the split above. */
+  const priceAge = streamAge ?? exchangeLag;
+
+  /* What gets *alarmed on*: the worse of the two, so neither a feed that
+     has gone quiet nor a feed that is still pushing yesterday's print can
+     pass as live. Safe to build from the quantised stamp because the only
+     thresholds it ever meets are 15s and 60s, where a second of rounding
+     changes nothing. It must not reach `formatAge` — at the one-second
+     resolution the pill renders, that same rounding is the entire
+     signal. */
+  const worstAge = streamAge === null ? exchangeLag
+    : exchangeLag === null ? streamAge
+    : Math.max(streamAge, exchangeLag);
 
   /* Is the feed supposed to be producing right now? Only the backend's
      session decides — never `Date.now()` here, which would put the desk back
@@ -1122,7 +1200,7 @@ export default function App() {
      a bodyless payload, and treating that as "not open" would suppress the
      alarm exactly when the backend is in trouble. */
   const sessionLive = market?.session ? market.session === "open" : true;
-  const ageState = classifyAge(priceAge, sessionLive);
+  const ageState = classifyAge(worstAge, sessionLive);
 
   /* Seconds to the next session boundary, recomputed on every tick against
      the absolute instant the backend supplied. Falls as time passes; it
@@ -1134,6 +1212,11 @@ export default function App() {
   /* Derived once per study, not once per render: a fresh object here
      would re-render the strip and the feed on every tick of the clock. */
   const perf = useMemo(() => performanceFrom(study), [study]);
+  /* The journal lists the recent few; the chart above it reads the
+     whole window. Sliced once per fetch rather than per render, so
+     a price tick four times a second does not hand `SignalFeed` a
+     new array identity and defeat its memo. */
+  const journal = useMemo(() => feed.slice(0, 25), [feed]);
   const outcomeRows = useMemo(() => study?.outcomes ?? NONE, [study]);
 
   /* What the freshness pill says after the label. A fixed instant once the
@@ -1151,22 +1234,37 @@ export default function App() {
         onRefresh={refresh}
       />
 
-      <PerformanceStrip perf={perf} />
+      <div className="workspace-heading">
+        <div><span className="workspace-eyebrow">NSE · OPTIONS INTELLIGENCE</span>
+          <h1>Market workspace<span className="workspace-dot">.</span></h1>
+          <p>Price action, decisions and risk — in one view.</p>
+        </div>
+        <span className="workspace-tag">NIFTY 50 <span> / </span> 5 MIN</span>
+      </div>
+      <div className="performance-wrap">
+        <div className="section-label">Signal outcomes <span>Hypothetical · overlapping · before fees</span></div>
+        <PerformanceStrip perf={perf} />
+      </div>
 
       <main className="terminal">
         {/* Left: the chart is the main visual, with the numbers that
             describe the same market directly under it. */}
         <div className="col col-chart">
-          <Suspense fallback={<ChartFallback label="NIFTY 50 · 5m" />}>
-            <PriceChart candles={candles} signal={signal} price={price} />
-          </Suspense>
+          {/* The chart is the one panel that draws to a canvas through a
+              third-party renderer, so it is the one most able to throw
+              from inside an effect. Uncaught, that took the whole desk
+              black on 15-Sep-2026; contained, it costs a chart. */}
+          <PanelBoundary label="NIFTY 50 · 5m">
+            <Suspense fallback={<ChartFallback label="NIFTY 50 · 5m" />}>
+              <PriceChart candles={candles} signal={signal} price={price} />
+            </Suspense>
+          </PanelBoundary>
           <MarketOverview
             signal={signal} chain={chain} regime={regime} vix={vix} price={price}
           />
         </div>
 
-        {/* Centre: what the desk is deciding, and the record of what it
-            decided before. This column is the reason the page exists. */}
+        {/* Keep the active decision beside the market it describes. */}
         <div className="col col-decision">
           {signal ? (
             <DecisionPanel
@@ -1191,31 +1289,54 @@ export default function App() {
               </p>
             </section>
           )}
-          <StrategyV2Panel state={v2} />
-          <SignalFeed rows={feed} outcomes={outcomeRows} />
         </div>
 
-        {/* Right: is the desk itself trustworthy right now. */}
+        <div className="workspace-section-heading"><h2>Strategy & activity</h2><span>Execution context and recent decisions</span></div>
+        <div className="activity-grid">
+          <StrategyV2Panel state={v2} />
+          <div className="col">
+            <PanelBoundary label="Engine · Risk">
+              <EngineRisk history={feed} />
+            </PanelBoundary>
+            <SignalFeed rows={journal} outcomes={outcomeRows} />
+          </div>
+        </div>
+        <div className="workspace-section-heading"><h2>Market & system health</h2><span>Session, conditions and feed integrity</span></div>
+
+        {/* Supporting health panels remain available below activity. */}
         <div className="col col-status">
           {/* The price itself lives in the top bar and only there. This
               panel is about how far behind the market that number is and
               where the session stands — the two questions the number alone
               cannot answer. */}
-          <section className="panel session-panel">
-            <div className="panel-head">
-              <h2>Current price</h2>
-              <span className="panel-note mono">
-                {price?.source ? `via ${price.source}` : "no feed"}
-              </span>
+          {/* Split rather than stacked. These are two different clocks —
+              how far behind the market the price is, and where the
+              session stands — and they are read against each other. Side
+              by side they stay comparable at a glance and the panel costs
+              half the vertical room, which on a dashboard this dense is
+              another panel visible without scrolling. */}
+          <section className="panel session-panel split ratio-3-2">
+            <div className="pane">
+              <div className="panel-head">
+                <h2>Current price</h2>
+                <span className="panel-note mono">
+                  {price?.source ? `via ${price.source}` : "no feed"}
+                </span>
+              </div>
+              <DataAge seconds={priceAge} alarmSeconds={worstAge}
+                       price={price} sessionLive={sessionLive} />
             </div>
-            <DataAge seconds={priceAge} price={price} sessionLive={sessionLive} />
-            <SessionClock market={market} secondsToBoundary={secondsToBoundary} />
+            <div className="pane">
+              <div className="panel-head"><h2>Session</h2></div>
+              <SessionClock market={market}
+                            secondsToBoundary={secondsToBoundary} />
+            </div>
           </section>
           {/* The market is in some condition whether or not the agent has
               spoken yet, so this is never gated on a signal. */}
           <RegimePanel regime={regime} />
           <SafetyMonitor
-            ageState={ageState} priceAge={priceAge} market={market}
+            ageState={ageState} priceAge={worstAge} market={market}
             quality={quality} scheduler={scheduler} riskNow={riskNow}
             coverage={coverage} feed={priceFeed}
           />

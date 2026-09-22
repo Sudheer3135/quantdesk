@@ -14,7 +14,7 @@ Costs are charged on both legs so the equity curve is net, not gross.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date
 
 import numpy as np
@@ -24,6 +24,7 @@ from ..analytics import signal_engine
 from ..risk.manager import DayState, RiskConfig, evaluate
 from .costs import CostModel, FlatCostModel, SlippageModel, describe
 from .feed import HistoricalFeed
+from .measurement import PositionLedger, provenance
 
 
 @dataclass
@@ -40,6 +41,11 @@ class Trade:
     r_multiple: float
     exit_reason: str
     confidence: float
+
+    gross_pnl: float = 0.0
+    execution_friction: float = 0.0
+    fees: float = 0.0
+    timing: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -142,6 +148,9 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         "losses": int(len(losses)),
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2),
         "net_pnl": round(float(pnls.sum()), 2),
+        "gross_pnl": round(sum(t.gross_pnl for t in trades), 2),
+        "execution_friction": round(sum(t.execution_friction for t in trades), 2),
+        "fees_taxes": round(sum(t.fees for t in trades), 2),
         "return_pct": round(float(pnls.sum()) / starting_capital * 100, 2),
         "avg_win": round(float(wins.mean()), 2) if len(wins) else 0.0,
         "avg_loss": round(float(losses.mean()), 2) if len(losses) else 0.0,
@@ -193,7 +202,7 @@ def run(
     which is more history than any of the checks actually use.
     """
     feed = HistoricalFeed(candles, analysis_window=analysis_window)
-    cfg = risk_config or RiskConfig(capital=starting_capital)
+    cfg = replace(risk_config) if risk_config else RiskConfig(capital=starting_capital)
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
     costs = cost_model or FlatCostModel(per_round_trip=cost_per_round_trip)
     slip_model = slippage_model or SlippageModel(index_pct=slippage_pct)
@@ -204,10 +213,13 @@ def run(
 
     day_states: dict[date, DayState] = {}
     open_trade: dict | None = None
+    ledger = PositionLedger()
+    initial_risk = asdict(cfg)
+    custom_signal = signal_fn
 
-    for i in feed.walk(warmup):
+    for i in feed.walk(warmup, reserve=0):
         bar = feed.bar(i)
-        moment = feed.ist(i)
+        moment = feed.close_time(i).tz_convert("Asia/Kolkata")
         today = moment.date()
         state = day_states.setdefault(today, DayState(trading_day=today))
 
@@ -222,13 +234,18 @@ def run(
             # If both are touched inside one candle, assume the stop filled
             # first. Pessimistic on purpose — never flatter the backtest.
             if hit_stop:
-                exit_price, reason = open_trade["stop"], "stop"
+                stop = open_trade["stop"]
+                exit_price = min(stop, float(bar["open"])) if open_trade["side"] == "BUY" else max(stop, float(bar["open"]))
+                reason = "stop_gap" if exit_price != stop else "stop"
             elif hit_target:
                 exit_price, reason = open_trade["target"], "target"
             elif i - open_trade["entry_index"] >= max_bars_in_trade:
                 exit_price, reason = float(bar["close"]), "time"
             elif moment.time().hour >= 15 and moment.time().minute >= 15:
                 exit_price, reason = float(bar["close"]), "session end"
+
+            if exit_price is None and (i == len(feed) - 1 or not feed.can_enter(i)):
+                exit_price, reason = float(bar["close"]), "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
 
             if exit_price is not None:
                 qty = open_trade["quantity"]
@@ -245,7 +262,7 @@ def run(
                 risk_unit = abs(open_trade["entry"] - open_trade["stop"]) * qty
                 trades.append(Trade(
                     entry_time=open_trade["entry_time"],
-                    exit_time=feed.timestamp(i).isoformat(),
+                    exit_time=feed.close_time(i).isoformat(),
                     side=open_trade["side"],
                     entry=round(open_trade["entry"], 2),
                     exit=round(fill, 2),
@@ -256,12 +273,19 @@ def run(
                     r_multiple=round(pnl / risk_unit, 3) if risk_unit else 0.0,
                     exit_reason=reason,
                     confidence=open_trade["confidence"],
+                    gross_pnl=round((exit_price-open_trade["reference_entry"])*direction*qty,2),
+                    execution_friction=round((abs(fill-exit_price)+abs(open_trade["entry"]-open_trade["reference_entry"]))*qty,2),
+                    fees=round(charges.total,2), timing=open_trade["timing"],
                 ))
+                pnl = round(pnl, 2)
+                # Account balances reconcile exactly to the reported monetary ledger.
+                equity = starting_capital + sum(t.pnl for t in trades)
+                ledger.close(feed.close_time(i), reason, pnl)
                 state.record_close(pnl)
                 curve.append(equity)
                 open_trade = None
 
-        if open_trade:
+        if open_trade or not feed.can_enter(i):
             continue
 
         # ---- look for a new entry using only bars up to i -------------
@@ -288,6 +312,8 @@ def run(
         entry_fill = next_open + slip_model.index_points(next_open) * direction
         shift = entry_fill - sig.entry
         open_trade = {
+            "reference_entry": next_open,
+            "timing": {"bar_open_time": feed.timestamp(i).isoformat(), "bar_close_time": feed.close_time(i).isoformat(), "signal_time": feed.close_time(i).isoformat(), "earliest_execution_time": feed.next_timestamp(i).isoformat()},
             "side": sig.action,
             "entry": entry_fill,
             "stop": sig.stop_loss + shift,
@@ -297,6 +323,7 @@ def run(
             "entry_time": feed.next_timestamp(i).isoformat(),
             "confidence": sig.confidence,
         }
+        ledger.enter(feed.close_time(i), feed.next_timestamp(i), decision.quantity)
         state.record_fill()
 
     return BacktestResult(
@@ -308,5 +335,9 @@ def run(
             "max_bars_in_trade": max_bars_in_trade,
             "stop_fills_first_when_both_touched": True,
         },
-        dataset=dataset or {},
+        dataset=(dataset or {}) | {"reproducibility": provenance(candles,
+            {"risk": initial_risk, "costs": describe(costs, slip_model),
+             "warmup": warmup, "analysis_window": analysis_window,
+             "max_bars_in_trade": max_bars_in_trade}, custom_signal),
+             "positions": ledger.finish(trades, starting_capital, equity)},
     )

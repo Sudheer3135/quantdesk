@@ -260,6 +260,9 @@ def test_a_zero_width_stop_is_not_actionable():
 def seed(db, specs, signals):
     import_index_candles(db, bars(specs), "NIFTY", "5m", "test")
     for record in signals:
+        # These fixtures describe a decision on the supplied bar. Write it
+        # when that bar closes, rather than before its close existed.
+        record.created_at += timedelta(minutes=5)
         record.id = None
         db.add(record)
     db.commit()
@@ -314,7 +317,8 @@ def test_the_study_reports_distinct_bars_alongside_the_count(db):
          [signal(ist_at(9, 15), sid=1), signal(ist_at(9, 17), sid=2)])
 
     report = study.evaluate(db, "NIFTY", "5m")
-    assert report.selection["selected"] == 2
+    assert report.selection["selected"] == 1
+    assert report.selection["duplicate_bars"] == 1
     assert report.selection["distinct_bars"] == 1
 
 

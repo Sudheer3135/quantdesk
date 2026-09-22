@@ -263,3 +263,98 @@ def test_a_second_resolution_source_never_reports_negative_latency():
 
     assert payload["feed_latency_ms"] == 0.0, (
         "a source stamped to the second must floor at zero, not go negative")
+
+
+# ---------------------------------------------------------------------------
+# 4. the resolution of the source clock, and what may be derived from it
+# ---------------------------------------------------------------------------
+#
+# The test above establishes that Angel's stamp is rounded to the second.
+# What it did not say is what follows from that, which cost the desk three
+# separate false latency alarms on 15-Sep-2026: every quantity derived from
+# `source_time` carries up to a second of rounding, and a dashboard that
+# renders an age to the nearest second is therefore rendering almost pure
+# rounding. The pill alternated "just now" / "1s ago" on consecutive seconds
+# while the feed sat at 97ms between ticks with zero reconnects.
+#
+# Measured that morning over 167 consecutive ticks: no `source_time` carried
+# a sub-second digit, and `feed_latency_ms` was spread dead flat across every
+# 100ms bucket from 0 to 1000. Real transit clusters; a flat band exactly one
+# second wide is a rounded clock. p50 read 562ms, the floor 56ms.
+
+def test_a_whole_second_stamp_is_reported_as_second_resolution():
+    """The uncertainty is published rather than left to be rediscovered."""
+    stamped = datetime(2026, 9, 15, 9, 11, 3, tzinfo=UTC)
+    received = datetime(2026, 9, 15, 9, 11, 3, 757_647, tzinfo=UTC)
+
+    payload = prices.build_payload(
+        "NIFTY", 23_217.6, source="angel", source_time=stamped.isoformat(),
+        received_at=received, transport="stream")
+
+    assert payload["source_time_quantum_ms"] == 1000.0, (
+        "a stamp with no sub-second digits cannot date itself more finely "
+        "than a second, and the payload has to say so — the 757ms latency "
+        "beside it is mostly that rounding")
+
+
+def test_a_finely_stamped_source_carries_no_such_caveat():
+    """The correction must retire itself the day the vendor improves.
+
+    Hard-coding "Angel is coarse" would still be claiming it long after it
+    stopped being true, and would quietly libel every other source that
+    dates itself properly.
+    """
+    stamped = datetime(2026, 9, 15, 9, 11, 3, 412_000, tzinfo=UTC)
+    received = datetime(2026, 9, 15, 9, 11, 3, 470_000, tzinfo=UTC)
+
+    payload = prices.build_payload(
+        "NIFTY", 23_217.6, source="angel", source_time=stamped.isoformat(),
+        received_at=received, transport="stream")
+
+    assert payload["source_time_quantum_ms"] == 0.0
+    assert payload["feed_latency_ms"] == pytest.approx(58, abs=1)
+
+
+def test_the_poller_stamps_when_it_received_the_quote(rig):
+    """Both sources must publish the same shape, including this field.
+
+    `prices.publish_price` exists so the push feed and the poller cannot
+    drift apart, but the poller was never passing `received_at` — so the
+    push feed published four timestamps and the poller three. That was
+    invisible until the dashboard started measuring freshness from
+    `received_at` to escape the rounding above. Without this, a fallback to
+    the poller would have silently dropped the dashboard back to ageing
+    against the coarse stamp, and the flicker would have returned wearing a
+    different hat, only during an outage, which is the worst time to be
+    debugging a clock.
+    """
+    broker, redis = rig
+    broker.age_seconds = 2.0
+
+    before = datetime.now(UTC)
+    ticker.tick()
+    after = datetime.now(UTC)
+
+    payload = last_price_payload(redis)
+    assert payload["received_at"] is not None, (
+        "the poller must stamp when the quote landed, as the push feed does")
+
+    received = datetime.fromisoformat(payload["received_at"])
+    assert before <= received <= after
+
+    # And it must be the arrival, not the print: the stub's quote is two
+    # seconds old, so these two cannot be the same instant.
+    printed = datetime.fromisoformat(payload["source_time"])
+    assert (received - printed).total_seconds() == pytest.approx(2.0, abs=0.5)
+
+
+def test_every_published_price_carries_the_four_timestamps(rig):
+    """The shape itself, asserted once, so a fifth caller cannot omit one."""
+    broker, redis = rig
+    broker.age_seconds = 1.0
+    ticker.tick()
+
+    payload = last_price_payload(redis)
+    for field in ("source_time", "received_at", "at",
+                  "source_time_quantum_ms"):
+        assert field in payload, f"{field} missing from the published price"

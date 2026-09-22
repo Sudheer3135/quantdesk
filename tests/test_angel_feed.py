@@ -11,6 +11,7 @@ the connection ends, and a reconnected socket arrives with no subscriptions.
 """
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -500,10 +501,18 @@ def test_the_status_carries_no_credentials():
     feed._session = a_session()
     rendered = str(feed.status())
 
+    # "feed" is scanned for because the session holds a feed token, so
+    # every legitimate *key* containing the word has to be cleared out of
+    # the way first or it reads as the token leaking. Keep this list in
+    # step with `status()`; a new field named feed_* fails here until it is
+    # added, which is the intended direction — the scan should have to be
+    # told a name is safe rather than assume it.
+    for key in ("feed_p50", "feed_p95", "feed_min", "has_feed_token",
+                "stale_after_seconds", "the feed"):
+        rendered = rendered.replace(key, "")
+
     for secret in ("jwt", "feed", "refresh", "1234", "JBSWY3DPEHPK3PXP"):
-        assert secret not in rendered.replace("feed_p50", "").replace(
-            "feed_p95", "").replace("has_feed_token", "").replace(
-            "stale_after_seconds", "").replace("the feed", "")
+        assert secret not in rendered
 
 
 def _wait_until(predicate, timeout=3.0):
@@ -515,3 +524,358 @@ def _wait_until(predicate, timeout=3.0):
         deadline.wait(0.02)
         waited += 0.02
     raise AssertionError("condition never became true")
+
+
+# ---- the stall watchdog ----------------------------------------------
+
+def test_a_socket_reporting_connected_but_silent_past_the_ceiling_is_kicked(
+        monkeypatch):
+    """The bug measured on 15-Sep-2026: the socket never fired on_close or
+    on_error, so nothing but a wait on the vendor's own clock — once
+    minutes long — would have recovered it."""
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, clock = a_feed()
+    feed._on_data(None, ltp())                    # a tick, socket "open"
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+
+    clock.advance(get_settings().angel_force_reconnect_seconds + 1)
+
+    assert feed._maybe_force_reconnect() is True
+    assert socket.closed is True
+    assert feed.stats.forced_reconnects == 1
+
+
+def test_it_does_not_kick_before_the_ceiling(monkeypatch):
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, clock = a_feed()
+    feed._on_data(None, ltp())
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+
+    clock.advance(get_settings().angel_force_reconnect_seconds - 1)
+
+    assert feed._maybe_force_reconnect() is False
+    assert socket.closed is False
+    assert feed.stats.forced_reconnects == 0
+
+
+def test_it_does_not_kick_a_socket_that_is_ticking_normally(monkeypatch):
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, clock = a_feed()
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+    for _ in range(5):
+        clock.advance(2)
+        feed._on_data(None, ltp(stamp=clock()))
+
+    assert feed._maybe_force_reconnect() is False
+    assert socket.closed is False
+
+
+def test_a_stall_is_kicked_once_then_left_alone_until_the_cooldown_passes(
+        monkeypatch):
+    """Without a cooldown a still-stalled connection would be
+    close_connection()'d on every single check — harmless to the vendor
+    call, but a warning logged every few seconds for a fault already
+    handled."""
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, clock = a_feed()
+    feed._on_data(None, ltp())
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+    clock.advance(get_settings().angel_force_reconnect_seconds + 1)
+
+    assert feed._maybe_force_reconnect() is True
+    assert feed._maybe_force_reconnect() is False       # still within cooldown
+    assert feed.stats.forced_reconnects == 1
+
+    clock.advance(get_settings().angel_reconnect_max_seconds + 1)
+    assert feed._maybe_force_reconnect() is True         # cooldown elapsed, still stalled
+    assert feed.stats.forced_reconnects == 2
+
+
+def test_a_socket_that_never_finishes_closing_does_not_wedge_the_watchdog(
+        monkeypatch):
+    """The 21-Sep-2026 failure, as a test.
+
+    The Mac moved from wifi to a phone hotspot mid-session. The Angel socket
+    stayed ESTABLISHED from a local address no interface held any more, so
+    no FIN or RST could ever arrive and close_connection() — which sends a
+    close frame before websocket-client applies any timeout — never
+    returned. It was being called inline, so it took the watchdog thread
+    down with it: one kick at 09:58:34, then nothing, and a feed that was
+    dead until someone restarted the process. `forced_reconnects` frozen at
+    1 next to `reconnects` 0 is the fingerprint.
+
+    What matters is not that the close succeeds — against a stranded socket
+    it cannot — but that failing to close costs nothing but the thread doing
+    it, and the watchdog is still able to kick again when the cooldown is up.
+    """
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, clock = a_feed()
+    feed._on_data(None, ltp())
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class StrandedSocket(FakeSocket):
+        def close_connection(self):
+            entered.set()
+            release.wait(timeout=10)      # never returns on its own
+
+    feed._socket = StrandedSocket(feed._session)
+    clock.advance(get_settings().angel_force_reconnect_seconds + 1)
+
+    try:
+        started = time.monotonic()
+        assert feed._maybe_force_reconnect() is True
+        elapsed = time.monotonic() - started
+
+        assert entered.wait(timeout=5), "the close was never attempted"
+        # The assertion that fails if this is ever moved back inline: the
+        # kick has to return while the close is still hanging, not after it
+        # gives up. Without this the test passes either way, just slowly.
+        assert elapsed < 1.0, f"the kick blocked on the close for {elapsed:.1f}s"
+        assert not release.is_set()
+
+        # And the watchdog can still act, which it could not when inline.
+        clock.advance(get_settings().angel_reconnect_max_seconds + 1)
+        assert feed._maybe_force_reconnect() is True
+        assert feed.stats.forced_reconnects == 2
+    finally:
+        release.set()
+
+
+def test_the_stall_watchdog_survives_a_failing_check():
+    """This thread is the only thing that notices a stalled socket, so an
+    exception escaping the check would leave the feed with no way back for
+    the rest of the session — the same outcome the watchdog exists to
+    prevent, arrived at from the other direction."""
+    feed, _, _ = a_feed()
+    calls = []
+
+    def explode():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("clock went backwards")
+        feed._stopping.set()
+
+    feed._maybe_force_reconnect = explode
+    feed._watch_for_stall(interval=0)     # returns only if it survived #1
+
+    assert len(calls) == 2
+
+
+def test_the_vendor_socket_is_built_with_a_bound_on_silence(monkeypatch):
+    """The SDK pings every 10s and never checks that a pong came back, so a
+    peer that stops answering is pinged forever and `connect()` never
+    returns — which is why `_supervise`'s reconnect loop could not run. The
+    socket also needs a plain timeout: websocket-client applies one only if
+    it is set globally, and without it a send to an unreachable peer blocks
+    for good."""
+    import ssl as _ssl
+
+    recorded = {}
+
+    class FakeWsApp:
+        def __init__(self, *a, **kw):
+            pass
+
+        def run_forever(self, **kwargs):
+            recorded.update(kwargs)
+
+    fake_ws = type(sys)("websocket")
+    fake_ws.WebSocketApp = FakeWsApp
+    fake_ws.setdefaulttimeout = lambda t: recorded.__setitem__("default_timeout", t)
+
+    class FakeSmartSocket:
+        ROOT_URI = "wss://example.invalid/socket"
+        HEART_BEAT_INTERVAL = 10
+
+        def __init__(self, auth_token, api_key, client_code, feed_token,
+                     max_retry_attempt=1):
+            self.auth_token, self.api_key = auth_token, api_key
+            self.client_code, self.feed_token = client_code, feed_token
+
+        def _on_open(self, *a): pass
+        def _on_error(self, *a): pass
+        def _on_close(self, *a): pass
+        def _on_data(self, *a): pass
+        def _on_ping(self, *a): pass
+        def _on_pong(self, *a): pass
+
+    fake_sdk = type(sys)("SmartApi.smartWebSocketV2")
+    fake_sdk.SmartWebSocketV2 = FakeSmartSocket
+    monkeypatch.setitem(sys.modules, "websocket", fake_ws)
+    monkeypatch.setitem(sys.modules, "ssl", _ssl)
+    monkeypatch.setitem(sys.modules, "SmartApi.smartWebSocketV2", fake_sdk)
+
+    from app.workers.angel_feed import (PING_TIMEOUT_SECONDS,
+                                        SOCKET_TIMEOUT_SECONDS, _build_socket)
+
+    _build_socket(a_session()).connect()
+
+    assert recorded["ping_timeout"] == PING_TIMEOUT_SECONDS
+    assert recorded["ping_interval"] == FakeSmartSocket.HEART_BEAT_INTERVAL
+    assert recorded["default_timeout"] == SOCKET_TIMEOUT_SECONDS
+    # websocket-client refuses a ping_timeout at or above the interval.
+    assert PING_TIMEOUT_SECONDS < FakeSmartSocket.HEART_BEAT_INTERVAL
+
+
+def test_a_stalled_socket_is_never_kicked_outside_market_hours(monkeypatch):
+    """A quiet socket after the close is the market being shut, not a
+    stall — kicking it would just start a login loop against a server with
+    nothing to send."""
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: False)
+    feed, _, clock = a_feed()
+    feed._on_data(None, ltp())
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+    clock.advance(get_settings().angel_force_reconnect_seconds + 1)
+
+    assert feed._maybe_force_reconnect() is False
+    assert socket.closed is False
+
+
+def test_a_feed_that_has_never_ticked_is_not_kicked(monkeypatch):
+    """No tick yet is not a stall — `age_seconds()` is None, and a socket
+    still connecting must not be closed out from under it."""
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    feed, _, _ = a_feed()
+    socket = FakeSocket(feed._session)
+    feed._socket = socket
+
+    assert feed._maybe_force_reconnect() is False
+    assert socket.closed is False
+
+
+def test_the_watchdog_loop_runs_and_reconnects_a_real_stall(monkeypatch):
+    """The loop, not just the predicate in isolation: a real background
+    thread notices a real stall and the real supervisor recovers from it."""
+    monkeypatch.setattr("app.workers.angel_feed.market_is_open", lambda: True)
+    monkeypatch.setenv("ANGEL_FORCE_RECONNECT_SECONDS", "0.05")
+    monkeypatch.setenv("ANGEL_RECONNECT_MIN_SECONDS", "0.01")
+    monkeypatch.setenv("ANGEL_RECONNECT_MAX_SECONDS", "0.02")
+    get_settings.cache_clear()
+
+    feed, _, _ = a_feed(clock=lambda: datetime.now(UTC))
+    assert feed.start() is True
+    _wait_until(lambda: len(FakeSocket.instances) >= 1)
+    feed._on_data(None, ltp(stamp=datetime.now(UTC)))   # one tick, then silence
+
+    watchdog = threading.Thread(
+        target=feed._watch_for_stall, kwargs={"interval": 0.02}, daemon=True)
+    watchdog.start()
+
+    _wait_until(lambda: feed.stats.forced_reconnects >= 1, timeout=3)
+    _wait_until(lambda: len(FakeSocket.instances) >= 2, timeout=3)
+    feed.stop()
+    watchdog.join(timeout=1)
+
+
+# ---- the option universe maintenance loop ----------------------------------
+#
+# This loop had no coverage at all, and it shipped two faults that between
+# them cost the desk its live option chain for a whole session on
+# 16-Sep-2026: it never noticed its contracts had expired, and it never
+# retried a subscribe that failed. Both are below.
+
+class _Universe:
+    """Just enough of `option_universe.Universe` for the loop."""
+
+    def __init__(self, tokens=("1", "2"), expiry="2026-09-15", stale=False):
+        self.tokens = list(tokens)
+        self.expiry = expiry
+        self.contracts = list(tokens)
+        self._stale = stale
+
+    def needs_refresh(self, spot, *, margin=5, on=None):
+        return self._stale
+
+    def to_dict(self):
+        return {"expiry": self.expiry, "contracts": len(self.contracts)}
+
+
+def _one_pass(feed, monkeypatch, universe):
+    """Run `_maintain_options` for exactly one iteration."""
+    from app.workers import option_chain_live
+
+    # `universe` is a read-only property; the backing attribute is what
+    # `set_universe` writes, and going through that would also rebuild
+    # the quote table this test does not care about.
+    monkeypatch.setattr(option_chain_live.CHAIN, "_universe", universe,
+                        raising=False)
+    monkeypatch.setenv("ANGEL_OPTIONS_ENABLED", "true")
+    get_settings.cache_clear()
+
+    feed.stats.last_price = 23_200.0
+    # Stop after the first pass: the loop checks this before sleeping and
+    # again at the top, so setting it leaves exactly one iteration.
+    original_wait = feed._stopping.wait
+
+    def wait_once(_timeout=None):
+        feed._stopping.set()
+        return original_wait(0)
+
+    monkeypatch.setattr(feed._stopping, "wait", wait_once)
+    feed._maintain_options(master_fn=lambda: [], interval=0)
+
+
+def test_a_universe_that_never_reached_the_socket_is_subscribed_again(
+        monkeypatch):
+    """The fault that cost a whole session.
+
+    `_subscribe_options` swallows its own failures deliberately — the
+    index feed is why the socket exists and the chain must never cost
+    the price. But nothing then tried again. A universe stayed installed,
+    `needs_refresh` answered "no" quite correctly, and the loop skipped
+    past it every thirty seconds for the rest of the day.
+
+    Measured 16-Sep-2026: "option subscribe failed: Connection is already
+    closed" at the open, then 0 of 80 contracts quoted all morning while
+    the desk ran on the 60-second poll and the dashboard said only
+    "POLL".
+    """
+    feed, _, _ = a_feed()
+    socket = FakeSocket()
+    feed._socket = socket
+    universe = _Universe()
+
+    # First attempt fails the way the live one did.
+    def refuse(*_a, **_k):
+        raise RuntimeError("Connection is already closed.")
+
+    socket.subscribe = refuse
+    _one_pass(feed, monkeypatch, universe)
+    assert feed._subscribed_universe is not universe
+    assert "subscribe failed" in (feed.stats.last_error or "")
+
+    # The socket comes back; the very next pass must try again rather
+    # than treat the installed universe as settled.
+    feed._stopping.clear()
+    calls = []
+    socket.subscribe = lambda *a: calls.append(a)
+    _one_pass(feed, monkeypatch, universe)
+
+    assert calls, "a universe that never reached the socket must be retried"
+    assert feed._subscribed_universe is universe
+
+
+def test_a_universe_already_on_the_socket_is_not_resubscribed_each_cycle(
+        monkeypatch):
+    """The other half. Retrying is cheap; retrying forever is a request
+    storm every thirty seconds for the life of the session."""
+    feed, _, _ = a_feed()
+    socket = FakeSocket()
+    feed._socket = socket
+    universe = _Universe()
+
+    _one_pass(feed, monkeypatch, universe)
+    assert feed._subscribed_universe is universe
+    before = len(socket.subscriptions)
+
+    feed._stopping.clear()
+    _one_pass(feed, monkeypatch, universe)
+    assert len(socket.subscriptions) == before, (
+        "a universe already on the socket must not be resubscribed")

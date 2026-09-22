@@ -24,10 +24,11 @@ import {
 } from "lightweight-charts";
 
 import { getJSON } from "./api.js";
+import { OVERLAY_COLORS, THEME as PALETTE } from "./theme.js";
 import {
   BAR_SECONDS, applyTick, formatStampIST, formatTickIST, mergeLive,
-  mergeOlder, priceLines, shouldLoadOlder, toCandleSeries, toCloseSeries,
-  toLineSeries, toSessionSeries,
+  mergeOlder, mergeRecent, priceLines, shouldLoadOlder, toCandleSeries,
+  toCloseSeries, toLineSeries, toSessionSeries,
 } from "./chart-data.js";
 
 export const PRICE_STYLES = ["candles", "line"];
@@ -37,17 +38,28 @@ export const PRICE_STYLES = ["candles", "line"];
    inside the endpoint's own 1500 ceiling. */
 const PAGE_BARS = 500;
 
+/* How often the archive's recent end is re-fetched to heal the overlay gap
+   `mergeLive` leaves behind. See `mergeRecent` for why this exists at all:
+   the initial archive load runs once, on mount, and every bar formed since
+   then carries prices only, with no VWAP, EMA or ATR. A tab open through a
+   session accumulates hours of that, not one bar. Two minutes bounds how
+   long the overlays can be visibly missing without asking the backend for
+   its (fully enriched, ~500-bar) recent window every few seconds. */
+export const RECENT_REFRESH_MS = 120_000;
+
 /* The terminal's palette, so the chart is part of the desk rather than a
    widget dropped onto it. */
+/* One palette for the whole desk; see theme.js for why it is mirrored
+   out of the stylesheet at all. */
 const THEME = {
-  up: "#4ec9a0",
-  down: "#e06c75",
-  grid: "#1c2128",
-  text: "#7d8590",
-  vwap: "#e3a008",
-  ema20: "#d7a13b",
-  ema50: "#4a9eff",
-  ema200: "#a970ff",
+  up: PALETTE.up,
+  down: PALETTE.down,
+  grid: PALETTE.grid,
+  text: PALETTE.dim,
+  vwap: OVERLAY_COLORS.vwap,
+  ema20: OVERLAY_COLORS.ema20,
+  ema50: OVERLAY_COLORS.ema50,
+  ema200: OVERLAY_COLORS.ema200,
 };
 
 const OVERLAYS = [
@@ -103,6 +115,7 @@ export default function PriceChart({ candles, signal, price: tick,
   const loading = useRef(false);
   const oldest = useRef(null);
   const rowsRef = useRef([]);
+  const refreshingRecent = useRef(false);
 
   rowsRef.current = rows;
 
@@ -143,6 +156,29 @@ export default function PriceChart({ candles, signal, price: tick,
       setRows((current) => mergeLive(current, candles));
     }
   }, [candles]);
+
+  /* Heal the gap `mergeLive` leaves behind: everything it adds is prices
+     only, and nothing else ever re-asks the archive for its recent end.
+     Deliberately silent — no `busy` flag — because this is upkeep the user
+     did not ask for and should not see a "loading…" label for. */
+  const refreshRecent = useCallback(async () => {
+    if (refreshingRecent.current) return;
+    refreshingRecent.current = true;
+    try {
+      const page = await fetchOlder();
+      const recent = page?.candles || [];
+      if (recent.length) {
+        setRows((current) => mergeRecent(current, recent));
+      }
+    } finally {
+      refreshingRecent.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(refreshRecent, RECENT_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [refreshRecent]);
 
   /* Build the chart once. Rebuilding it on every data change would reset
      the user's zoom, which is the one thing this rewrite exists to give

@@ -53,10 +53,12 @@ which is the only honest way to decide it later.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 
@@ -166,12 +168,136 @@ class FetchResult:
 
 # ---- the instrument master -------------------------------------------
 
-def load_master(fetch=None) -> list[dict]:
-    """The public instrument dump. ~140k rows, a few seconds to pull."""
+# Where a downloaded master is kept between runs. Not in `logs/` — this is
+# state the desk reads back, not a record of what happened.
+MASTER_CACHE_DIR = Path("var/cache")
+
+# The file is ~34MB over one connection and the tail is the part that goes
+# missing: observed truncating at 23.1MB and again at 8.4MB on 15-Sep-2026,
+# both reported as a clean 200 whose body then stopped.
+MASTER_ATTEMPTS = 3
+MASTER_RETRY_SECONDS = 2.0
+
+
+def _master_cache_file(directory: Path, day: date) -> Path:
+    return directory / f"instrument-master-{day.isoformat()}.json"
+
+
+def _cached_masters(directory: Path) -> list[tuple[date, Path]]:
+    """Every cached master on disk, newest day first."""
+    found: list[tuple[date, Path]] = []
+    try:
+        entries = list(directory.glob("instrument-master-*.json"))
+    except OSError:
+        return []
+    for path in entries:
+        stamp = path.stem.removeprefix("instrument-master-")
+        try:
+            found.append((date.fromisoformat(stamp), path))
+        except ValueError:
+            continue
+    return sorted(found, reverse=True)
+
+
+def _download_master(attempts: int, pause: float) -> str:
+    """The master as text, retried, because the download is not reliable."""
+    import httpx
+
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = httpx.get(MASTER_URL, timeout=120)
+            response.raise_for_status()
+            return response.text
+        except Exception as exc:                          # noqa: BLE001
+            last = exc
+            log.warning("instrument master download attempt %d/%d failed: %s",
+                        attempt, attempts, exc)
+            if attempt < attempts:
+                time.sleep(pause * attempt)
+    raise AngelHistoryError(
+        f"could not download the instrument master after {attempts} "
+        f"attempts: {last}")
+
+
+def load_master(fetch=None, *, cache_dir: Path | str | None = None,
+                on: date | None = None, attempts: int = MASTER_ATTEMPTS,
+                pause: float = MASTER_RETRY_SECONDS) -> list[dict]:
+    """The public instrument dump. ~140k rows, cached for the day.
+
+    Three things happen here that did not before, and each of them was a
+    live outage on 15-Sep-2026:
+
+    **It is cached by date.** The master is republished once a morning, so
+    fetching it again inside the same day is 34MB spent to receive what we
+    already had. Every restart paid that toll, and the option stream sat
+    dark for the ten seconds it took — longer when it failed.
+
+    **The download is retried.** A single truncated body used to leave the
+    desk with no option universe at all. The live option chain then falls
+    back to the polled NSE snapshot, which is a minute behind instead of
+    four hundred milliseconds, and nothing says so louder than one WARNING.
+
+    **A stale copy beats no copy.** If today's master will not download but
+    yesterday's is on disk, the desk uses yesterday's and says so. Expiries
+    already listed stay listed and their tokens do not move; the only thing
+    an old master can lack is a contract listed this morning. A chain built
+    from yesterday's tokens is worth vastly more than no live chain, and
+    `option_universe.build` still drops anything already expired.
+
+    `fetch` stays the test seam it always was, and bypasses all of this.
+    """
     if fetch is not None:
         return fetch()
-    import httpx
-    return httpx.get(MASTER_URL, timeout=120).json()
+
+    day = on or date.today()
+    directory = Path(cache_dir) if cache_dir is not None else MASTER_CACHE_DIR
+    todays = _master_cache_file(directory, day)
+
+    if todays.exists():
+        try:
+            return json.loads(todays.read_text())
+        except (OSError, ValueError) as exc:
+            # A half-written or corrupt cache must not be sticky.
+            log.warning("cached instrument master %s unreadable (%s); "
+                        "fetching a fresh one", todays, exc)
+            todays.unlink(missing_ok=True)
+
+    try:
+        text = _download_master(attempts, pause)
+        rows = json.loads(text)
+    except Exception as exc:                              # noqa: BLE001
+        for stamp, path in _cached_masters(directory):
+            if stamp >= day:
+                continue
+            try:
+                rows = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            log.warning(
+                "could not fetch today's instrument master (%s) — falling "
+                "back to the copy from %s. Contracts listed since then are "
+                "missing; everything already listed is unchanged.",
+                exc, stamp)
+            return rows
+        raise
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        # Written beside the target and moved into place, so a download cut
+        # short cannot leave a half-file that reads as a valid cache.
+        partial = todays.with_suffix(".partial")
+        partial.write_text(text)
+        partial.replace(todays)
+    except OSError as exc:
+        log.warning("could not cache the instrument master (%s); "
+                    "it will be downloaded again next time", exc)
+    else:
+        for stamp, path in _cached_masters(directory):
+            if stamp < day:
+                path.unlink(missing_ok=True)
+
+    return rows
 
 
 def validate_token(token: str, master: list[dict]) -> dict:

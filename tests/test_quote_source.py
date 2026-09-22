@@ -269,3 +269,50 @@ def test_a_forming_bar_already_on_the_grid_is_left_alone(monkeypatch, broker):
 
     assert len(df) == 3
     assert df.iloc[-1]["close"] == 101.0
+
+
+def test_a_lone_off_grid_bar_is_snapped_to_its_bucket(monkeypatch, broker):
+    """The case the duplicate-pair fix above missed, and what it cost.
+
+    That fix only folded a stray row when a *properly aligned* row for the
+    same bucket sat beside it. Yahoo does not always send the pair: the
+    still-forming bar can arrive alone, stamped at the instant of the
+    refresh rather than at its bucket start, with no twin to detect it by.
+
+    A lone off-grid row then reached the browser untouched, and the live
+    chart asked lightweight-charts to move its last bar backwards — from
+    07:43:12 to 07:40:00 — which the library refuses:
+
+        Cannot update oldest data, last time=..., new time=...
+
+    Nothing caught that throw, so it unmounted the whole dashboard and
+    left a black page until the bucket rolled over a few minutes later and
+    the condition cleared on its own. On a fixed-width timeframe a bar's
+    timestamp is its bucket start, full stop.
+    """
+    closed = 1_800_000_000 - 300
+    aligned = 1_800_000_000
+    lone = aligned + 300 + 192            # next bucket, 3m12s in, no twin
+
+    payload = _candle_payload([
+        (closed, 100.0, 101.0, 99.0, 100.5, 10),
+        (aligned, 100.5, 102.0, 100.0, 101.5, 20),
+        (lone, 101.5, 103.0, 101.0, 102.5, 5),
+    ])
+    monkeypatch.setattr(freedata.curl_requests, "get",
+                        lambda *a, **k: FakeResponse(payload))
+
+    df = broker.candles("NIFTY", "5m", days=1)
+
+    assert len(df) == 3, "a lone row is snapped, not merged away"
+    stamps = list(df["timestamp"])
+    assert all(t.minute % 5 == 0 and t.second == 0 for t in stamps), (
+        f"every bar must sit on the 5-minute grid, got {stamps}")
+    last = df.iloc[-1]
+    assert last["timestamp"] == pd.Timestamp(aligned + 300, unit="s", tz="UTC")
+    # snapped, not altered: its own values survive intact
+    assert last["open"] == 101.5
+    assert last["high"] == 103.0
+    assert last["low"] == 101.0
+    assert last["close"] == 102.5
+    assert last["volume"] == 5

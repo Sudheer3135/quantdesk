@@ -328,15 +328,25 @@ def test_market_hours_has_one_definition():
     """Open and close times lived in three modules at once — the agent, the
     ticker and the stream. Three copies is three chances to disagree, and
     the first symptom would be the dashboard calling the market open while
-    the agent had already stopped for the day."""
+    the agent had already stopped for the day.
+
+    The regex also catches a bare (9, 15) / (15, 30) tuple, not only a
+    `time(9, 15)` constructor call. Both `indicators.py` and
+    `optionbuy/contracts.py` restated the session boundary as one of these
+    and slipped past a version of this guard that only looked for the
+    constructor form — an escape route this closes rather than a
+    hypothetical one."""
     import re
 
     backend = Path(__file__).resolve().parents[1] / "backend"
     offenders = []
+    pattern = re.compile(
+        r"time\(\s*9,\s*15\s*\)|time\(\s*15,\s*30\s*\)"
+        r"|[=(]\s*\(\s*9,\s*15\s*\)|[=(]\s*\(\s*15,\s*30\s*\)")
     for path in (backend / "app").rglob("*.py"):
         if path.name == "market_hours.py":
             continue
-        if re.search(r"time\(9,\s*15\)|time\(15,\s*30\)", path.read_text()):
+        if pattern.search(path.read_text()):
             offenders.append(path.name)
     assert not offenders, f"market hours redefined in: {offenders}"
 

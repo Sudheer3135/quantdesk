@@ -27,7 +27,7 @@ The result is usually worse than the index backtest. That is the point.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -38,6 +38,7 @@ from ..risk.manager import DayState, RiskConfig, evaluate
 from . import costs as costs_module
 from .costs import CostModel, FlatCostModel, SlippageModel, buy_fill, describe, sell_fill
 from .feed import HistoricalFeed
+from .measurement import PositionLedger, provenance
 
 
 @dataclass
@@ -72,6 +73,11 @@ class OptionTrade:
     # Without this you can measure whether the combined score works, but
     # never which part of it is carrying or dragging.
     checks: dict = field(default_factory=dict)
+
+    gross_pnl: float = 0.0
+    execution_friction: float = 0.0
+    fees: float = 0.0
+    timing: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -143,6 +149,9 @@ def compute_stats(trades: list[OptionTrade], equity: list[float],
         "losses": int(len(losses)),
         "win_rate_pct": round(len(wins) / len(trades) * 100, 2),
         "net_pnl": round(float(pnls.sum()), 2),
+        "gross_pnl": round(sum(t.gross_pnl for t in trades), 2),
+        "execution_friction": round(sum(t.execution_friction for t in trades), 2),
+        "fees_taxes": round(sum(t.fees for t in trades), 2),
         "return_pct": round(float(pnls.sum()) / starting_capital * 100, 2),
         "expectancy_per_trade": round(float(pnls.mean()), 2),
         "expectancy_r": round(float(rs.mean()), 3),
@@ -188,7 +197,7 @@ def run(
     default. See `backtest/costs.py`.
     """
     feed = HistoricalFeed(candles, analysis_window=analysis_window)
-    cfg = risk_config or RiskConfig(capital=starting_capital, lot_size=lot_size)
+    cfg = replace(risk_config) if risk_config else RiskConfig(capital=starting_capital, lot_size=lot_size)
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
 
     costs = cost_model or (
@@ -203,10 +212,13 @@ def run(
     trades: list[OptionTrade] = []
     day_states: dict[date, DayState] = {}
     open_trade: dict | None = None
+    ledger = PositionLedger()
+    initial_risk = asdict(cfg)
+    custom_signal = signal_fn
 
-    for i in feed.walk(warmup):
+    for i in feed.walk(warmup, reserve=0):
         bar = feed.bar(i)
-        moment = feed.ist(i).to_pydatetime().replace(tzinfo=None)
+        moment = feed.close_time(i).tz_convert("Asia/Kolkata").to_pydatetime().replace(tzinfo=None)
         state = day_states.setdefault(moment.date(), DayState(trading_day=moment.date()))
 
         # ---- manage an open position ---------------------------------
@@ -221,13 +233,18 @@ def run(
 
             index_exit, reason = None, ""
             if hit_stop:                      # pessimistic: stop fills first
-                index_exit, reason = open_trade["stop"], "stop"
+                stop = open_trade["stop"]
+                index_exit = min(stop, float(bar["open"])) if open_trade["direction"] == "BUY" else max(stop, float(bar["open"]))
+                reason = "stop_gap" if index_exit != stop else "stop"
             elif hit_target:
                 index_exit, reason = open_trade["target"], "target"
             elif i - open_trade["entry_index"] >= max_bars_in_trade:
                 index_exit, reason = index_now, "time"
-            elif feed.ist(i).time().hour >= 15 and feed.ist(i).time().minute >= 15:
+            elif moment.hour * 60 + moment.minute >= 15 * 60 + 15:
                 index_exit, reason = index_now, "session end"
+
+            if index_exit is None and (i == len(feed) - 1 or not feed.can_enter(i)):
+                index_exit, reason = float(bar["close"]), "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
 
             if index_exit is not None:
                 quoted_exit = option_pricing.price(
@@ -255,7 +272,7 @@ def run(
                 equity += pnl
                 trades.append(OptionTrade(
                     entry_time=open_trade["entry_time"],
-                    exit_time=feed.timestamp(i).isoformat(),
+                    exit_time=feed.close_time(i).isoformat(),
                     direction=open_trade["direction"],
                     option=f"{open_trade['strike']:.0f} {open_trade['kind']}",
                     strike=open_trade["strike"], kind=open_trade["kind"],
@@ -272,12 +289,20 @@ def run(
                     checks=open_trade["checks"],
                     costs=charges.to_dict(),
                     premium_source="modelled",
+                    gross_pnl=round((exit_fill.requested-open_trade["entry_reference"]) * qty, 2),
+                    execution_friction=round((open_trade["entry_friction"]+exit_fill.slippage)*qty, 2),
+                    fees=round(charges.total, 2),
+                    timing=open_trade["timing"],
                 ))
+                pnl = round(pnl, 2)
+                # Account balances reconcile exactly to the reported monetary ledger.
+                equity = starting_capital + sum(t.pnl for t in trades)
+                ledger.close(feed.close_time(i), reason, pnl)
                 state.record_close(pnl)
                 curve.append(equity)
                 open_trade = None
 
-        if open_trade:
+        if open_trade or not feed.can_enter(i):
             continue
 
         # ---- look for a new entry ------------------------------------
@@ -344,6 +369,8 @@ def run(
             continue
 
         open_trade = {
+            "entry_reference": entry_fill.requested, "entry_friction": entry_fill.slippage,
+            "timing": {"bar_open_time": feed.timestamp(i).isoformat(), "bar_close_time": feed.close_time(i).isoformat(), "signal_time": feed.close_time(i).isoformat(), "earliest_execution_time": feed.next_timestamp(i).isoformat()},
             "direction": sig.action, "strike": strike, "kind": kind,
             "expiry": expiry, "entry_years": years,
             "index_entry": entry_index,
@@ -356,6 +383,7 @@ def run(
             "confidence": sig.confidence,
             "checks": {c.name: round(c.contribution, 4) for c in sig.checks},
         }
+        ledger.enter(feed.close_time(i), feed.next_timestamp(i), decision.quantity)
         state.record_fill()
 
     return OptionBacktestResult(
@@ -371,5 +399,9 @@ def run(
             "warmup_bars": warmup,
             "max_bars_in_trade": max_bars_in_trade,
         },
-        dataset=dataset or {},
+        dataset=(dataset or {}) | {"reproducibility": provenance(candles,
+            {"risk": initial_risk, "costs": describe(costs, slip_model),
+             "warmup": warmup, "analysis_window": analysis_window,
+             "max_bars_in_trade": max_bars_in_trade}, custom_signal),
+             "positions": ledger.finish(trades, starting_capital, equity)},
     )

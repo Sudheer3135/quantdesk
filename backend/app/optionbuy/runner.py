@@ -23,6 +23,7 @@ from ..risk.manager import RiskConfig
 from . import chain, strategy
 from . import coverage as coverage_module
 from .contracts import SelectionConfig
+from ..backtest.costs import CostModel, SlippageModel
 from .coverage import CoverageReport
 from .pricing import MODELLED_ONLY, ModelAssumptions
 from .strategy import OptionBuyConfig, OptionBuyResult
@@ -57,6 +58,8 @@ class OptionBuyRequest:
     selection: SelectionConfig = field(default_factory=SelectionConfig)
     risk: RiskConfig | None = None
     model: ModelAssumptions = field(default_factory=ModelAssumptions)
+    costs: CostModel = field(default_factory=CostModel)
+    execution: SlippageModel = field(default_factory=SlippageModel)
 
 
 def execute(db: Session, request: OptionBuyRequest) -> OptionBuyResult:
@@ -103,6 +106,7 @@ def execute(db: Session, request: OptionBuyRequest) -> OptionBuyResult:
     return strategy.run(
         candles, store=store, config=request.run, risk_config=risk,
         selection=request.selection, model=request.model,
+        cost_model=request.costs, slippage_model=request.execution,
         dataset=dataset, coverage=report.to_dict())
 
 

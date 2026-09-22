@@ -28,7 +28,7 @@ import json
 import logging
 import threading
 from contextlib import nullcontext
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
 
@@ -463,8 +463,17 @@ class PaperTrader:
         todays = db.scalars(select(PaperPosition).where(
             PaperPosition.strategy == NAME, PaperPosition.session_date == today)
             .order_by(PaperPosition.id)).all()
-        rows = [_Journal(r) for r in todays]
-        return day_state_from_trades(today, rows, [r for r in rows if r.status == "open"])
+        open_now = db.scalars(select(PaperPosition).where(
+            PaperPosition.strategy == NAME, PaperPosition.status == "open")).all()
+        start = datetime.combine(today, datetime.min.time(), tzinfo=IST).astimezone(UTC)
+        closed_today = db.scalars(select(PaperPosition).where(
+            PaperPosition.strategy == NAME, PaperPosition.status == "closed",
+            PaperPosition.closed_at >= start,
+            PaperPosition.closed_at < start + timedelta(days=1))
+            .order_by(PaperPosition.closed_at, PaperPosition.id)).all()
+        return day_state_from_trades(
+            today, [_Journal(r) for r in todays], [_Journal(r) for r in open_now],
+            closed_today=[_Journal(r) for r in closed_today])
 
     # ---- records and publishing ---------------------------------------------------
 
@@ -520,9 +529,6 @@ class PaperTrader:
             equity = self._equity(db)
             state = self._day_state(db, today)
             open_row = db.get(PaperPosition, self._open_id) if self._open_id else None
-            closed_today = db.scalars(select(PaperPosition).where(
-                PaperPosition.strategy == NAME, PaperPosition.status == "closed",
-                PaperPosition.session_date == today)).all()
             counts = dict(db.execute(select(PaperDecision.code, func.count()).where(
                 PaperDecision.strategy == NAME, PaperDecision.session_date == today)
                 .group_by(PaperDecision.code)).all())
@@ -551,7 +557,7 @@ class PaperTrader:
                 "starting_capital": cfg.paper_capital,
                 "equity": round(equity, 2),
                 "realised_total": round(equity - cfg.paper_capital, 2),
-                "realised_today": round(sum(r.pnl or 0 for r in closed_today), 2),
+                "realised_today": round(state.realised_pnl, 2),
                 "trades_today": state.trades_taken,
                 "consecutive_losses": state.consecutive_losses,
                 "max_trades_per_day": cfg.max_trades_per_day,
@@ -579,7 +585,8 @@ class _Journal:
     def __init__(self, row: PaperPosition) -> None:
         self.status = row.status
         self.pnl = row.pnl
-        self.created_at = _aware(row.closed_at or row.opened_at)
+        self.created_at = _aware(row.opened_at)
+        self.closed_at = _aware(row.closed_at)
 
 
 def _signal_summary(sig: dict) -> dict:
@@ -620,4 +627,3 @@ def start() -> bool:
 
 def stop() -> None:
     TRADER.stop()
-

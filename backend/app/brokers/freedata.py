@@ -166,31 +166,38 @@ class FreeDataBroker(Broker):
         # (23307.40 on all four fields) — the real bucket's range gone,
         # replaced by a doji sitting off the 5-minute grid.
         #
-        # Two rows for one bucket is what breaks a live chart's tick merge:
-        # the desk buckets a fresh tick by flooring its own timestamp, so a
-        # tick inside [07:35, 07:40) floors to 07:35:00 — earlier than the
-        # stray row's 07:39:24 — and is silently rejected as belonging to a
-        # bar already in the past. Folding the stray row back into its
-        # bucket fixes that at the source: the aligned row's range wins,
-        # the stray row's price becomes the close since it is the later
-        # print, and the row count only ever shrinks by the duplicate.
+        # An off-grid row breaks a live chart's tick merge: the desk buckets
+        # a fresh tick by flooring its own timestamp, so a tick inside
+        # [07:35, 07:40) floors to 07:35:00 — earlier than the stray row's
+        # 07:39:24. The chart then either rejects the tick as belonging to
+        # a bar already in the past (the bar freezes until the next
+        # boundary) or, once it stopped rejecting it, asks the renderer to
+        # move the last bar backwards, which lightweight-charts refuses
+        # with "Cannot update oldest data" — an uncaught throw that
+        # unmounted the dashboard and left a black page.
+        #
+        # So the rule is applied to the whole frame, not just to a detected
+        # duplicate pair. On a fixed-width timeframe a bar's timestamp *is*
+        # its bucket start by definition, and anything else is the source
+        # describing itself badly. Snapping every row and aggregating the
+        # collisions covers the duplicate case and, importantly, the case
+        # that a narrower fix missed: a lone off-grid forming row with no
+        # properly aligned twin, which passed straight through. Where a
+        # bucket ends up holding several rows the first row's open and the
+        # last row's close survive, which is what those fields mean.
         minutes = TIMEFRAME_MINUTES.get(interval)
-        if minutes and len(df) >= 2:
+        if minutes and not df.empty:
             bucket = df["timestamp"].dt.floor(f"{minutes}min")
-            stray = (bucket.iloc[-1] == bucket.iloc[-2]
-                    and df["timestamp"].iloc[-1] != bucket.iloc[-1])
-            if stray:
-                tail = df.iloc[-2:]
-                merged = pd.DataFrame([{
-                    "timestamp": bucket.iloc[-1],
-                    "open": tail["open"].iloc[0],
-                    "high": tail["high"].max(),
-                    "low": tail["low"].min(),
-                    "close": tail["close"].iloc[-1],
-                    "volume": tail["volume"].sum(),
-                }])
-                df = pd.concat([df.iloc[:-2], merged], ignore_index=True)
+            if not bucket.equals(df["timestamp"]):
+                df = (df.assign(timestamp=bucket)
+                        .groupby("timestamp", as_index=False)
+                        .agg(open=("open", "first"), high=("high", "max"),
+                             low=("low", "min"), close=("close", "last"),
+                             volume=("volume", "sum"))
+                        .sort_values("timestamp")
+                        .reset_index(drop=True))
 
+        df.attrs["volume_is_synthetic"] = True
         return df
 
     def _yahoo_quote(self, symbol: str) -> dict:

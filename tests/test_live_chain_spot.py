@@ -55,6 +55,22 @@ def with_price(monkeypatch, price):
                         lambda key: {"price": price} if key == "price:latest" else None)
 
 
+def test_option_only_outage_uses_http_fallback(streamed, monkeypatch):
+    snapshot = option_chain_live.CHAIN.snapshot()
+    snapshot["newest_age_seconds"] = 16.0
+    cached = {"transport": "poll", "symbol": "NIFTY", "strikes": []}
+    monkeypatch.setattr(market_api, "get_json", lambda key: cached)
+    assert market_api.live_chain() is None
+    assert market_api.option_chain("NIFTY") == cached
+
+
+def test_quiet_wings_do_not_hide_a_chain_with_fresh_quotes(streamed, monkeypatch):
+    snapshot = option_chain_live.CHAIN.snapshot()
+    snapshot.update(newest_age_seconds=0.2, oldest_age_seconds=600.0)
+    with_price(monkeypatch, 24000)
+    assert market_api.live_chain()["transport"] == "stream"
+
+
 def test_the_summary_uses_the_live_spot_not_the_band_centre(streamed, monkeypatch):
     with_price(monkeypatch, 24_022.75)
     summary = market_api.live_chain()["summary"]

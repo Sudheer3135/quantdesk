@@ -201,7 +201,10 @@ def test_the_risk_decision_is_stored_on_the_trade():
     assert trade.risk["approved"] is True
     assert trade.risk["quantity"] == trade.quantity
     assert trade.quantity % 75 == 0
-    assert any("Risking 1.0%" in r for r in trade.risk["reasons"])
+    assert trade.risk["risk_amount"] == pytest.approx(
+        trade.quantity * trade.risk["risk_per_unit"])
+    actual_pct = trade.risk["risk_amount"] / 200_000 * 100
+    assert any(f"Risking {actual_pct:.2f}%" in r for r in trade.risk["reasons"])
 
 
 def test_sizing_is_in_premium_terms_not_index_points():
@@ -336,7 +339,7 @@ def test_a_mixed_trade_is_labelled_mixed_rather_than_the_better_half():
 def test_costs_are_itemised_and_subtracted_from_the_gross():
     trade = go().trades[0]
     assert trade.costs["total"] > 0
-    assert trade.pnl == pytest.approx(trade.gross_pnl - trade.costs["total"],
+    assert trade.pnl == pytest.approx(trade.gross_pnl - trade.execution_friction - trade.costs["total"],
                                       abs=0.01)
     # For a retail option buyer the dominant charge is usually STT on the
     # sell leg, and that is only actionable if it is broken out.
@@ -414,7 +417,7 @@ def test_the_session_boundary_guard_fires_when_the_time_rule_is_disabled():
         warmup=20, pricing_policy=PREFER_OBSERVED,
         max_bars_in_trade=10_000, session_exit_ist=clock(23, 59)))
 
-    assert any(t.exit_reason == strategy.SESSION_BOUNDARY for t in result.trades)
+    assert any(t.exit_reason == "session_or_data_boundary" for t in result.trades)
 
 
 def test_an_expired_contract_is_settled_rather_than_held():

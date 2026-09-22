@@ -51,3 +51,28 @@ export function sameOIPicture(prev, next) {
   }
   return true;
 }
+
+/* Props equality for the strike ladder.
+
+   The ladder is the densest thing on the desk — up to eighty cells of
+   streaming premium — and it was the only panel still redrawing on
+   every price tick, because it takes the live spot as a prop and
+   nothing guarded it.
+
+   What the spot actually decides here is which strikes are listed, in
+   what order, and which side of each row is in the money. On a
+   50-point grid all three change only where the spot crosses a strike
+   or the midpoint between two, which is what `spotBand` already
+   measures for the OI chart. A 1.4-point wobble changes none of them,
+   so it must not cost a redraw of eighty cells.
+
+   What deliberately *does* redraw: a new chain object. Those arrive up
+   to four times a second carrying new premiums, and premiums are the
+   whole point of the panel — this guard exists to drop the renders
+   that show nothing new, not to throttle the ones that do. */
+export function sameLadder(prev, next) {
+  if (prev.chain !== next.chain) return false;
+  if (prev.nowMs !== next.nowMs) return false;
+  if (prev.skewMs !== next.skewMs) return false;
+  return spotBand(prev.spot) === spotBand(next.spot);
+}

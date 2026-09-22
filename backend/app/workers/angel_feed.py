@@ -55,6 +55,36 @@ ANGEL = "angel"
 # server has since expired.
 SESSION_MAX_AGE_SECONDS = 6 * 3600
 
+# Measured on 21-Sep-2026: the Mac moved from wifi to an iPhone hotspot at
+# 09:58 and the feed never came back. `lsof` showed the Angel socket still
+# ESTABLISHED from 10.124.17.242 — an address no interface held any more.
+# No FIN or RST can arrive on a socket whose source address is gone, so the
+# kernel kept it open and the SDK kept believing it was connected.
+#
+# Both numbers below exist to make that state impossible to stay in.
+#
+# The socket timeout is the important one. websocket-client only puts a
+# timeout on the underlying socket if one is set globally — `_app.py` does
+# `self.sock.settimeout(getdefaulttimeout())` and nothing else — so without
+# it every send() and recv() on a stranded socket blocks indefinitely. That
+# is what wedged the watchdog: it called close_connection(), which sends a
+# close frame *before* setting any timeout of its own, and never returned.
+# Only reached when the peer is unreachable; the read loop selects on the
+# socket rather than sitting in recv(), so a quiet market does not trip it.
+SOCKET_TIMEOUT_SECONDS = 15.0
+
+# Ping/pong is how a peer that is reachable but silent gets noticed. The SDK
+# passes ping_interval=10 and no ping_timeout, which sends pings and never
+# checks that a pong came back. With this set, websocket-client terminates
+# run_forever when a pong is late, `connect()` returns, and `_supervise`
+# reconnects on its own backoff — the recovery path that was already here
+# and could never run. Must stay below the SDK's 10s ping_interval, which
+# websocket-client enforces (`Ensure ping_interval > ping_timeout`).
+#
+# Judged on pongs, not on ticks, so a quiet-but-healthy socket outside
+# market hours is not mistaken for a dead one.
+PING_TIMEOUT_SECONDS = 5.0
+
 
 @dataclass
 class FeedStats:
@@ -88,6 +118,11 @@ class FeedStats:
     # quiet enough to justify changing source. A rising count here with
     # stale_events flat is the anti-flap gate doing its job.
     held_through: int = 0
+    # How many times the watchdog force-closed a socket that was still
+    # reporting itself connected but had gone silent past
+    # angel_force_reconnect_seconds. Each one is a stall the vendor SDK's
+    # own reconnect had not yet noticed on its own.
+    forced_reconnects: int = 0
     last_tick_at: datetime | None = None
     last_source_time: datetime | None = None
     last_price: float | None = None
@@ -134,11 +169,22 @@ class AngelFeed:
         self._socket = None
         self._thread: threading.Thread | None = None
         self._options_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._stopping = threading.Event()
         self._lock = threading.Lock()
         self._last_publish_at: datetime | None = None
         self._was_healthy = False
         self._unhealthy_streak = 0
+        # When the watchdog last forced a reconnect, so it kicks a given
+        # stall once and then waits rather than calling close_connection()
+        # on an already-closing socket every few seconds until a fresh tick
+        # finally arrives.
+        self._last_forced_reconnect_at: datetime | None = None
+        # The universe that last reached the socket *successfully*. Not
+        # the same thing as the one that is installed: a subscribe can
+        # fail on its own, and the difference between the two is what
+        # tells the maintenance loop to try again.
+        self._subscribed_universe = None
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -179,6 +225,12 @@ class AngelFeed:
                 target=self._maintain_options, name="angel-options", daemon=True)
             self._options_thread.start()
 
+        # Unconditional — this protects the core price feed, not an
+        # opt-in enhancement riding on top of it.
+        self._watchdog_thread = threading.Thread(
+            target=self._watch_for_stall, name="angel-watchdog", daemon=True)
+        self._watchdog_thread.start()
+
         log.info("Angel feed starting for token %s", settings.angel_nifty_token)
         return True
 
@@ -192,10 +244,13 @@ class AngelFeed:
         socket = self._socket
         self._socket = None
         if socket is not None:
-            try:
-                socket.close_connection()
-            except Exception as exc:
-                log.debug("Angel socket close failed: %s", exc)
+            # Off-thread for the same reason the watchdog is: a socket
+            # stranded by a network change never finishes closing, and
+            # shutdown must not wait on one. The join below is already
+            # bounded, so a socket that will not answer delays nothing.
+            threading.Thread(
+                target=self._close_quietly, args=(socket,),
+                name="angel-close", daemon=True).start()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
         self.stats.state = IDLE
@@ -333,12 +388,41 @@ class AngelFeed:
                 "stale_events": stats.stale_events,
                 "fallbacks": stats.fallbacks,
                 "held_through": stats.held_through,
+                "forced_reconnects": stats.forced_reconnects,
                 "option_ticks": stats.option_ticks,
                 "vix_ticks": stats.vix_ticks,
             },
             "latency_ms": {
+                # Read `feed_min` first, not `feed_p50`.
+                #
+                # Angel rounds `exchange_timestamp` to a whole second, so
+                # each feed sample is the true transit plus up to 1000ms of
+                # rounding, spread flat across that second. The percentiles
+                # therefore mostly measure the rounding: sampled
+                # 15-Sep-2026, p50 came to 562ms on a feed whose ticks were
+                # 97ms apart — the p50 was the artefact, not the feed.
+                #
+                # The minimum is the one statistic that rounding cannot
+                # inflate. Over a window some tick lands hard against the
+                # second boundary with almost no rounding left in it, so
+                # the floor converges on the real transit time; that same
+                # sample put it at 56ms. It is a floor, not an average, and
+                # the truth sits somewhere in [feed_min, feed_min +
+                # source_quantum_ms] — which is as narrow as this vendor's
+                # clock allows anyone to be.
+                "feed_min": (round(min(stats.feed_latency_ms), 2)
+                             if stats.feed_latency_ms else None),
                 "feed_p50": _percentile(stats.feed_latency_ms, 50),
                 "feed_p95": _percentile(stats.feed_latency_ms, 95),
+                # The width of the uncertainty above, so nobody has to
+                # rediscover it from the shape of a histogram. Read off the
+                # last tick rather than hard-coded, so the day Angel starts
+                # sending milliseconds this reports 0.0 and the caveat
+                # retires itself instead of outliving the problem.
+                "source_quantum_ms": prices.source_quantum_ms(
+                    stats.last_source_time),
+                # Ours, and measured against our own clock at both ends, so
+                # these carry no such caveat.
                 "publish_p50": _percentile(stats.publish_latency_ms, 50),
                 "publish_p95": _percentile(stats.publish_latency_ms, 95),
                 "samples": len(stats.feed_latency_ms),
@@ -572,6 +656,22 @@ class AngelFeed:
             current = option_chain_live.CHAIN.universe
             if current and not current.needs_refresh(
                     spot, margin=settings.angel_options_refresh_margin):
+                # Installed is not the same as subscribed. `_subscribe_
+                # options` swallows its own failures on purpose — the
+                # index feed is why this socket exists and the chain must
+                # not be able to cost the price — but nothing then ever
+                # tried again, so a single failed subscribe left the
+                # universe sitting in memory, `needs_refresh` answering
+                # "no" quite correctly, and the loop skipping past it for
+                # the rest of the session.
+                #
+                # Measured 16-Sep-2026: "option subscribe failed:
+                # Connection is already closed" at the open, and the live
+                # chain served 0 of 80 contracts all morning while the
+                # desk quietly ran on the 60-second NSE poll.
+                if self._subscribed_universe is not current \
+                        and self._socket is not None:
+                    self._subscribe_options()
                 if master is not None and settings.v2_paper_enabled:
                     self._maintain_v2_universe(master, spot, settings)
                 self._stopping.wait(interval)
@@ -601,8 +701,117 @@ class AngelFeed:
                     self._subscribe_options()
                 log.info("option universe re-centred on %.2f: %s",
                          spot, universe.to_dict())
+            else:
+                # Says so, rather than going round the loop in silence.
+                # An empty universe is not a quiet state: it means the live
+                # option chain never subscribes, so every option on the
+                # desk quietly drops to the polled NSE snapshot a minute
+                # behind the market. On 15-Sep-2026 that ran for seven
+                # minutes and the only way to find it was to notice the
+                # subscription count sitting at zero.
+                self.stats.last_error = (
+                    f"option universe empty at spot {spot:.2f}")
+                log.warning(
+                    "option universe came back empty at spot %.2f — the "
+                    "live chain cannot subscribe and options are being "
+                    "served from the polled snapshot instead", spot)
             if settings.v2_paper_enabled:
                 self._maintain_v2_universe(master, spot, settings)
+            self._stopping.wait(interval)
+
+    def _maybe_force_reconnect(self) -> bool:
+        """One check: is the socket stalled, and if so, kick it.
+
+        `angel_stale_seconds` only decides when the poller starts covering
+        for the feed — it never touches the socket. Measured on
+        15-Sep-2026: twice, ticks stopped for minutes (677s and 365s) while
+        the socket still reported itself connected. Neither `on_close` nor
+        `on_error` fired, so `_supervise`'s reconnect loop — which only
+        acts on those — never ran; what eventually recovered it both times
+        was the vendor SDK's own internal reconnect, logged by its own
+        `websocket` logger rather than ours, on a clock measured that day
+        at minutes rather than seconds.
+
+        This closes the gap without touching that internal logic: past
+        `angel_force_reconnect_seconds` of silence, `close_connection()` is
+        called here, exactly as `stop()` already does on shutdown. The
+        supervisor sees that as an ordinary disconnect — `on_close` fires,
+        `connect()` returns — and reconnects at its own 2-60s backoff
+        instead of whatever the vendor's internal clock decides.
+
+        Gated on market hours: a quiet socket after the close is the
+        market being shut, not a stall, and force-reconnecting all night
+        would just be a login loop against a server with nothing to send.
+
+        Returns whether it kicked, which is all a test needs to assert on;
+        the loop below only cares that this ran.
+        """
+        if not market_is_open():
+            return False
+
+        settings = get_settings()
+        age = self.age_seconds()
+        threshold = settings.angel_force_reconnect_seconds
+        socket = self._socket
+        if age is None or age <= threshold or socket is None:
+            return False
+
+        since_last_kick = (
+            (self._now() - self._last_forced_reconnect_at).total_seconds()
+            if self._last_forced_reconnect_at else None)
+        # One kick per stall. Without this the loop would call
+        # close_connection() on an already-closing socket every `interval`
+        # seconds until a fresh tick finally arrives — harmless to the
+        # vendor call, but noisy and pointless. The cooldown re-arms on
+        # `angel_reconnect_max_seconds`, the same ceiling the supervisor's
+        # own backoff caps at, so a stall that survives one kick still gets
+        # another rather than being kicked only once ever.
+        cooldown = settings.angel_reconnect_max_seconds
+        if since_last_kick is not None and since_last_kick <= cooldown:
+            return False
+
+        self.stats.forced_reconnects += 1
+        self._last_forced_reconnect_at = self._now()
+        log.warning(
+            "Angel socket silent for %.0fs (past the %.0fs ceiling) while "
+            "still reporting connected — forcing it closed so the "
+            "supervisor reconnects rather than waiting on the SDK's own "
+            "recovery.", age, threshold)
+        # Off-thread, and this is the whole point of the indirection.
+        # close_connection() sends a close frame, and websocket-client sets
+        # the socket's timeout only *after* that send. On a socket whose
+        # local address is gone the send cannot complete, so calling this
+        # inline wedged the watchdog itself: on 21-Sep-2026 it kicked once
+        # at 09:58:34 and never ran again, leaving the feed dead for the
+        # rest of the session with `forced_reconnects` frozen at 1.
+        # A thrown-away daemon thread means a socket that refuses to close
+        # costs one parked thread instead of the recovery mechanism.
+        threading.Thread(
+            target=self._close_quietly, args=(socket,),
+            name="angel-force-close", daemon=True).start()
+        return True
+
+    @staticmethod
+    def _close_quietly(socket) -> None:
+        """Close a socket that may never answer. Runs on its own thread."""
+        try:
+            socket.close_connection()
+        except Exception as exc:                             # noqa: BLE001
+            log.warning("forced Angel socket close failed: %s", exc)
+
+    def _watch_for_stall(self, interval: float = 5.0) -> None:
+        """The loop: check for a stall every `interval`, until stopped.
+
+        The body is guarded because this thread is the only thing that
+        notices a stalled socket. An exception escaping here would kill it
+        silently and leave the feed with no way back for the whole session
+        — which is the failure this watchdog exists to prevent.
+        """
+        while not self._stopping.is_set():
+            try:
+                self._maybe_force_reconnect()
+            except Exception as exc:                         # noqa: BLE001
+                log.warning("Angel stall watchdog check failed: %s", exc)
             self._stopping.wait(interval)
 
     @staticmethod
@@ -664,6 +873,7 @@ class AngelFeed:
                 "quantdesk-options", angel_api.SNAP_QUOTE,
                 angel_api.token_lists({angel_api.NSE_FO: universe.tokens}))
             self.stats.option_subscribes += 1
+            self._subscribed_universe = universe
             log.info("Angel feed subscribed to %d option contracts "
                      "(SNAP_QUOTE), expiry %s",
                      len(universe.tokens), universe.expiry)
@@ -763,15 +973,50 @@ def _load_master():
 
 
 def _build_socket(session):
-    """The vendor socket, imported at the point of use."""
+    """The vendor socket, imported at the point of use.
+
+    Subclassed rather than used as-is, for one reason: the SDK's `connect()`
+    calls `run_forever(ping_interval=10)` with no `ping_timeout`, so it pings
+    a dead peer forever and never concludes anything. Overriding `connect()`
+    is the only seam — `wsapp` is constructed inside it, so there is nothing
+    to configure from outside.
+    """
     try:
+        import ssl
+
+        import websocket
         from SmartApi.smartWebSocketV2 import SmartWebSocketV2
     except ImportError as exc:            # pragma: no cover - packaging
         raise AngelError(
             "smartapi-python is not installed — there is no Angel websocket "
             "to connect to") from exc
 
-    return SmartWebSocketV2(
+    # Global, but scoped in practice: SmartApi is the only websocket-client
+    # user in the process. The dashboard's own sockets are Starlette's.
+    websocket.setdefaulttimeout(SOCKET_TIMEOUT_SECONDS)
+
+    class _BoundedSocket(SmartWebSocketV2):
+        """The vendor socket with a bound on how long it can say nothing."""
+
+        def connect(self):
+            headers = {
+                "Authorization": self.auth_token,
+                "x-api-key": self.api_key,
+                "x-client-code": self.client_code,
+                "x-feed-token": self.feed_token,
+            }
+            self.wsapp = websocket.WebSocketApp(
+                self.ROOT_URI, header=headers,
+                on_open=self._on_open, on_error=self._on_error,
+                on_close=self._on_close, on_data=self._on_data,
+                on_ping=self._on_ping, on_pong=self._on_pong)
+            # The vendor call, plus the one argument it omits.
+            self.wsapp.run_forever(
+                sslopt={"cert_reqs": ssl.CERT_NONE},
+                ping_interval=self.HEART_BEAT_INTERVAL,
+                ping_timeout=PING_TIMEOUT_SECONDS)
+
+    return _BoundedSocket(
         session.auth_token, session.api_key,
         session.client_code, session.feed_token,
         max_retry_attempt=2)

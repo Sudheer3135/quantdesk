@@ -1145,7 +1145,7 @@ describe("bias and entry layers", () => {
   });
 });
 
-describe("the streamed option chain falls back when the socket drops", () => {
+describe("the streamed option chain falls back when delivery stops", () => {
   const chainFrame = (atm) => ({
     type: "chain",
     chain: {
@@ -1167,8 +1167,41 @@ describe("the streamed option chain falls back when the socket drops", () => {
     await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
 
     const before = chainCalls();
-    await tick(180_000);           // three minutes of the 60s poll interval
+    for (let i = 0; i < 18; i++) {
+      await tick(10_000);
+      await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+    }
     expect(chainCalls()).toBe(before);
+  });
+
+  it("uses HTTP after an option-only outage and resumes push when it recovers", async () => {
+    const polled = { ...chainFrame(24_350).chain, transport: "poll" };
+    fetchMock.mockImplementation((url) => Promise.resolve({
+      ok: true, json: () => Promise.resolve(
+        String(url).includes("/market/option-chain") ? polled : {}),
+    }));
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+    const before = chainCalls();
+    await tick(10_000);
+    await act(async () => {
+      FakeSocket.last.deliver(priceFrame(24_210, 0));
+      FakeSocket.last.deliver({ type: "heartbeat", market: {
+        open: true, session: "open", server_time: iso(0),
+      } });
+    });
+    await tick(6_000);
+    expect(FakeSocket.last.readyState).toBe(1);
+    expect(chainCalls()).toBeGreaterThan(before);
+    expect(document.querySelector(".chain-ladder").textContent).toContain("24,350");
+    expect(document.querySelector(".chain-ladder").textContent).not.toContain("24,200");
+
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_400)); });
+    expect(document.querySelector(".chain-ladder").textContent).toContain("24,400");
+    const recovered = chainCalls();
+    await tick(10_000);
+    expect(chainCalls()).toBe(recovered);
   });
 
   it("restarts the poll when the socket degrades, instead of freezing", async () => {
@@ -1188,5 +1221,132 @@ describe("the streamed option chain falls back when the socket drops", () => {
     const before = chainCalls();
     await tick(180_000);
     expect(chainCalls()).toBeGreaterThan(before);
+  });
+});
+
+describe("a source clock coarser than the reading drawn from it", () => {
+  /* The regression, measured live on 15-Sep-2026.
+
+     Angel rounds `exchange_timestamp` to a whole second — across 167
+     consecutive index ticks not one carried a sub-second digit. The pill
+     aged the price against that stamp and repainted once a second, which
+     beats two 1-second grids against each other: the reading sawtoothed
+     through a full second of phantom age and the badge alternated
+     "just now" / "1s ago" / "just now" on consecutive seconds.
+
+     Nothing was wrong with the feed. It was 97ms between ticks, zero
+     reconnects, zero fallbacks, zero forced reconnects, for the whole
+     window. The flicker was arithmetic, and the desk owner read it as a
+     latency fault three separate times.
+
+     The age now comes from `received_at`, which this process stamps
+     itself at microsecond resolution. These two tests hold that line from
+     both sides: the reading must not move on a steady feed, and it must
+     still break when the feed is genuinely bad. */
+
+  /* What a vendor that rounds to the second does to a fine instant. */
+  const toWholeSecond = (ms) =>
+    new Date(Math.floor(ms / 1000) * 1000).toISOString();
+
+  const frame = (receivedMs, { sourceMs = receivedMs } = {}) => ({
+    type: "price",
+    price: {
+      symbol: "NIFTY", price: 23_220.7, previous: 23_220.6, change: 0.1,
+      direction: "up", source: "angel", transport: "stream",
+      source_time: toWholeSecond(sourceMs),
+      received_at: new Date(receivedMs).toISOString(),
+      at: new Date(receivedMs).toISOString(),
+      source_time_quantum_ms: 1000,
+      market_open: true,
+    },
+  });
+
+  async function mountOpen(startMs) {
+    vi.setSystemTime(new Date(startMs));
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver({
+        type: "heartbeat",
+        market: {
+          open: true, session: "open",
+          server_time: new Date(startMs).toISOString(),
+        },
+      });
+    });
+  }
+
+  it("holds one steady reading while the rounding sweeps a whole second", async () => {
+    /* Deliberately started off a second boundary and delivered on a
+       cadence that does not divide a second, so the repaint drifts
+       through every phase of the vendor's rounding rather than sitting
+       at one convenient offset — which is what the live desk does and
+       what makes the old arithmetic flicker. */
+    await mountOpen(Date.parse("2026-09-15T14:38:36.400+05:30"));
+
+    const read = () =>
+      document.querySelector(".data-age-value").textContent;
+    const seen = new Set();
+
+    /* Twenty seconds of a feed that never misses a beat: a tick every
+       300ms, each one landing while still young. The transit time sweeps
+       the full second so no single phase can flatter the result. */
+    const transit = [60, 310, 520, 780, 940];
+    for (let step = 0; step < 66; step += 1) {
+      await tick(300);
+      await act(async () => {
+        FakeSocket.last.deliver(
+          frame(Date.now() - transit[step % transit.length]));
+      });
+      seen.add(read());
+    }
+
+    expect([...seen]).toEqual(["just now"]);
+  });
+
+  it("still goes stale when the feed pushes but the prints are old", async () => {
+    /* The failure the coarse stamp was guarding against, and the reason
+       the alarm is not simply moved onto `received_at`. Angel keeps the
+       socket busy and keeps handing us ticks, so "time since anything
+       arrived" stays at zero — but every print is a minute and a half
+       behind the market. Reading only `received_at` would call that live.
+       The classification takes the worse of the two readings, so it does
+       not. */
+    const start = Date.parse("2026-09-15T14:38:36.400+05:30");
+    await mountOpen(start);
+
+    for (let step = 0; step < 4; step += 1) {
+      await tick(1_000);
+      const now = Date.now();
+      await act(async () => {
+        // Arrived just now; printed 90 seconds ago.
+        FakeSocket.last.deliver(frame(now - 80, { sourceMs: now - 90_000 }));
+      });
+    }
+
+    expect(document.querySelector(".data-age").className)
+      .toContain("age-stale");
+  });
+});
+
+describe("layout density", () => {
+  /* The split-pane system exists so related readings stay comparable and
+     the desk fits more on one screen. A system that is defined in CSS
+     and never applied is just dead weight, so this pins that at least
+     the session panel uses it and that both halves survive. */
+  it("splits the session panel into two panes rather than stacking", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(priceFrame(24_231.85, 1));
+    });
+
+    const panel = document.querySelector(".session-panel");
+    expect(panel.classList.contains("split")).toBe(true);
+    expect(panel.querySelectorAll(".pane").length).toBe(2);
+
+    // and both readings are still present, not lost in the reflow
+    expect(panel.querySelector(".data-age")).toBeTruthy();
+    expect(panel.textContent).toMatch(/current price/i);
   });
 });

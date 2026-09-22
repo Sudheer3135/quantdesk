@@ -36,6 +36,15 @@ vi.mock("./OIProfile.jsx", async (importOriginal) => {
   return { ...real, default: counted("OIProfile", real.default) };
 });
 
+/* App applies the memo around what it imports (see the note there), so
+   the counter goes on the module's plain view and the real memo sits
+   outside it — which is the only arrangement where the count reflects
+   the memo's decisions rather than App's render rate. */
+vi.mock("./OptionChain.jsx", async (importOriginal) => {
+  const real = await importOriginal();
+  return { ...real, default: counted("OptionChain", real.default) };
+});
+
 const { default: App } = await import("./App.jsx");
 
 class FakeSocket {
@@ -93,6 +102,21 @@ async function settle() {
   await act(async () => { FakeSocket.last.open(); });
   await act(async () => { FakeSocket.last.deliver(snapshot); });
   await act(async () => { vi.advanceTimersByTime(50); });
+
+  /* Wait for the lazy panels to actually arrive before sampling.
+
+     `OIProfile` is a dynamic import behind Suspense, so a fixed number
+     of timer ticks is a bet on how fast the module graph resolves —
+     and that bet is lost whenever the suite is under load. The counter
+     then reads `undefined` and the assertion fails with "actual value
+     must be number or bigint", which looks like a render-count
+     regression and is really a race in this helper. Poll for the
+     component instead of guessing at a duration. */
+  for (let i = 0; i < 50 && renders.OIProfile === undefined; i += 1) {
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { vi.advanceTimersByTime(10); });
+  }
+
   const before = { ...renders };
   return before;
 }
@@ -126,6 +150,29 @@ describe("a price tick redraws only what shows the price", () => {
 
     await ticks([24_201.10, 24_201.90, 24_202.45]);
     expect(renders.OIProfile).toBe(before.OIProfile);
+  });
+
+  it("does not redraw the strike ladder for a move inside one strike band", async () => {
+    /* The densest panel on the desk — up to eighty cells of streaming
+       premium — and until this guard it redrew on every price tick,
+       sorting forty strikes twice each time to produce the identical
+       list. What the spot decides here is which strikes are listed, in
+       what order, and which side is in the money; a 1.4-point wobble
+       changes none of the three. */
+    const before = await settle();
+    expect(before.OptionChain).toBeGreaterThan(0);
+
+    await ticks([24_201.10, 24_201.90, 24_202.45]);
+    expect(renders.OptionChain).toBe(before.OptionChain);
+  });
+
+  it("does redraw the strike ladder when price crosses a strike", async () => {
+    /* The other half of the guard. Suppressing a redraw that shows
+       something new is a far worse bug than the cost it saves, so the
+       crossing case is pinned too. */
+    const before = await settle();
+    await ticks([24_196.00]);
+    expect(renders.OptionChain).toBeGreaterThan(before.OptionChain);
   });
 
   it("does redraw the open-interest chart when price crosses a strike", async () => {

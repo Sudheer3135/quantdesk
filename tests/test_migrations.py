@@ -148,6 +148,24 @@ def test_the_head_lookup_finds_a_real_revision():
     assert head and head.isdigit(), head
 
 
+def test_trade_exit_migration_preserves_unknown_close_times(url):
+    cfg = make_config(url)
+    command.upgrade(cfg, "0007")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO trades "
+                          "(symbol, side, quantity, entry, stop_loss, status, pnl) "
+                          "VALUES ('NIFTY', 'BUY', 65, 200, 150, 'closed', -6500)"))
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT pnl, closed_at FROM trades")).one() == (-6500, None)
+    assert "ix_trades_closed_at" in {
+        index["name"] for index in inspect(engine).get_indexes("trades")}
+    command.downgrade(cfg, "0007")
+    assert "closed_at" not in {c["name"] for c in inspect(engine).get_columns("trades")}
+    engine.dispose()
+
+
 def test_upgrade_survives_a_database_built_by_create_all(url):
     """`init_db()` calls `Base.metadata.create_all`, so a deployment that
     starts the app before running migrations arrives at 0001 with tables

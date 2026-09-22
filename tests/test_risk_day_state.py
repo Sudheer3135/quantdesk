@@ -261,3 +261,82 @@ def test_every_risk_limit_is_configurable(monkeypatch, env, attr, value):
         assert getattr(risk_config(), attr) == value
     finally:
         get_settings.cache_clear()
+
+
+def test_overnight_loss_closed_today_blocks_live_risk(db, monkeypatch, config):
+    from app.api import journal
+    from app.risk import live
+
+    now = datetime(2026, 9, 22, 10, 0, tzinfo=IST)
+    row = trade(status="open", created_at=now - timedelta(days=1))
+    row.quantity, row.entry, row.stop_loss = 65, 200.0, 150.0
+    db.add(row)
+    db.commit()
+    monkeypatch.setattr(journal, "utc_now", lambda: now.astimezone(UTC))
+    monkeypatch.setattr(live, "trading_date", lambda: now.date())
+    monkeypatch.setattr(live, "risk_config", lambda: config)
+    journal.close_trade(row.id, journal.TradeClose(exit=100.0), db)
+    db.expire_all()
+
+    verdict = live.current(db, {"action": "BUY", **TRADE})
+    assert verdict["day_state"]["trades_taken"] == 0
+    assert verdict["day_state"]["realised_pnl"] == -6500
+    assert verdict["day_state"]["consecutive_losses"] == 1
+    assert verdict["state"] == "blocked"
+    assert any("Daily loss limit" in reason for reason in verdict["reasons"])
+    tomorrow = now.date() + timedelta(days=1)
+    assert repository.closed_trades(db, tomorrow) == []
+
+
+def test_exit_day_uses_ist_midnight_and_preserves_legacy_rows(db):
+    day = datetime(2026, 9, 22, tzinfo=IST)
+    entries = [
+        trade(pnl=-100, created_at=day - timedelta(days=2),
+              closed_at=(day - timedelta(microseconds=1)).astimezone(UTC)),
+        trade(pnl=-200, created_at=day - timedelta(days=2),
+              closed_at=day.astimezone(UTC)),
+        trade(pnl=-300, created_at=day - timedelta(days=2),
+              closed_at=(day + timedelta(days=1)).astimezone(UTC)),
+        trade(pnl=50, created_at=day.astimezone(UTC)),
+    ]
+    db.add_all(entries)
+    db.commit()
+    assert [row.pnl for row in repository.closed_trades(db, day.date())] == [-200, 50]
+
+
+def test_loss_streak_follows_exit_order_not_entry_order():
+    now = datetime(2026, 9, 22, 10, tzinfo=UTC)
+    exits = [trade(pnl=-100, created_at=now - timedelta(hours=3), closed_at=now),
+             trade(pnl=100, created_at=now - timedelta(hours=2),
+                   closed_at=now - timedelta(minutes=1))]
+    state = day_state_from_trades(now.date(), [], [], closed_today=exits)
+    assert state.trades_taken == 0
+    assert state.consecutive_losses == 1
+
+
+@pytest.mark.parametrize("unit_cost,lot_size,instrument", [
+    (100, 65, "option"), (200, 65, "option"), (1000, 65, "option"),
+    (100, 1, "index"),
+])
+def test_risk_amount_matches_final_quantity(unit_cost, lot_size, instrument):
+    cfg = RiskConfig(capital=100_000, lot_size=lot_size)
+    result = evaluate(config=cfg, state=DayState(trading_date()),
+                      entry=100, stop_loss=97, target=106,
+                      unit_cost=unit_cost, instrument=instrument)
+    assert result.risk_amount == result.quantity * 3
+    assert result.risk_amount <= 1000
+    if result.approved:
+        assert f"{result.risk_amount / cfg.capital * 100:.2f}%" in result.reasons[0]
+
+
+def test_live_risk_reports_650_for_one_65_unit_lot(db, monkeypatch, config):
+    from app.risk import live
+
+    config.lot_size = 65
+    monkeypatch.setattr(live, "risk_config", lambda: config)
+    result = live.current(db, {"action": "BUY", "entry": 100,
+                               "stop_loss": 90, "target": 120})
+    assert result["approved"]
+    assert result["quantity"] == 65
+    assert result["rupees_at_risk"] == result["risk_amount"] == 650
+    assert result["potential"]["rupees_at_risk"] == 650

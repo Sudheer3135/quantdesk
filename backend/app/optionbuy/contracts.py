@@ -36,7 +36,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 
 from ..analytics import option_pricing
-from ..market_hours import IST
+from ..market_hours import IST, MARKET_CLOSE
 from .chain import ChainStore, ContractKey
 
 CALL, PUT = "CE", "PE"
@@ -69,7 +69,6 @@ PREMIUM_TOO_LOW = "premium_below_floor"
 # this before — it was Thursday until 2025 — so it is a parameter, and a
 # long backtest spanning a change needs the archive rather than this.
 DEFAULT_EXPIRY_WEEKDAY = 1
-EXPIRY_TIME = (15, 30)
 
 
 @dataclass
@@ -178,8 +177,8 @@ def side_for(action: str) -> str:
 
 def expiry_moment(day: date) -> datetime:
     """Expiry as an instant: the close on expiry day, IST."""
-    hour, minute = EXPIRY_TIME
-    return datetime(day.year, day.month, day.day, hour, minute, tzinfo=IST)
+    return datetime(day.year, day.month, day.day,
+                    MARKET_CLOSE.hour, MARKET_CLOSE.minute, tzinfo=IST)
 
 
 def synthetic_expiries(moment: datetime, weekday: int, count: int = 6) -> list[date]:

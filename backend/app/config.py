@@ -72,6 +72,29 @@ class Settings(BaseSettings):
     angel_reconnect_min_seconds: float = 2.0
     angel_reconnect_max_seconds: float = 60.0
 
+    # How long the feed may sit silent, socket still reporting "connected",
+    # before this forces the connection closed rather than waiting for the
+    # vendor SDK to notice on its own.
+    #
+    # angel_stale_seconds only decides when the *poller* takes over; it does
+    # not touch the Angel socket at all. That gap is real: measured on
+    # 15-Sep-2026, the feed twice went fully silent for minutes — 677s and
+    # 365s — with the socket reporting itself open the whole time and
+    # neither on_close nor on_error firing, so the supervisor's own reconnect
+    # loop never ran. Both times a "Websocket connected" line from the
+    # vendor library's own logger, not ours, is what eventually recovered
+    # it — the SDK's internal reconnect noticed, on its own clock, which
+    # that day took over ten minutes. This is what makes the desk force the
+    # issue instead of trusting that clock: past this many seconds of
+    # silence during market hours, the socket is closed here, which the
+    # supervisor sees as a normal disconnect and reconnects from at its own
+    # (much faster) 2-60s backoff.
+    #
+    # Set comfortably above angel_stale_seconds so the fallback poller is
+    # already covering the gap before this fires — this is a ceiling on how
+    # long a stall can last, not the trigger for switching to the poller.
+    angel_force_reconnect_seconds: float = 30.0
+
     # Nothing places a real order unless this is explicitly true.
     live_trading: bool = False
 

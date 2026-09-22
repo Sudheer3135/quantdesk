@@ -79,14 +79,36 @@ class Universe:
     def strikes(self) -> list[float]:
         return sorted({c.strike for c in self.contracts})
 
-    def needs_refresh(self, spot: float, *, margin: int = 5) -> bool:
-        """Has spot drifted far enough to leave the band thin on one side?
+    def needs_refresh(self, spot: float, *, margin: int = 5,
+                      on: date | None = None) -> bool:
+        """Should this universe be rebuilt?
 
-        `margin` is how many strikes of cover must remain between spot and
-        the edge. Below that the chain stops describing the money, which is
-        the only part of it the signal engine reads.
+        Two ways it goes stale, and only one of them used to be checked.
+
+        **Its expiry has passed.** Measured on 16-Sep-2026: the desk was
+        still subscribed to eighty 15-Sep contracts the morning after they
+        expired. Those tokens never print again, so the live chain sat at
+        0 of 80 quoted for the whole session and every option on the desk
+        silently fell back to the 60-second NSE poll — a chain roughly
+        150x slower than the stream it replaced, with nothing on the
+        dashboard saying why beyond a "POLL" badge.
+
+        Drift alone could never catch that: the strikes stay perfectly
+        well centred on spot, they are simply dead. An expiry is a
+        property of the calendar, not of the price, so it has to be asked
+        about separately or it is never asked at all.
+
+        **Spot has drifted off the band.** `margin` is how many strikes of
+        cover must remain between spot and the edge. Below that the chain
+        stops describing the money, which is the only part of it the
+        signal engine reads.
         """
         if not self.contracts:
+            return True
+        # Expiry day itself is a trading day — contracts settle at the
+        # close, so `<` rather than `<=`. Rebuilding at 09:15 on the
+        # expiry would throw away the most active session they have.
+        if self.expiry and self.expiry < (on or date.today()):
             return True
         edge = margin * STRIKE_STEP
         return spot < min(self.strikes) + edge or spot > max(self.strikes) - edge

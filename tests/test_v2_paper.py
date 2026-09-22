@@ -380,6 +380,24 @@ def test_equity_carries_realised_pnl_into_the_next_trade(desk):
     assert state["mode"] == "paper"
 
 
+def test_recovered_overnight_loss_belongs_to_exit_day(desk):
+    _, pos = open_position(desk)
+    with desk.session() as db:
+        row = db.get(PaperPosition, pos.id)
+        row.last_premium = row.premium_entry / 2
+        db.commit()
+    desk.clock.advance(days=1)
+    desk.clock.at(10, 30)
+    fresh = desk.trader()
+    fresh.recover()
+    [closed] = positions(desk)
+    state = fresh.status()
+    assert closed.pnl < 0
+    assert state["account"]["realised_today"] == closed.pnl
+    assert state["account"]["trades_today"] == 0
+    assert state["account"]["consecutive_losses"] == 1
+
+
 def test_status_shows_the_open_position_with_live_unrealised_pnl(desk):
     trader, pos = open_position(desk)
     desk.clock.advance(seconds=5)

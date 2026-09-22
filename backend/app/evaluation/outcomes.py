@@ -102,6 +102,9 @@ class SelectionReport:
     no_candle: int = 0
     selected: int = 0
     distinct_bars: int = 0
+    duplicate_bars: int = 0
+    invalid_timing: int = 0
+    legacy_inferred_timing: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -133,6 +136,9 @@ class Outcome:
     risk_per_unit: float
 
     outcome: str
+    timing_basis: str = "recorded_bar_time"
+    signal_bar_close_time: str | None = None
+    earliest_execution_time: str | None = None
     exit_time: str | None = None
     exit_price: float | None = None
     bars_held: int = 0
@@ -234,7 +240,8 @@ def _excursions(feed: HistoricalFeed, entry_index: int, exit_index: int, side: s
 
 def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecord,
                     costs: CostModel, slippage: SlippageModel,
-                    quantity: int = EVALUATION_QUANTITY) -> Outcome:
+                    quantity: int = EVALUATION_QUANTITY, *, execution_index: int | None = None,
+                    timing_basis: str = "recorded_bar_time") -> Outcome:
     """Replay one stored signal against the bars that followed it.
 
     `signal_index` is the bar the signal was computed on. The fill is the
@@ -244,7 +251,11 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
     direction = 1 if record.action == "BUY" else -1
 
     feed.seek(signal_index)
-    raw_open = feed.next_open(signal_index)
+    entry_index = execution_index if execution_index is not None else signal_index + 1
+    if entry_index <= signal_index:
+        raise ValueError("execution must follow a completed signal bar")
+    feed.seek(entry_index - 1)
+    raw_open = feed.next_open(entry_index - 1)
     entry_fill = raw_open + slippage.index_points(raw_open) * direction
     # The levels travel with the fill, exactly as the engine shifts them, so
     # a gap between the signal bar's close and the next open does not
@@ -254,7 +265,7 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
     target = record.target + shift
     risk_per_unit = abs(entry_fill - stop)
 
-    entry_index = signal_index + 1
+    # entry_index is determined above from the recorded execution clock.
     outcome_name, exit_index = _resolve(
         feed, entry_index, record.action, entry_fill, stop, target)
 
@@ -266,7 +277,10 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
         confidence=float(record.confidence or 0.0),
         trend=(record.context or {}).get("trend"),
         signal_bar_time=feed.timestamp(signal_index).isoformat(),
-        entry_time=feed.next_timestamp(signal_index).isoformat(),
+        entry_time=feed._frame.timestamp.iloc[entry_index].isoformat(),
+        timing_basis=timing_basis,
+        signal_bar_close_time=(feed._frame.timestamp.iloc[signal_index] + pd.Timedelta(minutes=5)).isoformat(),
+        earliest_execution_time=feed._frame.timestamp.iloc[entry_index].isoformat(),
         entry=round(entry_fill, 2),
         stop=round(stop, 2),
         target=round(target, 2),
@@ -292,7 +306,7 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
             sell_price=max(entry_fill, fill),
             quantity=quantity)
 
-        out.exit_time = feed.timestamp(exit_index).isoformat()
+        out.exit_time = feed.close_time(exit_index).isoformat()
         out.exit_price = round(fill, 2)
         out.bars_held = exit_index - entry_index + 1
         out.minutes_held = round(
@@ -499,6 +513,8 @@ class EvaluationReport:
 
 
 CAVEATS = [
+    "Legacy signals lack source-bar timestamps: last-closed-bar alignment is inferred, not verified. "
+    "Duplicate source bars are excluded. This is signal analytics, not executed-trade performance.",
     "Hypothetical. No order was placed; these are stored signals replayed "
     "against stored candles.",
     "Observations are not independent. The agent emits a signal every five "
@@ -584,20 +600,39 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
             selection.out_of_session += 1
             continue
 
-        # The bar the signal was computed on: the last one that had closed.
-        # `searchsorted` on the right, minus one, is that bar.
-        position = int(stamps.searchsorted(
-            pd.Timestamp(stamped), side="right")) - 1
-        if position < 0 or position >= len(feed) - 1:
-            # Either the archive does not reach back to this signal, or the
-            # signal sits on the final stored bar and could never have been
-            # filled. Both are missing data, not outcomes.
+        timing = (record.context or {}).get("timing") or {}
+        decision = pd.Timestamp(timing.get("signal_time") or stamped)
+        if decision.tzinfo is None:
+            selection.invalid_timing += 1
+            continue
+        if timing.get("bar_open_time"):
+            bar_time = pd.Timestamp(timing["bar_open_time"])
+            if bar_time.tzinfo is None or bar_time + pd.Timedelta(minutes=5) > decision:
+                selection.invalid_timing += 1
+                continue
+            position = int(stamps.searchsorted(bar_time))
+            if position >= len(feed) or stamps.iloc[position] != bar_time:
+                selection.no_candle += 1
+                continue
+            basis = "recorded_bar_time"
+        else:
+            position = int(stamps.searchsorted(decision-pd.Timedelta(minutes=5), side="right"))-1
+            basis = "legacy_inferred_last_closed_bar"
+            selection.legacy_inferred_timing += 1
+        execution = int(stamps.searchsorted(decision, side="left"))
+        if position < 0 or execution >= len(feed) or execution <= position:
             selection.no_candle += 1
             continue
-
+        # Never fill a signal at an earlier open or carry a late signal overnight.
+        if stamps.iloc[execution].tz_convert("Asia/Kolkata").date() != decision.tz_convert("Asia/Kolkata").date():
+            selection.no_candle += 1
+            continue
+        if position in seen_bars:
+            selection.duplicate_bars += 1
+            continue
         seen_bars.add(position)
-        outcomes.append(evaluate_signal(
-            feed, position, record, costs, slippage, quantity))
+        outcomes.append(evaluate_signal(feed, position, record, costs, slippage,
+                        quantity, execution_index=execution, timing_basis=basis))
 
     selection.selected = len(outcomes)
     selection.distinct_bars = len(seen_bars)
