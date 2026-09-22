@@ -1,0 +1,16 @@
+{
+  "captured_at_utc": "2026-09-22T15:49:09.406150+00:00",
+  "counts": {
+    "candles": 6750,
+    "signals": 1276,
+    "trades": 1,
+    "option_contracts": 1038,
+    "option_candles": 120838,
+    "market_regimes": 6062,
+    "vix_daily": 326,
+    "paper_positions": 0,
+    "paper_decisions": 231
+  },
+  "sha256": "9b49ef771fa13fce4a99415f71766f4bf63d83b20994672fbcad08dde0aba89d",
+  "scope": "consistent read-only snapshot; local research copy"
+}

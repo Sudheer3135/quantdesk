@@ -1,0 +1,157 @@
+{
+  "alignment_sensitivity_NOT_reconstructed_truth": {
+    "n": 377,
+    "win_rate_pct": 27.055702917771885,
+    "avg_r": -0.46241114058355437,
+    "profit_factor_r": 0.4617099522320037
+  },
+  "zero_slippage_existing_alignment": {
+    "n": 377,
+    "win_rate_pct": 31.56498673740053,
+    "avg_r": -0.14643236074270558,
+    "profit_factor_r": 0.7741628007821768
+  },
+  "groupings": {
+    "regime": {
+      "unknown": {
+        "n": 167,
+        "win_rate_pct": 20.35928143712575,
+        "avg_r": -0.6604071856287426,
+        "profit_factor_r": 0.30100582452893565
+      },
+      "VOLATILE_CHOP": {
+        "n": 22,
+        "win_rate_pct": 22.727272727272727,
+        "avg_r": -0.8034090909090907,
+        "profit_factor_r": 0.07465577718444062
+      },
+      "TREND_DOWN": {
+        "n": 28,
+        "win_rate_pct": 28.57142857142857,
+        "avg_r": -0.41192857142857153,
+        "profit_factor_r": 0.5245867853757059
+      },
+      "RANGE": {
+        "n": 140,
+        "win_rate_pct": 25.0,
+        "avg_r": -0.49276428571428565,
+        "profit_factor_r": 0.4405627863601345
+      },
+      "TREND_UP": {
+        "n": 5,
+        "win_rate_pct": 0.0,
+        "avg_r": -1.1968,
+        "profit_factor_r": 0.0
+      },
+      "SQUEEZE": {
+        "n": 15,
+        "win_rate_pct": 0.0,
+        "avg_r": -1.25,
+        "profit_factor_r": 0.0
+      }
+    },
+    "vix": {
+      "below15": {
+        "n": 371,
+        "win_rate_pct": 21.293800539083556,
+        "avg_r": -0.633700808625337,
+        "profit_factor_r": 0.3200438451883088
+      },
+      "15to20": {
+        "n": 6,
+        "win_rate_pct": 50.0,
+        "avg_r": 0.31416666666666676,
+        "profit_factor_r": 1.5495626822157431
+      }
+    },
+    "risk": {
+      "unknown": {
+        "n": 167,
+        "win_rate_pct": 20.35928143712575,
+        "avg_r": -0.6604071856287426,
+        "profit_factor_r": 0.30100582452893565
+      },
+      "blocked": {
+        "n": 210,
+        "win_rate_pct": 22.857142857142858,
+        "avg_r": -0.5853809523809524,
+        "profit_factor_r": 0.3577694071918541
+      }
+    }
+  },
+  "signal_days": 24,
+  "signal_days_first": "2026-08-05",
+  "signal_days_last": "2026-09-22",
+  "mean_signals_per_active_day": 15.708333333333334,
+  "max_signals_in_day": 38,
+  "max_overlapping_outcomes": 13,
+  "daily_block_bootstrap_mean_r_95pct": [
+    -0.8239381085219288,
+    -0.3486442730420091
+  ],
+  "bootstrap_warning": "conditional on flawed outcome alignment; not strategy validation",
+  "session_close_timestamp_rows": 12,
+  "volume_values": {
+    "1.0": 6428,
+    "0.0": 321,
+    "2.0": 1
+  },
+  "paper_rejections": [
+    {
+      "code": "entry_state_not_ready",
+      "n": 85
+    },
+    {
+      "code": "expiry_day",
+      "n": 8
+    },
+    {
+      "code": "live_feed_not_healthy",
+      "n": 2
+    },
+    {
+      "code": "no_directional_signal",
+      "n": 118
+    },
+    {
+      "code": "no_two_sided_quote",
+      "n": 14
+    },
+    {
+      "code": "outside_entry_window",
+      "n": 3
+    },
+    {
+      "code": "quote_too_old",
+      "n": 1
+    }
+  ],
+  "journal": [
+    {
+      "status": "open",
+      "side": "BUY",
+      "quantity": 75,
+      "pnl": null
+    }
+  ],
+  "missing_bar_fold_example": {
+    "input_start_times": [
+      "2026-05-15 03:45:00+00:00",
+      "2026-05-15 03:55:00+00:00",
+      "2026-05-15 04:00:00+00:00",
+      "2026-05-15 04:05:00+00:00",
+      "2026-05-15 04:10:00+00:00"
+    ],
+    "emitted_bars": [
+      {
+        "timestamp": "2026-05-15 03:45:00+00:00",
+        "open": 23731.400390625,
+        "high": 23796.44921875,
+        "low": 23663.849609375,
+        "close": 23748.5,
+        "volume": 3.0
+      }
+    ],
+    "issue": "first 3 records span 20 minutes after one missing 5-minute bar"
+  }
+}

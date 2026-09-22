@@ -1,0 +1,22 @@
+{
+ "sampled_signal_actions": {
+  "HOLD": 46,
+  "BUY": 28,
+  "SELL": 46
+ },
+ "runs": [
+  [
+   "d7cbdd4556da6842fb1dcca91f852af129a7fc7ba203464c798217157642b926",
+   40,
+   40,
+   40
+  ],
+  [
+   "d7cbdd4556da6842fb1dcca91f852af129a7fc7ba203464c798217157642b926",
+   40,
+   40,
+   40
+  ]
+ ],
+ "identical": true
+}

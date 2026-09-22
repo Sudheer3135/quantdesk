@@ -1,0 +1,50 @@
+{
+ "snapshot_sha256": "9b49ef771fa13fce4a99415f71766f4bf63d83b20994672fbcad08dde0aba89d",
+ "rows": 6750,
+ "ks_tested": 42,
+ "indicators_real_snapshot_volume": {
+  "mismatch_columns": {},
+  "examples": {},
+  "non_null_counts_full": {
+   "ema20": 6750,
+   "ema50": 6750,
+   "ema100": 6750,
+   "ema200": 6750,
+   "atr14": 6750,
+   "vwap": 0,
+   "vwap_upper": 0,
+   "vwap_lower": 0,
+   "rvol": 0
+  }
+ },
+ "indicators_synthetic_real_volume": {
+  "mismatch_columns": {},
+  "examples": {},
+  "non_null_counts_full": {
+   "ema20": 6750,
+   "ema50": 6750,
+   "ema100": 6750,
+   "ema200": 6750,
+   "atr14": 6750,
+   "vwap": 6750,
+   "vwap_upper": 6750,
+   "vwap_lower": 6750,
+   "rvol": 6741
+  }
+ },
+ "htf_fold_closed_bins": {
+  "mismatches": 0,
+  "examples": []
+ },
+ "regime_rowwise": {
+  "tested": 30,
+  "mismatches": 0,
+  "examples": []
+ },
+ "swings_confirmed": {
+  "mismatching_ks": 0
+ },
+ "fvg_formation": {
+  "mismatching_ks": 0
+ }
+}
