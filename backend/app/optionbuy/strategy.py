@@ -60,6 +60,8 @@ from ..backtest.costs import (
     describe,
     sell_fill,
 )
+from ..backtest import execution as execution_module
+from ..backtest.execution import ExecutionPolicy
 from ..backtest.feed import HistoricalFeed
 from ..backtest.measurement import PositionLedger, provenance
 from ..risk.manager import DayState, RiskConfig, evaluate
@@ -89,6 +91,11 @@ PLAN_FAILED = "plan_could_not_be_built"
 GAP_PAST_STOP = "gap_past_stop_before_fill"
 FILL_CROSSES_SESSION = "fill_lands_in_a_later_session"
 UNPRICEABLE = "no_permitted_premium"
+# Every stored quote for the contract became available before the order
+# could have existed. Reachable at any latency, including zero, and raised
+# only under a policy that refuses a modelled stand-in — which is the
+# correct refusal, not a data problem.
+NO_ELIGIBLE_QUOTE = "no_quote_at_or_after_execution_time"
 RISK_VETO = "risk_manager_vetoed"
 NO_DEFINED_RISK = "premium_risk_not_defined"
 ALREADY_IN_TRADE = "position_already_open"
@@ -124,10 +131,17 @@ class OptionBuyConfig:
     session_exit_ist: time = time(15, 15)
     hold_overnight: bool = False
 
+    # How a decision becomes a fill: latency, what happens to the levels
+    # when the fill gaps, and which level is assumed first when one bar
+    # covers both. Shared with both backtest engines and the evaluator so
+    # that "stopped out" means the same thing in all four.
+    execution_policy: ExecutionPolicy = field(default_factory=ExecutionPolicy)
+
     def to_dict(self) -> dict:
         out = asdict(self)
         out["session_exit_ist"] = self.session_exit_ist.strftime("%H:%M")
         out["require_entry_states"] = list(self.require_entry_states)
+        out["execution_policy"] = self.execution_policy.describe()
         return out
 
 
@@ -185,6 +199,10 @@ class OptionTrade:
     entry_evidence: str = MODELLED
     exit_evidence: str = MODELLED
     execution_friction: float = 0.0
+    # `execution_friction` split by cause: what the quoted spread cost and
+    # what this run's impact assumption added on top of it.
+    spread_cost: float = 0.0
+    impact_cost: float = 0.0
     fees: float = 0.0
     timing: dict = field(default_factory=dict)
     execution_accuracy: str = "estimated_bar_resolution"
@@ -195,6 +213,23 @@ class OptionTrade:
 
     selection: dict = field(default_factory=dict)
     risk: dict = field(default_factory=dict)
+
+    # The execution record, in the same words the engines use. `index_*`
+    # above are the levels the trade ran with; these say what was planned
+    # and what the fill did to it, which on a gapped entry is the whole
+    # story and used to be nowhere in the row.
+    entry_side: str = ""
+    exit_side: str = ""
+    planned_entry: float = 0.0
+    actual_entry: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    gap_amount: float = 0.0
+    execution_policy: str = execution_module.KEEP_PLANNED
+    ambiguous_intrabar: bool = False
+    brokerage: float = 0.0
+    statutory_fees: float = 0.0
+    net_pnl: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -319,7 +354,13 @@ def run(
         store.advance(stamp.to_pydatetime())
         state = day_states.setdefault(ist.date(), DayState(trading_day=ist.date()))
 
-        if open_trade is not None:
+        # Nothing may happen to a position before it exists. With the
+        # default zero latency the fill lands on the very next bar and this
+        # guard never fires; with a latency the bars between the decision
+        # and the fill are the ones the order was not yet working in, and
+        # running the stop, the target, the time cap or the session exit
+        # over them would close a trade that had not been opened.
+        if open_trade is not None and i >= open_trade["entry_index"]:
             closed = _maybe_exit(open_trade, feed, i, bar, ist, store, cfg, sel,
                                  model, costs, slippage)
             if closed is not None:
@@ -417,11 +458,32 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
                        f"{bias} bias")
         return None
 
-    # The existing entry convention, unchanged: filled at the next bar's
-    # open, which is the earliest price a decision on a closed bar could
-    # have been executed at.
-    index_entry = feed.next_open(i)
-    fill_stamp = feed.next_timestamp(i)
+    # The existing entry convention, now stated as a policy rather than
+    # assumed: filled at the open of the first bar the order could have
+    # reached. With the default zero latency that is the next bar, exactly
+    # as before; with a latency it is the first bar opening at or after the
+    # deadline, and the bars in between are never read.
+    policy = cfg.execution_policy
+    signal_time = feed.close_time(i)
+    earliest = execution_module.earliest_execution_time(signal_time, policy)
+    exec_index = execution_module.first_executable_index(
+        feed.stamps(), i, signal_time, policy)
+    if exec_index is None:
+        rejections.add(FILL_CROSSES_SESSION,
+                       f"{ist.isoformat()} — no bar opens at or after "
+                       f"{earliest.isoformat()}")
+        return None
+    # Timestamp first, price second. `first_executable_index` already picks
+    # the bar by the clock, but the eligibility check is repeated here
+    # against the bar about to be priced, and *before* its open is read, so
+    # the causal contract holds on its own rather than by trusting the
+    # selector that chose the index.
+    fill_stamp = feed.execution_timestamp(i, exec_index)
+    if fill_stamp < earliest:
+        raise RuntimeError(
+            f"fill at {fill_stamp.isoformat()} precedes the earliest "
+            f"executable time {earliest.isoformat()}")
+    _, index_entry = feed.execution_open(i, exec_index)
     fill_ist = fill_stamp.tz_convert("Asia/Kolkata").to_pydatetime()
 
     # A decision on the last bar of a session would otherwise fill at the
@@ -439,16 +501,15 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
         return None
 
     # A gap that opens past the stop is not a trade with tiny risk — its
-    # premise is already invalid. Skipped rather than sized.
-    if signal.action == "BUY" and index_entry <= signal.stop_loss:
+    # premise is already invalid. Refused rather than sized, and refused by
+    # the same rule the engines use so the three cannot drift apart.
+    entry_plan = execution_module.plan_entry(
+        signal.action, planned_entry=signal.entry,
+        planned_stop=signal.stop_loss, planned_target=signal.target,
+        actual_entry=index_entry, policy=policy)
+    if not entry_plan.accepted:
         rejections.add(GAP_PAST_STOP,
-                       f"{fill_ist.isoformat()} opened at {index_entry:.2f}, "
-                       f"already past the {signal.stop_loss:.2f} stop")
-        return None
-    if signal.action == "SELL" and index_entry >= signal.stop_loss:
-        rejections.add(GAP_PAST_STOP,
-                       f"{fill_ist.isoformat()} opened at {index_entry:.2f}, "
-                       f"already past the {signal.stop_loss:.2f} stop")
+                       f"{fill_ist.isoformat()} — {entry_plan.rejection_detail}")
         return None
 
     chosen, rejected = contract_module.select(
@@ -478,23 +539,37 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
                        f"{chosen.key.label()} has already expired at {ist}")
         return None
 
+    # An archived quote may price this entry only if it was available at or
+    # after the moment the order could first have been working. That rule is
+    # the same at every latency, which is the correction 2B.1 got half
+    # right: it excluded pre-eligibility quotes when a latency was
+    # configured and kept the "last quote available at the decision bar"
+    # convention at zero latency. But zero latency means the clock starts at
+    # the decision instant, not that anything earlier is acceptable — a
+    # bucket that became available five minutes before the order existed is
+    # a price the order could never have been given either way.
+    #
+    # With no eligible quote the declared missing-quote policy applies and
+    # the trade says so, rather than filling off a print it could not have
+    # reached.
     try:
         quote = pricing_module.quote(
             store, chosen.key, ist, spot=index_entry, years=years,
-            policy=cfg.pricing_policy, model=model)
+            policy=cfg.pricing_policy, model=model,
+            eligible_from=earliest.to_pydatetime())
     except pricing_module.UnpriceableContract as exc:
-        rejections.add(UNPRICEABLE, exc.reason)
+        # Two different refusals. A contract the archive cannot price is a
+        # data gap; one whose every quote predates the execution clock is
+        # the clock working. Counted apart so a run cannot be read as
+        # short of data when it is actually short of eligible prices.
+        rejections.add(NO_ELIGIBLE_QUOTE if exc.ineligible else UNPRICEABLE,
+                       exc.reason)
         return None
 
     fill = buy_fill(quote.premium, slippage, bid=quote.bid, ask=quote.ask)
     premium_entry = fill.filled
-    # The index fills at the next bar's open — the existing convention, kept.
-    # The premium cannot: the archive holds a folded bucket, not a tick, so
-    # the last quote available at the decision bar is the most recent price
-    # that provably existed before the fill. The pairing is therefore not
-    # simultaneous, and it is named rather than left to be discovered.
-    entry_basis = ("decision_bar_quote_observed" if not quote.modelled
-                   else "next_open_modelled")
+    entry_basis = ("eligible_quote_observed" if not quote.modelled
+                   else "modelled_no_eligible_quote")
     if premium_entry < pricing_module.MIN_TRADABLE_PREMIUM:
         rejections.add(contract_module.PREMIUM_TOO_LOW,
                        f"{chosen.key.label()} filled at {premium_entry:.2f}")
@@ -507,10 +582,10 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
     sizing_iv = _sane_iv(quote.iv_used) or model.iv
     projection_years = hold_years if quote.modelled else quote_years
     premium_stop = option_pricing.price(
-        signal.stop_loss, chosen.strike, projection_years, sizing_iv,
+        entry_plan.stop, chosen.strike, projection_years, sizing_iv,
         model.rate, kind=chosen.option_type)
     premium_target = option_pricing.price(
-        signal.target, chosen.strike, projection_years, sizing_iv,
+        entry_plan.target, chosen.strike, projection_years, sizing_iv,
         model.rate, kind=chosen.option_type)
     premium_risk = premium_entry - premium_stop
 
@@ -537,11 +612,28 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
     return {
         "signal": signal, "selection": chosen, "quote": quote,
         "entry_reference": fill.requested, "entry_friction": fill.slippage,
-        "timing": {"bar_open_time": feed.timestamp(i).isoformat(), "bar_close_time": feed.close_time(i).isoformat(), "signal_time": ist.isoformat(), "earliest_execution_time": fill_stamp.isoformat()},
+        # Friction, split by what caused it. On a stored bid and ask the
+        # spread is the market's number and the impact is this run's
+        # assumption, and only the second is something a sensitivity sweep
+        # may vary. Reported as one figure, a sweep over a quoted book
+        # looked flat when it was measuring a spread it could not move.
+        "entry_spread_cost": fill.spread_cost,
+        "entry_impact_cost": fill.impact_cost,
+        "timing": {"bar_open_time": feed.timestamp(i).isoformat(),
+                   "bar_close_time": signal_time.isoformat(),
+                   "signal_time": ist.isoformat(),
+                   "earliest_execution_time": earliest.isoformat(),
+                   "actual_fill_time": fill_stamp.isoformat(),
+                   "execution_latency_seconds": policy.latency_seconds},
         "entry_basis": entry_basis,
         "direction": signal.action,
         "index_entry": index_entry,
-        "index_stop": signal.stop_loss, "index_target": signal.target,
+        "index_stop": entry_plan.stop, "index_target": entry_plan.target,
+        "planned_entry": entry_plan.planned_entry,
+        "planned_stop": entry_plan.planned_stop,
+        "planned_target": entry_plan.planned_target,
+        "gap_amount": entry_plan.gap_amount,
+        "execution_policy": entry_plan.execution_policy,
         "premium_entry": premium_entry,
         "premium_stop": premium_stop, "premium_target": premium_target,
         "premium_risk": premium_risk,
@@ -549,7 +641,14 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
         "quantity": decision.quantity, "lots": decision.lots,
         "risk_amount": decision.risk_amount,
         "risk": decision.to_dict(),
-        "entry_index": i + 1,
+        # The bar the position actually opens on, not the one after the
+        # decision. They are the same bar only at zero latency. Storing
+        # `i + 1` regardless started the bar count, the time cap and the
+        # session-exit check before the position existed — and on a long
+        # latency the ledger recorded the OPEN at the fill stamp after it
+        # had already recorded a CLOSE at an earlier bar's close, which is
+        # where `position clock moved backwards` came from.
+        "entry_index": exec_index,
         "entry_time": fill_stamp.isoformat(),
         "entry_day": fill_ist.date(),
         "entry_session": fill_ist.date(),
@@ -569,40 +668,39 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
 def _exit_trigger(trade, bar, ist, i, cfg):
     """Which rule closes this trade on this bar, if any.
 
+    Returns (index level, reason, trigger level, ambiguous).
+
     Order matters and is deliberately pessimistic. Expiry first because an
-    expired contract cannot be held whatever else happened; then the stop,
-    because when one bar touches both the stop and the target there is no
-    way to know which came first and assuming the good one is how a backtest
-    flatters itself.
+    expired contract cannot be held whatever else happened; then the levels,
+    resolved by `backtest.execution` so that this strategy, both backtest
+    engines and the signal evaluator agree on what a stop that gapped is
+    worth and on when one bar covering both levels is a guess rather than an
+    observation.
     """
     if ist >= trade["selection"].expiry:
-        return float(bar["close"]), EXPIRY, None
+        return float(bar["close"]), EXPIRY, None, False
 
     if not cfg.hold_overnight and ist.date() != trade["entry_session"]:
-        return float(bar["open"]), SESSION_BOUNDARY, None
+        return float(bar["open"]), SESSION_BOUNDARY, None, False
 
-    long_index = trade["direction"] == "BUY"
-    stop, target = trade["index_stop"], trade["index_target"]
-
-    hit_stop = bar["low"] <= stop if long_index else bar["high"] >= stop
-    hit_target = bar["high"] >= target if long_index else bar["low"] <= target
-
-    if hit_stop:
-        fill = min(stop, float(bar["open"])) if long_index else max(stop, float(bar["open"]))
-        return fill, ("stop_gap" if fill != stop else STOP), stop
-    if hit_target:
-        return target, TARGET, target
+    hit = execution_module.resolve_levels(
+        trade["direction"], bar_open=float(bar["open"]),
+        high=float(bar["high"]), low=float(bar["low"]),
+        stop=trade["index_stop"], target=trade["index_target"],
+        policy=cfg.execution_policy)
+    if hit is not None:
+        return hit.price, hit.reason, hit.level, hit.ambiguous_intrabar
     if i - trade["entry_index"] >= cfg.max_bars_in_trade:
-        return float(bar["close"]), TIME, None
+        return float(bar["close"]), TIME, None, False
     if ist.time() >= cfg.session_exit_ist:
-        return float(bar["close"]), SESSION_END, None
-    return None, "", None
+        return float(bar["close"]), SESSION_END, None, False
+    return None, "", None, False
 
 
 def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
                 slippage):
     """Close the trade if a rule fires, and price the exit honestly."""
-    index_exit, reason, trigger = _exit_trigger(trade, bar, ist, i, cfg)
+    index_exit, reason, trigger, ambiguous = _exit_trigger(trade, bar, ist, i, cfg)
     if index_exit is None and (i == len(feed) - 1 or (not cfg.hold_overnight and not feed.can_enter(i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute))):
         index_exit = float(bar["close"])
         reason = "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
@@ -637,10 +735,14 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
     premium_exit = fill.filled
     quantity = trade["quantity"]
 
-    gross = (premium_exit - trade["premium_entry"]) * quantity
-    charges = costs.round_trip(buy_price=trade["premium_entry"],
-                               sell_price=premium_exit, quantity=quantity)
-    pnl = gross - charges.total
+    # The contract is bought to open and sold to close whichever way the
+    # index trade pointed, and every charge is levied on the premium legs.
+    money = execution_module.account(
+        entry_side="BUY", entry_price=trade["premium_entry"],
+        exit_price=premium_exit, quantity=quantity, costs=costs,
+        reference_entry=trade["entry_reference"],
+        reference_exit=fill.requested)
+    pnl = money.net_pnl
 
     # The decay bill: what the passage of time cost, holding the index level
     # and the volatility fixed. Both sides are modelled *at the same spot and
@@ -682,10 +784,14 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
         premium_target=round(trade["premium_target"], 2),
         premium_exit=round(premium_exit, 2),
         lots=trade["lots"], quantity=quantity,
-        gross_pnl=round((fill.requested - trade["entry_reference"]) * quantity, 2),
-        execution_friction=round((fill.slippage + trade["entry_friction"]) * quantity, 2),
-        fees=round(charges.total, 2), timing=trade["timing"],
-        costs=charges.to_dict(),
+        gross_pnl=round(money.gross_pnl, 2),
+        execution_friction=round(money.execution_friction, 2),
+        spread_cost=round((trade["entry_spread_cost"] + fill.spread_cost)
+                          * quantity, 2),
+        impact_cost=round((trade["entry_impact_cost"] + fill.impact_cost)
+                          * quantity, 2),
+        fees=round(money.total_fees, 2), timing=trade["timing"],
+        costs=money.breakdown,
         pnl=round(pnl, 2),
         r_multiple=round(pnl / risk_amount, 3) if risk_amount else 0.0,
         risk_amount=round(risk_amount, 2),
@@ -709,6 +815,17 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
         sizing_iv=round(trade["sizing_iv"], 4),
         selection=chosen.to_dict(),
         risk=trade["risk"],
+        entry_side=money.entry_side, exit_side=money.exit_side,
+        planned_entry=round(trade["planned_entry"], 2),
+        actual_entry=round(trade["index_entry"], 2),
+        planned_stop=round(trade["planned_stop"], 2),
+        planned_target=round(trade["planned_target"], 2),
+        gap_amount=round(trade["gap_amount"], 4),
+        execution_policy=trade["execution_policy"],
+        ambiguous_intrabar=ambiguous,
+        brokerage=round(money.brokerage, 2),
+        statutory_fees=round(money.statutory_fees, 2),
+        net_pnl=round(money.net_pnl, 2),
     )
     return built, pnl
 
@@ -732,11 +849,12 @@ def _limitations(cfg, evidence: dict) -> list[str]:
     """What this result cannot tell you. Always present, never a footnote."""
     out = [
         "Option premiums are stored at bucket resolution, not as a tick tape. "
-        "An OBSERVED entry therefore pays the last quote available at the "
-        "decision bar while the index fills at the next bar's open, and an "
-        "OBSERVED exit fills at the close of the bar that triggered rather "
-        "than at the trigger level. Per trade, `entry_basis` and `exit_basis` "
-        "say which pairing was used.",
+        "An OBSERVED entry pays a quote that became available at or after "
+        "the moment the order could first have been working — never an "
+        "earlier one, at any latency — and an OBSERVED exit fills at the "
+        "close of the bar that triggered rather than at the trigger level. "
+        "Per trade, `entry_basis` and `exit_basis` say which pairing was "
+        "used.",
         "Position sizing is always modelled: no archive holds the premium at "
         "a level the index never reached, so the stop premium is projected "
         "with Black-Scholes.",
@@ -750,7 +868,25 @@ def _limitations(cfg, evidence: dict) -> list[str]:
         "sides of it are Black-Scholes at the same index level and the same "
         "IV, differing only in time remaining. It says what the clock cost, "
         "not what the trade lost.",
+        "A stop the bar gapped through fills at the bar's open and is worse "
+        "than the stop; a target the bar gapped through fills at the open "
+        "and is better than the target. One rule, applied to whichever "
+        "level the bar opened past, favouring neither side.",
+        "`max_drawdown_pct` is measured on this run's own realised equity "
+        "curve: one position at a time, marked only when a trade closes, "
+        "starting from `starting_capital` and never constrained by it. It "
+        "is not a daily mark-to-market portfolio drawdown and no margin "
+        "model stands behind it. `drawdown_basis` on the stats block says "
+        "the same thing in one line.",
     ]
+    if cfg.execution_policy.latency_seconds > 0:
+        out.append(
+            f"A {cfg.execution_policy.latency_seconds:g}s execution latency "
+            "is configured. Every archived quote for the contract became "
+            "available before the order could exist, and the first eligible "
+            "one lies past the walk, so entry premiums in this run are "
+            "modelled and carry `entry_basis = modelled_no_eligible_quote`. "
+            "Nothing here is evidence about traded entry prices.")
     if cfg.pricing_policy == MODELLED_ONLY:
         out.append(
             "Every premium in this run is Black-Scholes at a constant IV. "

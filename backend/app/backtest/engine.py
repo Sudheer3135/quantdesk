@@ -10,6 +10,11 @@ not reached and returns the next bar's *open alone* rather than the whole
 row. See `backtest/feed.py` for why one number instead of one row matters.
 
 Costs are charged on both legs so the equity curve is net, not gross.
+
+Fills, levels, ambiguity and money are not decided here. They come from
+`backtest/execution.py`, which the option engine, the option-buying
+strategy and the signal evaluator also call, so that "stopped out" means
+one thing across the platform instead of four slightly different things.
 """
 from __future__ import annotations
 
@@ -22,7 +27,9 @@ import pandas as pd
 
 from ..analytics import signal_engine
 from ..risk.manager import DayState, RiskConfig, evaluate
+from . import execution
 from .costs import CostModel, FlatCostModel, SlippageModel, describe
+from .execution import ExecutionPolicy
 from .feed import HistoricalFeed
 from .measurement import PositionLedger, provenance
 
@@ -46,6 +53,27 @@ class Trade:
     execution_friction: float = 0.0
     fees: float = 0.0
     timing: dict = field(default_factory=dict)
+
+    # The execution record. Everything needed to rebuild the trade's money
+    # and its levels without re-running the engine, and specifically the
+    # four numbers that used to be conflated into one: what was planned,
+    # what filled, and the two levels the plan named.
+    entry_side: str = ""
+    exit_side: str = ""
+    planned_entry: float = 0.0
+    actual_entry: float = 0.0
+    planned_stop: float = 0.0
+    planned_target: float = 0.0
+    gap_amount: float = 0.0
+    execution_policy: str = execution.KEEP_PLANNED
+    # True when one bar covered both the stop and the target and the bar's
+    # own open did not say which came first. The exit is then a policy
+    # choice, not an observation, and a result should say how many of its
+    # trades rest on it.
+    ambiguous_intrabar: bool = False
+    brokerage: float = 0.0
+    statutory_fees: float = 0.0
+    net_pnl: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -151,6 +179,17 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         "gross_pnl": round(sum(t.gross_pnl for t in trades), 2),
         "execution_friction": round(sum(t.execution_friction for t in trades), 2),
         "fees_taxes": round(sum(t.fees for t in trades), 2),
+        "brokerage": round(sum(t.brokerage for t in trades), 2),
+        "statutory_fees": round(sum(t.statutory_fees for t in trades), 2),
+        # How much of this result is an assumption rather than an
+        # observation. Every one of these trades had a bar covering both
+        # levels with an open that settled neither, so its outcome was
+        # chosen by policy. Reported next to the P&L because it belongs
+        # next to the P&L.
+        "ambiguous_trade_count": sum(1 for t in trades if t.ambiguous_intrabar),
+        "gapped_exit_count": sum(1 for t in trades
+                                 if t.exit_reason in (execution.STOP_GAP,
+                                                      execution.TARGET_GAP)),
         "return_pct": round(float(pnls.sum()) / starting_capital * 100, 2),
         "avg_win": round(float(wins.mean()), 2) if len(wins) else 0.0,
         "avg_loss": round(float(losses.mean()), 2) if len(losses) else 0.0,
@@ -161,6 +200,16 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         "expectancy_r": round(float(rs.mean()), 3),
         "avg_r_win": round(float(rs[rs > 0].mean()), 3) if (rs > 0).any() else 0.0,
         "max_drawdown_pct": round(max_dd, 2),
+        # What that drawdown is measured on, stated rather than assumed.
+        # Sequential and non-overlapping: this engine holds one position
+        # at a time and marks equity when a trade closes. That is not the
+        # signal study's overlapping hypothetical outcome curve, which
+        # carries its own name for exactly this reason. It is also not a
+        # daily mark-to-market portfolio — no capital constraint and no
+        # margin model stands behind it.
+        "drawdown_basis": (
+            "realised_pnl_at_exit; one position at a time; non-overlapping; "
+            "no capital constraint; not daily mark-to-market"),
         "sharpe": round(sharpe, 2),
         "sortino": round(sortino, 2),
         # Without this, the ratio above is a number with no units. Two runs
@@ -186,9 +235,18 @@ def run(
     analysis_window: int = 300,
     cost_model: CostModel | FlatCostModel | None = None,
     slippage_model: SlippageModel | None = None,
+    execution_policy: ExecutionPolicy | None = None,
     dataset: dict | None = None,
 ) -> BacktestResult:
     """Walk the candles forward and simulate the rulebook.
+
+    `execution_policy` carries every assumption about *how* a decision
+    becomes a trade — the latency before an order can work, what happens to
+    the levels when the fill gaps away from the planned entry, and which
+    level is assumed to have filled first when one bar covers both. The
+    defaults are the conservative ones and they are written into the
+    result's assumptions, because a backtest that does not state them
+    cannot be compared with one that assumed differently.
 
     Costs default to a flat rupee charge per round trip, which is the right
     shape here and only here: this engine trades index points, so there is
@@ -206,6 +264,7 @@ def run(
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
     costs = cost_model or FlatCostModel(per_round_trip=cost_per_round_trip)
     slip_model = slippage_model or SlippageModel(index_pct=slippage_pct)
+    policy = execution_policy or ExecutionPolicy()
 
     equity = starting_capital
     curve: list[float] = [equity]
@@ -216,6 +275,10 @@ def run(
     ledger = PositionLedger()
     initial_risk = asdict(cfg)
     custom_signal = signal_fn
+    stamps = feed.stamps()
+    # Entries the fill invalidated. Counted, never filled — a rejected entry
+    # that reappears anywhere as a trade would be the worst of both.
+    rejected_gap_entries = 0
 
     for i in feed.walk(warmup, reserve=0):
         bar = feed.bar(i)
@@ -224,21 +287,20 @@ def run(
         state = day_states.setdefault(today, DayState(trading_day=today))
 
         # ---- manage an open trade on this bar -------------------------
-        if open_trade:
-            hit_stop = (bar["low"] <= open_trade["stop"]) if open_trade["side"] == "BUY" \
-                else (bar["high"] >= open_trade["stop"])
-            hit_target = (bar["high"] >= open_trade["target"]) if open_trade["side"] == "BUY" \
-                else (bar["low"] <= open_trade["target"])
-
+        # Never before the bar the order filled on. With a latency the fill
+        # can land several bars after the signal, and the bars in between
+        # belong to a period when no position existed.
+        if open_trade and i >= open_trade["entry_index"]:
             exit_price, reason = None, ""
-            # If both are touched inside one candle, assume the stop filled
-            # first. Pessimistic on purpose — never flatter the backtest.
-            if hit_stop:
-                stop = open_trade["stop"]
-                exit_price = min(stop, float(bar["open"])) if open_trade["side"] == "BUY" else max(stop, float(bar["open"]))
-                reason = "stop_gap" if exit_price != stop else "stop"
-            elif hit_target:
-                exit_price, reason = open_trade["target"], "target"
+            ambiguous = False
+            level_exit = execution.resolve_levels(
+                open_trade["side"], bar_open=float(bar["open"]),
+                high=float(bar["high"]), low=float(bar["low"]),
+                stop=open_trade["stop"], target=open_trade["target"],
+                policy=policy)
+            if level_exit is not None:
+                exit_price, reason = level_exit.price, level_exit.reason
+                ambiguous = level_exit.ambiguous_intrabar
             elif i - open_trade["entry_index"] >= max_bars_in_trade:
                 exit_price, reason = float(bar["close"]), "time"
             elif moment.time().hour >= 15 and moment.time().minute >= 15:
@@ -252,12 +314,15 @@ def run(
                 direction = 1 if open_trade["side"] == "BUY" else -1
                 slip = slip_model.index_points(exit_price) * direction
                 fill = exit_price - slip
-                gross = (fill - open_trade["entry"]) * direction * qty
-                charges = costs.round_trip(
-                    buy_price=min(open_trade["entry"], fill),
-                    sell_price=max(open_trade["entry"], fill),
-                    quantity=qty)
-                pnl = gross - charges.total
+                # Legs from the side, money from one place. The exit of a
+                # long is a sale whatever the two prices happen to be.
+                money = execution.account(
+                    entry_side=open_trade["side"],
+                    entry_price=open_trade["entry"], exit_price=fill,
+                    quantity=qty, costs=costs,
+                    reference_entry=open_trade["reference_entry"],
+                    reference_exit=exit_price)
+                pnl = money.net_pnl
                 equity += pnl
                 risk_unit = abs(open_trade["entry"] - open_trade["stop"]) * qty
                 trades.append(Trade(
@@ -273,9 +338,20 @@ def run(
                     r_multiple=round(pnl / risk_unit, 3) if risk_unit else 0.0,
                     exit_reason=reason,
                     confidence=open_trade["confidence"],
-                    gross_pnl=round((exit_price-open_trade["reference_entry"])*direction*qty,2),
-                    execution_friction=round((abs(fill-exit_price)+abs(open_trade["entry"]-open_trade["reference_entry"]))*qty,2),
-                    fees=round(charges.total,2), timing=open_trade["timing"],
+                    gross_pnl=round(money.gross_pnl, 2),
+                    execution_friction=round(money.execution_friction, 2),
+                    fees=round(money.total_fees, 2), timing=open_trade["timing"],
+                    entry_side=money.entry_side, exit_side=money.exit_side,
+                    planned_entry=round(open_trade["planned_entry"], 2),
+                    actual_entry=round(open_trade["entry"], 2),
+                    planned_stop=round(open_trade["planned_stop"], 2),
+                    planned_target=round(open_trade["planned_target"], 2),
+                    gap_amount=round(open_trade["gap_amount"], 4),
+                    execution_policy=open_trade["execution_policy"],
+                    ambiguous_intrabar=ambiguous,
+                    brokerage=round(money.brokerage, 2),
+                    statutory_fees=round(money.statutory_fees, 2),
+                    net_pnl=round(money.net_pnl, 2),
                 ))
                 pnl = round(pnl, 2)
                 # Account balances reconcile exactly to the reported monetary ledger.
@@ -307,23 +383,54 @@ def run(
             continue
 
         direction = 1 if sig.action == "BUY" else -1
+        signal_time = feed.close_time(i)
+        earliest = execution.earliest_execution_time(signal_time, policy)
+        entry_index = execution.first_executable_index(stamps, i, signal_time, policy)
+        if entry_index is None:
+            continue
         # The only permitted look forward, and it is one number wide.
-        next_open = feed.next_open(i)
+        fill_stamp, next_open = feed.execution_open(i, entry_index)
+        if fill_stamp < earliest:
+            # Cannot happen given how `entry_index` was chosen. Asserted
+            # anyway: this is the invariant the whole latency model rests
+            # on, and a silent violation of it is a fill from before the
+            # order existed.
+            raise RuntimeError("fill precedes the earliest executable time")
         entry_fill = next_open + slip_model.index_points(next_open) * direction
-        shift = entry_fill - sig.entry
+
+        # What the fill did to the plan. The levels are the strategy's own
+        # unless the policy says otherwise, and a fill that has already
+        # reached one of them does not become a trade.
+        entry = execution.plan_entry(
+            sig.action, planned_entry=sig.entry, planned_stop=sig.stop_loss,
+            planned_target=sig.target, actual_entry=entry_fill, policy=policy)
+        if not entry.accepted:
+            rejected_gap_entries += 1
+            continue
+
         open_trade = {
             "reference_entry": next_open,
-            "timing": {"bar_open_time": feed.timestamp(i).isoformat(), "bar_close_time": feed.close_time(i).isoformat(), "signal_time": feed.close_time(i).isoformat(), "earliest_execution_time": feed.next_timestamp(i).isoformat()},
+            "timing": {"bar_open_time": feed.timestamp(i).isoformat(),
+                       "bar_close_time": signal_time.isoformat(),
+                       "signal_time": signal_time.isoformat(),
+                       "earliest_execution_time": earliest.isoformat(),
+                       "actual_fill_time": fill_stamp.isoformat(),
+                       "execution_latency_seconds": policy.latency_seconds},
             "side": sig.action,
-            "entry": entry_fill,
-            "stop": sig.stop_loss + shift,
-            "target": sig.target + shift,
+            "entry": entry.actual_entry,
+            "stop": entry.stop,
+            "target": entry.target,
+            "planned_entry": entry.planned_entry,
+            "planned_stop": entry.planned_stop,
+            "planned_target": entry.planned_target,
+            "gap_amount": entry.gap_amount,
+            "execution_policy": entry.execution_policy,
             "quantity": decision.quantity,
-            "entry_index": i + 1,
-            "entry_time": feed.next_timestamp(i).isoformat(),
+            "entry_index": entry_index,
+            "entry_time": fill_stamp.isoformat(),
             "confidence": sig.confidence,
         }
-        ledger.enter(feed.close_time(i), feed.next_timestamp(i), decision.quantity)
+        ledger.enter(signal_time, fill_stamp, decision.quantity)
         state.record_fill()
 
     return BacktestResult(
@@ -333,10 +440,14 @@ def run(
             "warmup_bars": warmup,
             "analysis_window": analysis_window,
             "max_bars_in_trade": max_bars_in_trade,
-            "stop_fills_first_when_both_touched": True,
+            "stop_fills_first_when_both_touched":
+                policy.intrabar == execution.STOP_FIRST,
+            "execution": policy.describe(),
+            "entries_rejected_due_to_gap": rejected_gap_entries,
         },
         dataset=(dataset or {}) | {"reproducibility": provenance(candles,
             {"risk": initial_risk, "costs": describe(costs, slip_model),
+             "execution": policy.describe(),
              "warmup": warmup, "analysis_window": analysis_window,
              "max_bars_in_trade": max_bars_in_trade}, custom_signal),
              "positions": ledger.finish(trades, starting_capital, equity)},

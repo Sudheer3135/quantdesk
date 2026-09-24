@@ -257,6 +257,52 @@ class HistoricalFeed:
         self._guard(index, "next_timestamp")
         return self._frame["timestamp"].iloc[index + 1]
 
+    def execution_timestamp(self, index: int, execution_index: int) -> pd.Timestamp:
+        """*When* a decision made on bar `index` would fill — no price.
+
+        Split out of `execution_open` so eligibility can be decided before
+        any price is touched. The order matters: a candidate bar that fails
+        the execution clock must be refused without its open ever being
+        read, because reading it is the causal violation. Raising afterwards
+        stops a bad number reaching the result but not the look-ahead from
+        having happened, and a test cannot tell the two apart if the only
+        accessor returns both at once.
+        """
+        self._guard(index, "execution_timestamp")
+        if execution_index <= index:
+            raise ValueError(
+                f"execution bar {execution_index} does not follow decision "
+                f"bar {index}; a fill cannot precede its own signal")
+        if execution_index >= len(self._frame):
+            raise IndexError(f"no bar at {execution_index} to execute on")
+        return self._frame["timestamp"].iloc[execution_index]
+
+    def execution_open(self, index: int, execution_index: int) -> tuple[pd.Timestamp, float]:
+        """When and at what price a decision made on bar `index` fills.
+
+        The same single number `next_open` hands over, but for a bar chosen
+        by the clock rather than by position — which is what an execution
+        latency does. With no latency `execution_index` is `index + 1` and
+        this is `next_timestamp`/`next_open` together; with latency it is
+        the first bar opening at or after the deadline, possibly several
+        bars later if the market was closed in between.
+
+        The forward reach is still exactly one open. Bars strictly between
+        the decision and the fill are skipped, not read: they existed before
+        the order did, and a fill priced from them would be a fill at a
+        price the order could never have reached.
+        """
+        stamp = self.execution_timestamp(index, execution_index)
+        return stamp, float(self._frame["open"].iloc[execution_index])
+
+    def stamps(self) -> pd.Series:
+        """The bar-open clock, for deciding which bar an order may reach.
+
+        A clock reading only — no prices — so handing it to the execution
+        layer cannot leak a bar the walk has not arrived at.
+        """
+        return self._frame["timestamp"]
+
     # ---- self-checking -------------------------------------------------
 
     def verify_causality(self, samples: int = 8, seed: int = 0) -> CausalityReport:

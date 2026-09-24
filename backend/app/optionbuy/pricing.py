@@ -64,11 +64,19 @@ MIN_TRADABLE_PREMIUM = 0.05
 
 
 class UnpriceableContract(RuntimeError):
-    """No premium this policy will accept. Never a reason to invent one."""
+    """No premium this policy will accept. Never a reason to invent one.
 
-    def __init__(self, reason: str) -> None:
+    `ineligible` separates two refusals a caller has to count differently:
+    a contract the archive cannot price at all, and one whose only stored
+    quotes became available before the order could have existed. The second
+    is the execution clock doing its job, not a hole in the data, and
+    folding them into one rejection code would hide which it was.
+    """
+
+    def __init__(self, reason: str, *, ineligible: bool = False) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.ineligible = ineligible
 
 
 @dataclass
@@ -143,7 +151,8 @@ def allowed(policy: str) -> tuple[str, ...]:
     return _ALLOWED[policy]
 
 
-def _from_bar(bar: OptionBar, moment: datetime) -> Quote:
+def _from_bar(bar: OptionBar, moment: datetime,
+              available_from: datetime | None = None) -> Quote:
     age = int((moment - bar.timestamp).total_seconds() // 60)
     freshness = "at this bar" if age <= 0 else f"{age} min old"
     if bar.observed_tape:
@@ -155,7 +164,9 @@ def _from_bar(bar: OptionBar, moment: datetime) -> Quote:
         premium=float(bar.close),
         evidence=evidence_for(bar),
         basis=basis,
-        reference=bar.reference(),
+        reference=bar.reference() | (
+            {"available_from": available_from.isoformat()}
+            if available_from is not None else {}),
         bid=bar.bid, ask=bar.ask, iv_used=bar.iv,
         open_interest=bar.open_interest, volume=bar.volume,
         bar_kind=bar.bar_kind,
@@ -192,6 +203,7 @@ def quote(
     years: float,
     policy: str = PREFER_OBSERVED,
     model: ModelAssumptions | None = None,
+    eligible_from: datetime | None = None,
 ) -> Quote:
     """The premium this policy is willing to use, with its label attached.
 
@@ -204,16 +216,31 @@ def quote(
     permitted = allowed(policy)
 
     if policy != MODELLED_ONLY:
-        bar = store.bar_at(key, moment)
+        # `eligible_from` is the execution clock. A quote that became
+        # available before the order could exist is not an observation this
+        # fill may use, so the store refuses it and the policy below decides
+        # what to do instead — exactly as it would for a contract the
+        # collector never priced at all.
+        bar = store.bar_at(key, moment, eligible_from=eligible_from)
         if bar is not None and bar.close >= MIN_TRADABLE_PREMIUM:
-            found = _from_bar(bar, moment)
+            found = _from_bar(bar, moment, store.available_from(bar))
             if found.evidence in permitted:
                 return found
 
     if MODELLED not in permitted:
+        # Was it the eligibility floor that blocked this, or is there simply
+        # no usable quote? Asked by dropping the floor and looking again, so
+        # the answer is the store's and not an inference from the message.
+        ineligible = bool(
+            eligible_from is not None
+            and store.bar_at(key, moment, eligible_from=eligible_from) is None
+            and store.bar_at(key, moment) is not None)
+        since = (f" available at or after {eligible_from.isoformat()}"
+                 if eligible_from is not None else "")
         raise UnpriceableContract(
-            f"no stored quote for {key.label()} at {moment.isoformat()}, and "
-            f"the {policy} policy does not permit a modelled premium")
+            f"no stored quote for {key.label()} at {moment.isoformat()}"
+            f"{since}, and the {policy} policy does not permit a modelled "
+            "premium", ineligible=ineligible)
 
     return modelled_quote(spot, key, years, model)
 

@@ -162,6 +162,7 @@ class ChainStore:
                        _as_utc(contracts[bar.key].first_seen) if bar.key in contracts and contracts[bar.key].first_seen else _as_utc(bar.timestamp))
         self._bars = {k: sorted(v, key=available) for k, v in bars.items()}
         self._stamps = {k: [available(b) for b in v] for k, v in self._bars.items()}
+        self._available = available
         self.contracts = contracts
         self.underlying = underlying
         self.timeframe = timeframe
@@ -188,6 +189,19 @@ class ChainStore:
         """Set the clock without walking. For tests and for resuming."""
         self._now = _as_utc(moment) if moment is not None else None
 
+    def available_from(self, bar: OptionBar) -> datetime:
+        """When this bar actually became readable, as the store ordered it.
+
+        Not the same as `OptionBar.available_at`, which is only one of the
+        three inputs: a bucket stamped 05:25 is not readable until the
+        bucket has closed at 05:30, and a contract's `first_seen` can push
+        it later still. The citation on a trade used to print the raw field,
+        so a fill that was correctly eligible at 05:30 cited a 05:25
+        availability and could not be checked against its own execution
+        clock. This is the number the store compared.
+        """
+        return self._available(bar)
+
     def _guard(self, moment: datetime, what: str) -> datetime:
         moment = _as_utc(moment)
         if self._now is None:
@@ -204,13 +218,27 @@ class ChainStore:
     # ---- reading -------------------------------------------------------
 
     def bar_at(self, key: ContractKey, moment: datetime,
-               *, allow_stale: bool = False) -> OptionBar | None:
+               *, allow_stale: bool = False,
+               eligible_from: datetime | None = None) -> OptionBar | None:
         """The last quote printed on or before `moment`, if it is current.
 
         None means *no observation* and never a modelled stand-in. Deciding
         what to do without one belongs to the pricing policy, which has to
         label the answer; a store that quietly substituted a model would put
         that label out of reach.
+
+        `eligible_from` is the execution clock: the earliest instant an order
+        from this decision could have been working. A quote that became
+        available before that instant is not a price the order could have
+        been given, however recent it is, so it is refused rather than
+        returned.
+
+        That is not a latency special case. At zero latency the clock is the
+        decision instant itself, and a bucket that became available five
+        minutes earlier is exactly as unreachable then as it is under a
+        latency. Staleness and eligibility are different questions — a quote
+        can be entirely fresh and still have printed before the order
+        existed — and only one of them used to be asked.
         """
         moment = self._guard(moment, f"bar_at {key.label()}")
         stamps = self._stamps.get(key)
@@ -219,6 +247,12 @@ class ChainStore:
 
         position = bisect_right(stamps, moment) - 1
         if position < 0:
+            return None
+        # Availability ascends, so the candidate above is the newest quote
+        # the walk can see. If even that one became available before the
+        # order could exist, every earlier one did too and there is no
+        # eligible observation to be had.
+        if eligible_from is not None and stamps[position] < _as_utc(eligible_from):
             return None
         bar = self._bars[key][position]
 

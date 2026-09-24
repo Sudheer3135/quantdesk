@@ -126,8 +126,23 @@ def stats(trades: Sequence, curve: Sequence[float],
         "net_pnl": round(float(pnls.sum()), 2),
         "gross_pnl": round(float(gross.sum()), 2),
         "fees_taxes": round(float(charges.sum()), 2),
+        "brokerage": round(float(sum(t.brokerage for t in trades)), 2),
+        "statutory_fees": round(float(sum(t.statutory_fees for t in trades)), 2),
         "execution_friction": round(float(friction.sum()), 2),
+        # The same friction, split by cause. A quoted spread is measured and
+        # a sensitivity sweep cannot move it; the impact on top of it is an
+        # assumption and is the only part that scales. One combined figure
+        # made a flat sweep over a real book look like a finding.
+        "spread_cost": round(float(sum(t.spread_cost for t in trades)), 2),
+        "impact_cost": round(float(sum(t.impact_cost for t in trades)), 2),
         "total_costs": round(float(charges.sum() + friction.sum()), 2),
+        # How many of these outcomes were chosen by the stop-first rule
+        # rather than observed, and how many exits filled away from their
+        # level because the bar gapped through it. Both are properties of
+        # the sample and belong beside the win rate, not in a footnote.
+        "ambiguous_trade_count": sum(1 for t in trades if t.ambiguous_intrabar),
+        "gapped_exit_count": sum(
+            1 for t in trades if t.exit_reason in ("stop_gap", "target_gap")),
         "cost_per_trade": round(float(charges.mean()), 2),
         "return_pct": round(float(pnls.sum()) / starting_capital * 100, 2),
         "expectancy_per_trade": round(float(pnls.mean()), 2),
@@ -144,6 +159,16 @@ def stats(trades: Sequence, curve: Sequence[float],
         "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss else None,
         "max_drawdown_pct": round(float(drawdown.min()) * 100, 2),
         "max_drawdown_value": round(float((equity - peak).min()), 2),
+        # What that drawdown is measured on, stated rather than assumed.
+        # This run holds one position at a time and marks equity when a
+        # trade closes, so the curve is sequential and non-overlapping —
+        # unlike the signal study's overlapping outcome curve, which is a
+        # different thing and carries a different name. It is still not a
+        # daily mark-to-market portfolio: nothing constrains the capital
+        # and no margin model stands behind it.
+        "drawdown_basis": (
+            "realised_pnl_at_exit; one position at a time; non-overlapping; "
+            "no capital constraint; not daily mark-to-market"),
         "avg_decay_cost": round(float(decay.mean()), 2),
         "total_decay_cost": round(float(decay.sum()), 2),
         "right_direction_but_lost": right_but_lost,

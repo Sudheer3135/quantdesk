@@ -65,12 +65,36 @@ class CostModel:
 
     orders_per_round_trip: int = 2
 
+    # What the percentages above are percentages *of*. Every rate in this
+    # schedule is levied on premium turnover, so this model is only correct
+    # when it is handed a premium. Handing it an index level charges option
+    # rates on 24,000 a point instead of a hundred-odd rupees of premium and
+    # produces a bill roughly two hundred times too large; the index
+    # backtest uses `FlatCostModel` for exactly that reason. The field
+    # exists so a caller can check rather than assume.
+    turnover_basis: str = "option_premium"
+
+    # Whether anyone has checked these against a real contract note on a
+    # known date. "assumed" is the honest default: the numbers above were
+    # read off circulars, not off a settlement, and no date-stamped source
+    # document is stored alongside them. A run that reports its costs as
+    # verified when nothing verified them is worse than one that says
+    # nothing, because the claim travels further than the caveat.
+    schedule_status: str = "assumed"
+
     def round_trip(self, buy_price: float, sell_price: float,
                    quantity: int) -> CostBreakdown:
         """Every charge on one complete long-option round trip.
 
         `quantity` is contracts, not lots — a NIFTY lot is 75 contracts and
         the charges scale with the contract count.
+
+        `buy_price` and `sell_price` are the prices of the *buy leg* and the
+        *sell leg*, decided by the side each order was sent on. They are not
+        the lower and the higher of the two prices: STT falls on the sale
+        and stamp duty on the purchase, so inferring the legs from price
+        order misplaces both on every losing long. `execution.legs` does
+        this correctly and is what the engines call.
         """
         buy_turnover = max(0.0, buy_price) * quantity
         sell_turnover = max(0.0, sell_price) * quantity
@@ -135,9 +159,17 @@ class SlippageModel:
     ticks: float = 2.0
     tick_size: float = TICK_SIZE
 
-    # How much of the quoted spread a market order gives up. 0.5 is the
-    # mid-to-touch distance — optimistic for a resting book, roughly right
-    # for a liquid weekly strike.
+    # How much of the quoted spread a market order gives up, used by
+    # `per_unit` to estimate a per-contract cost from a book.
+    #
+    # It deliberately does *not* reach the quoted fill path below. When a
+    # real bid and ask are stored the spread is a measurement, not an
+    # assumption, and a market order crosses it in full: a buy lifts the
+    # ask, a sell hits the bid. Scaling a measured spread would be inventing
+    # a different market rather than stressing the execution assumption, and
+    # shrinking it would manufacture fills better than the touch. What a
+    # sensitivity sweep varies on a quoted book is `impact_ticks` — the part
+    # that genuinely is an assumption.
     spread_fraction: float = 0.5
     execution_model: str = "ltp_slippage"  # or conservative_spread
     estimated_spread_pct: float = 1.0
@@ -160,11 +192,23 @@ class SlippageModel:
 
 @dataclass
 class Fill:
-    """One executed leg, priced honestly."""
+    """One executed leg, priced honestly.
+
+    `slippage` is the whole distance from the reference to the fill, and it
+    is split because the two halves answer different questions. `spread_cost`
+    is what the market charged — on a quoted book it is the measured
+    half-spread, and no assumption of this platform's can make it smaller.
+    `impact_cost` is what this run *assumed* on top of that, and it is the
+    only part a sensitivity sweep is entitled to vary. Reporting one number
+    made a sweep over a quoted book look flat when it was in fact measuring
+    a spread it could not move.
+    """
     requested: float
     filled: float
     slippage: float
     basis: str
+    spread_cost: float = 0.0
+    impact_cost: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -197,19 +241,47 @@ def _execution_fill(price, model, bid, ask, *, buying):
         raise ValueError("execution friction cannot be negative")
     impact = model.impact_ticks * model.tick_size
     if bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask:
-        # Reference is midpoint, never arbitrary LTP. Crossing the spread is friction.
+        # Reference is midpoint, never arbitrary LTP. Crossing the spread is
+        # friction, and the two components are kept apart:
+        #
+        #   spread_cost  the measured half-spread. The market's number. A
+        #                sweep at 0x does not erase it, because a zero
+        #                *slippage assumption* is not a claim that the book
+        #                was one tick wide.
+        #   impact_cost  what this run assumes a market order moves the
+        #                touch by. The assumption, and the only part a
+        #                multiplier scales.
+        #
+        # Adding the two once, here, is also what stops the spread being
+        # counted twice: the fill is the touch plus impact, never the touch
+        # plus a re-derived spread plus impact.
         reference = (bid + ask) / 2
+        spread_cost = (ask - bid) / 2
         filled = ask + impact if buying else max(0, bid - impact)
         basis = "quoted_touch_estimated_impact"
+        # A sell floored at zero gives up less than the model asked for, so
+        # the components are read back off the fill rather than asserted.
+        realised = abs(filled - reference)
+        impact_cost = max(0.0, realised - spread_cost)
+        spread_cost = min(spread_cost, realised)
     else:
         reference = price
-        slip = model.ticks * model.tick_size + impact
-        if model.execution_model == "conservative_spread":
-            slip += price * model.estimated_spread_pct / 200
+        spread_estimate = (price * model.estimated_spread_pct / 200
+                           if model.execution_model == "conservative_spread"
+                           else 0.0)
+        slip = model.ticks * model.tick_size + impact + spread_estimate
         filled = price + slip if buying else max(0, price - slip)
         basis = "estimated_" + model.execution_model
+        # No book, so nothing here is measured: the whole distance is an
+        # assumption. The estimated spread is still reported under
+        # `spread_cost` so the two branches read the same way, but it is an
+        # estimate and the basis string says so.
+        realised = abs(filled - reference)
+        spread_cost = min(spread_estimate, realised)
+        impact_cost = max(0.0, realised - spread_cost)
     return Fill(requested=reference, filled=filled,
-                slippage=abs(filled-reference), basis=basis)
+                slippage=abs(filled-reference), basis=basis,
+                spread_cost=spread_cost, impact_cost=impact_cost)
 
 
 @dataclass(frozen=True)
@@ -222,6 +294,12 @@ class FlatCostModel:
     comparison stays honest.
     """
     per_round_trip: float = 120.0
+
+    # Charged per round trip regardless of what was traded, so there is no
+    # turnover to get wrong. Stated in the same words as `CostModel` so a
+    # caller can read the basis off either without knowing which it has.
+    turnover_basis: str = "flat_per_round_trip"
+    schedule_status: str = "configured"
 
     def round_trip(self, buy_price: float = 0.0, sell_price: float = 0.0,
                    quantity: int = 0) -> CostBreakdown:
@@ -245,6 +323,16 @@ def describe(model: CostModel | FlatCostModel,
     else:
         costs = {"kind": "itemised", "rates_as_of": "2024-10",
                  **{k: v for k, v in asdict(model).items()}}
+    # Stated on every result, not only the itemised one. "assumed" here
+    # means exactly what it says: nobody has reconciled these rates against
+    # a dated contract note, and until somebody does, a net figure computed
+    # with them carries that uncertainty wherever it is quoted. The rates
+    # themselves are preserved above so an old result stays reproducible
+    # after the schedule changes.
+    costs.setdefault("cost_schedule_status",
+                     getattr(model, "schedule_status", "assumed"))
+    costs.setdefault("turnover_basis",
+                     getattr(model, "turnover_basis", "unstated"))
     return {
         "costs": costs,
         "slippage": asdict(slippage),

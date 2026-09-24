@@ -118,6 +118,24 @@ def load_candles(db: Session, payload: BacktestIn) -> tuple:
     return candles, block
 
 
+def drawdown_fields(stats: dict) -> dict:
+    """A drawdown, projected together with what it is a drawdown *of*.
+
+    Two different curves in this codebase report a drawdown and they are not
+    comparable: the engines' sequential realised-equity curve, and the
+    signal study's overlapping hypothetical outcome curve, which has no
+    capital constraint and runs into deficit. Projecting either as a bare
+    percentage puts a number in front of a reader with no way to tell which
+    they are looking at, and the two differ by more than a hundred
+    percentage points on this archive. So the basis travels with the figure
+    through every projection, or neither goes.
+    """
+    from ..backtest.sensitivity import DRAWDOWN_KEYS, DRAWDOWN_METADATA
+
+    return {key: stats[key]
+            for key in (*DRAWDOWN_KEYS, *DRAWDOWN_METADATA) if key in stats}
+
+
 @router.post("/run", dependencies=[Depends(require_api_key)])
 def run_backtest(payload: BacktestIn, db: Session = Depends(get_db)):
     """Backtest the strategy on the index itself."""
@@ -232,7 +250,7 @@ def stop_sweep(payload: StopSweepIn, db: Session = Depends(get_db)):
             "win_rate_pct": stats.get("win_rate_pct"),
             "expectancy_r": stats.get("expectancy_r"),
             "net_pnl": stats.get("net_pnl"),
-            "max_drawdown_pct": stats.get("max_drawdown_pct"),
+            **drawdown_fields(stats),
         })
 
     return {

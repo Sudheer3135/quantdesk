@@ -12,9 +12,10 @@ risk manager's veto, the pricing policy, the cost model, the exits, and both
 look-ahead guards.
 """
 import sys
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -607,3 +608,245 @@ def test_a_trade_counts_against_the_day_it_was_actually_filled():
         per_day[day] = per_day.get(day, 0) + 1
     assert per_day
     assert max(per_day.values()) <= 2
+
+
+# ---- Repair Pass 2B.1: the position does not exist before it is filled ----
+
+def test_the_stored_entry_index_is_the_delayed_execution_bar():
+    """`entry_index` was `i + 1` whatever the latency, so the bar count, the
+    time cap and the session-exit check all began running on a bar the
+    order had not reached. Every one of those is measured from the bar the
+    position actually opened on."""
+    import pandas as pd
+
+    from app.backtest.execution import ExecutionPolicy
+
+    bars = frame()
+    result = go(bars, config=OptionBuyConfig(
+        warmup=20, pricing_policy=PREFER_OBSERVED,
+        execution_policy=ExecutionPolicy(latency_seconds=900)))
+
+    assert result.trades
+    stamps = list(bars["timestamp"])
+    for trade in result.trades:
+        timing = trade.timing
+        signal_time = pd.Timestamp(timing["bar_close_time"])
+        earliest = pd.Timestamp(timing["earliest_execution_time"])
+        filled = pd.Timestamp(timing["actual_fill_time"])
+
+        assert earliest == signal_time + pd.Timedelta(seconds=900)
+        assert filled >= earliest
+        assert pd.Timestamp(trade.entry_time) == filled
+        # The fill is a real bar open, and the bars the order could not
+        # have reached were skipped rather than priced.
+        assert filled in stamps
+        assert pd.Timestamp(trade.exit_time) > filled
+        # `bars_held` is `exit_index - entry_index + 1`, so it is the stored
+        # entry index made visible. Counted from the fill bar it matches the
+        # bars between the fill and the exit; counted from `i + 1` it comes
+        # out three too many at this latency, and the trade claims to have
+        # been open before it was filled.
+        exit_bar_open = pd.Timestamp(trade.exit_time) - pd.Timedelta(minutes=5)
+        expected = stamps.index(exit_bar_open) - stamps.index(filled) + 1
+        assert trade.bars_held == expected
+
+
+def test_a_long_latency_no_longer_moves_the_position_clock_backwards():
+    """The reproduction, made deterministic.
+
+    `max_bars_in_trade=0` makes the trade close on the first bar management
+    looks at. With `entry_index` stored as `i + 1`, that was the bar right
+    after the *decision* — three bars before the fill — so the ledger
+    stamped a CLOSE at that bar's close and then found it was earlier than
+    the OPEN it had already stamped at the fill. `PositionLedger.move`
+    refused it: `position clock moved backwards`.
+
+    With the entry index being the bar the position actually opens on, and
+    management held back until the walk reaches it, the first bar
+    management sees *is* the fill bar. The trade closes there, and the
+    clock runs forwards.
+    """
+    import pandas as pd
+
+    from app.backtest.execution import ExecutionPolicy
+
+    result = go(config=OptionBuyConfig(
+        warmup=20, pricing_policy=PREFER_OBSERVED, max_bars_in_trade=0,
+        execution_policy=ExecutionPolicy(latency_seconds=900)))
+
+    assert result.trades
+    positions = result.dataset["positions"]
+    assert positions["capital_reconciled"] is True
+    assert positions["entries"] == positions["closed_positions"] == len(result.trades)
+
+    stamps = [pd.Timestamp(event["timestamp"]) for event in positions["events"]]
+    assert stamps == sorted(stamps)
+
+    for trade in result.trades:
+        # Closed on the fill bar, not three bars before it.
+        assert trade.exit_reason == strategy.TIME
+        assert trade.bars_held == 1
+        filled = pd.Timestamp(trade.timing["actual_fill_time"])
+        assert pd.Timestamp(trade.entry_time) == filled
+        assert pd.Timestamp(trade.exit_time) > filled
+
+
+def test_an_entry_under_latency_is_not_priced_off_the_decision_bar_quote():
+    """Every archived quote at or before the decision bar became available
+    before the order could exist. The first eligible one is past the walk,
+    so the declared fallback applies and the trade says so — rather than
+    filling at a print it could never have reached."""
+    from app.backtest.execution import ExecutionPolicy
+
+    result = go(config=OptionBuyConfig(
+        warmup=20, pricing_policy=PREFER_OBSERVED,
+        execution_policy=ExecutionPolicy(latency_seconds=900)))
+
+    assert result.trades
+    for trade in result.trades:
+        assert trade.entry_basis == "modelled_no_eligible_quote"
+        assert trade.entry_evidence == MODELLED
+    stated = " ".join(result.limitations)
+    assert "modelled_no_eligible_quote" in stated
+    assert "before the order could exist" in stated
+
+
+def test_observed_only_refuses_a_latency_entry_rather_than_faking_a_quote():
+    from app.backtest.execution import ExecutionPolicy
+
+    result = go(policy=OBSERVED_ONLY, config=OptionBuyConfig(
+        warmup=20, pricing_policy=OBSERVED_ONLY,
+        execution_policy=ExecutionPolicy(latency_seconds=900)))
+
+    assert result.trades == []
+    assert result.rejections["counts"][strategy.NO_ELIGIBLE_QUOTE] > 0
+
+
+# ---- 2B.2: eligibility is not a latency special case ---------------------
+
+def a_store_with_one_quote(available_at):
+    """A store holding a single quote for one contract, made available at a
+    chosen instant. Everything else about it is irrelevant to eligibility."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.optionbuy.chain import ChainStore, ContractMeta, OptionBar
+
+    key = ContractKey(expiry=EXPIRY, strike=24_000.0, option_type="CE")
+    # `available()` is max(timestamp + one bar, available_at, first_seen), so
+    # the bar is stamped one bucket before the availability being tested.
+    bar = OptionBar(
+        row_id=1, contract_id=1, key=key,
+        timestamp=available_at - timedelta(minutes=5),
+        open=100.0, high=101.0, low=99.0, close=100.0, volume=10.0,
+        open_interest=100.0, iv=0.15, bid=None, ask=None,
+        underlying_close=24_000.0, bar_kind="ohlc", source="test",
+        samples=1, session_date=available_at.date(),
+        available_at=available_at)
+    meta = ContractMeta(contract_id=1, key=key, lot_size=75,
+                        tradingsymbol="T", source="test",
+                        first_seen=datetime(2025, 1, 1, tzinfo=UTC))
+    return key, ChainStore({key: [bar]}, {key: meta})
+
+
+@pytest.mark.parametrize("offset_seconds,eligible", [
+    (-300, False),   # became available five minutes before eligibility
+    (-1, False),     # one second before — still a price the order never saw
+    (0, True),       # exactly at the execution clock
+    (1, True),       # after it
+])
+def test_quote_eligibility_is_enforced_at_zero_latency(offset_seconds, eligible):
+    """The 2B.1 defect, directly.
+
+    Zero latency means the execution clock starts at the signal instant. It
+    does not mean an earlier quote becomes acceptable — and the old code
+    read that second meaning into it, handing a 05:25 bucket to an order
+    that could not exist before 05:30.
+
+    The walk is at the eligibility instant, so a quote that became available
+    one second later is unreachable rather than ineligible; the 0s and +1s
+    cases are therefore driven by the same boundary and both must pass.
+    """
+    from datetime import timedelta
+
+    from app.optionbuy import pricing as pricing_module
+
+    eligible_at = datetime(2025, 6, 2, 5, 30, tzinfo=UTC)
+    available = eligible_at + timedelta(seconds=offset_seconds)
+    key, store = a_store_with_one_quote(available)
+    store.seek(max(available, eligible_at))
+
+    found = store.bar_at(key, max(available, eligible_at),
+                         eligible_from=eligible_at)
+    assert (found is not None) is eligible
+
+    # observed_only: an ineligible quote is a refusal, never a stale reuse.
+    if eligible:
+        quoted = pricing_module.quote(
+            store, key, max(available, eligible_at), spot=24_000.0,
+            years=0.02, policy=OBSERVED_ONLY, eligible_from=eligible_at)
+        assert quoted.evidence != MODELLED
+    else:
+        with pytest.raises(pricing_module.UnpriceableContract) as raised:
+            pricing_module.quote(
+                store, key, max(available, eligible_at), spot=24_000.0,
+                years=0.02, policy=OBSERVED_ONLY, eligible_from=eligible_at)
+        assert raised.value.ineligible is True
+
+    # fallback-enabled: modelled, labelled, and never the earlier print.
+    fell_back = pricing_module.quote(
+        store, key, max(available, eligible_at), spot=24_000.0, years=0.02,
+        policy=PREFER_OBSERVED, eligible_from=eligible_at)
+    assert (fell_back.evidence == MODELLED) is not eligible
+
+
+def test_an_ineligible_quote_is_counted_apart_from_a_missing_one():
+    """A contract the archive cannot price is a data gap. One whose quotes
+    all predate the execution clock is the clock working. Folding them into
+    one rejection code would read as a shortage of data."""
+    from app.backtest.execution import ExecutionPolicy
+
+    stale = go(policy=OBSERVED_ONLY, config=OptionBuyConfig(
+        warmup=20, pricing_policy=OBSERVED_ONLY,
+        execution_policy=ExecutionPolicy(latency_seconds=900)))
+    counts = stale.rejections["counts"]
+    assert counts.get(strategy.NO_ELIGIBLE_QUOTE, 0) > 0
+    assert counts.get(strategy.UNPRICEABLE, 0) == 0
+
+
+def test_the_zero_latency_entry_convention_still_takes_observed_trades():
+    """Rewritten in 2B.2. It used to assert `decision_bar_quote_observed`,
+    which is the stale-quote exception this pass removed, and so would have
+    kept the defect alive.
+
+    What the convention actually is: the index fills at the next bar's open
+    and the premium comes from a quote available at or after that instant.
+    Where the archive holds one, the entry is still OBSERVED — so the fix is
+    a tightening, not a blanket switch to modelled fills.
+    """
+    observed = go()
+    assert observed.trades
+    assert {t.entry_basis for t in observed.trades} <= {
+        "eligible_quote_observed", "modelled_no_eligible_quote"}
+    assert any(t.entry_basis == "eligible_quote_observed"
+               for t in observed.trades)
+
+    for trade in observed.trades:
+        if trade.entry_basis != "eligible_quote_observed":
+            continue
+        reference = trade.entry_quote.get("reference") or {}
+        # `available_from`, not the raw `available_at` field: the store
+        # orders bars by when they actually became readable, which for a
+        # five-minute bucket is one bucket after its own stamp. The raw
+        # field alone made a correctly eligible fill cite an availability
+        # five minutes before its own execution clock, so the citation
+        # could not be checked against the clock it had satisfied.
+        available = reference["available_from"]
+        assert pd.Timestamp(available) >= pd.Timestamp(
+            trade.timing["earliest_execution_time"])
+
+
+def test_the_option_run_says_what_its_drawdown_is_measured_on():
+    stats = go().stats
+    assert "max_drawdown_pct" in stats
+    basis = stats["drawdown_basis"]
+    assert "non-overlapping" in basis and "not daily mark-to-market" in basis
