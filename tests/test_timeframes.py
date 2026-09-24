@@ -22,14 +22,21 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from app.analytics import timeframes
+from app.analytics import indicators, timeframes
 from app.market_hours import IST
 
 BARS_PER_SESSION = 75          # 09:15 to 15:25, five minutes apart
 
 
-def five_minute(sessions=2, bars=BARS_PER_SESSION, start=24_000.0, step=1.0):
-    """A clean ramp, so every aggregate is arithmetic anyone can check."""
+def five_minute(sessions=2, bars=BARS_PER_SESSION, start=24_000.0, step=1.0,
+                provenance=indicators.GENUINE):
+    """A clean ramp, so every aggregate is arithmetic anyone can check.
+
+    Declared genuine by default: it stands in for an exchange feed that
+    reports traded volume, which is what makes the volume arithmetic below
+    meaningful. Tests about unvouched or substituted volume pass their own
+    provenance.
+    """
     stamps, day = [], datetime(2026, 6, 1, 9, 15, tzinfo=IST)
     for _ in range(sessions):
         for i in range(bars):
@@ -39,10 +46,11 @@ def five_minute(sessions=2, bars=BARS_PER_SESSION, start=24_000.0, step=1.0):
             day += timedelta(days=1)
     n = len(stamps)
     close = start + np.arange(n) * step
-    return pd.DataFrame({
+    frame = pd.DataFrame({
         "timestamp": stamps, "open": close - step,
         "high": close + 2, "low": close - 3,
         "close": close, "volume": [100.0] * n})
+    return indicators.declare_volume(frame, provenance)
 
 
 def ist_times(frame):
@@ -208,18 +216,193 @@ def test_a_frame_shorter_than_one_group_folds_to_nothing():
     assert folded.empty
 
 
-def test_synthetic_volume_stays_detectable_after_folding():
-    """Summing a constant gives another constant, so `has_real_volume` must
-    still say no — otherwise the bias layer would start trusting a
-    placeholder it could not see through."""
-    from app.analytics import indicators
+def test_synthetic_volume_stays_synthetic_after_folding():
+    """A declared substitute must still be a declared substitute at 15m.
 
-    df = five_minute()
-    df.attrs["volume_is_synthetic"] = True
+    Aggregation is where a provenance claim is easiest to lose: the sums
+    are new numbers, and if the claim were re-derived from them the bias
+    layer would start trusting a placeholder it could not see through.
+    """
+    df = indicators.declare_volume(five_minute(), indicators.SYNTHETIC)
+    folded = timeframes.fifteen_minute(df)
+
+    assert indicators.volume_provenance(folded) == indicators.SYNTHETIC
     assert not indicators.has_real_volume(df)
-    assert not indicators.has_real_volume(timeframes.fifteen_minute(df))
+    assert not indicators.has_real_volume(folded)
+
+
+def test_unvouched_volume_stays_unvouched_after_folding():
+    """The separate case: nobody declared anything about these numbers."""
+    df = five_minute(provenance=indicators.UNKNOWN)
+    folded = timeframes.fifteen_minute(df)
+
+    assert indicators.volume_provenance(folded) == indicators.UNKNOWN
+    assert not indicators.has_real_volume(df)
+    assert not indicators.has_real_volume(folded)
+
+
+def test_genuine_volume_survives_folding():
+    """And the claim is not lost in the other direction either."""
+    df = indicators.declare_volume(five_minute(), indicators.GENUINE)
+    folded = timeframes.fifteen_minute(df)
+
+    assert indicators.volume_provenance(folded) == indicators.GENUINE
+    assert indicators.has_real_volume(folded)
+    # Three five-minute bars of 100 fold to one fifteen-minute bar of 300.
+    assert folded["volume"].iloc[0] == 300.0
 
 
 def test_a_nonsense_group_size_is_refused():
     with pytest.raises(ValueError):
         timeframes.fold(five_minute(), 0)
+
+
+# ---- volume validity through aggregation (2A.2) ------------------------
+#
+# A fifteen-minute bar is only as trustworthy as the five-minute bars
+# inside it. `sum` alone says otherwise: it skips what it cannot add and
+# returns a confident number, which is how [100, NaN, 300] became a
+# plausible 400 and a flagged constituent disappeared into a bigger total.
+
+LATE = pd.Timestamp("2026-06-01 16:00", tz="Asia/Kolkata")
+
+
+def constituents(volumes, *, provenance=indicators.GENUINE, flags=None):
+    """A short session of five-minute bars with the volume column stated."""
+    n = len(volumes)
+    stamps = pd.date_range("2026-06-01 09:15", periods=n, freq="5min",
+                           tz="Asia/Kolkata").tz_convert(UTC)
+    frame = pd.DataFrame({"timestamp": stamps, "open": 100.0, "high": 100.1,
+                          "low": 99.9, "close": 100.0, "volume": volumes})
+    if flags is not None:
+        frame["volume_is_synthetic"] = flags
+    return indicators.declare_volume(frame, provenance)
+
+
+def folded_volume(frame):
+    """(value, usable) for each higher-timeframe bar."""
+    out = timeframes.fold(frame, 3, as_of=LATE)
+    usable = indicators.volume_weights(out).notna()
+    return list(zip(out["volume"].tolist(), [bool(u) for u in usable], strict=True))
+
+
+def test_all_genuine_constituents_aggregate_to_a_trusted_total():
+    assert folded_volume(constituents([100., 200., 300.])) == [(600.0, True)]
+
+
+def test_a_genuine_zero_is_a_real_observation_not_a_gap():
+    """No trading in one bar is information, and it sums like any number."""
+    assert folded_volume(constituents([100., 0., 300.])) == [(400.0, True)]
+
+
+def test_one_synthetic_constituent_makes_the_whole_bar_untrusted():
+    """The number itself has to be unusable.
+
+    Reporting 600 and marking it untrusted was not enough: the mark lives
+    in a column that a six-column projection drops, and the 600 survived
+    it on a frame still claiming genuine volume.
+    """
+    [(value, usable)] = folded_volume(constituents([100., 200., 300.],
+                                                   flags=[False, True, False]))
+    assert np.isnan(value)
+    assert usable is False
+
+
+@pytest.mark.parametrize("provenance", [indicators.UNKNOWN,
+                                        indicators.UNAVAILABLE,
+                                        indicators.SYNTHETIC])
+def test_an_untrusted_frame_cannot_be_aggregated_into_a_trusted_one(provenance):
+    [(_, usable)] = folded_volume(constituents([100., 200., 300.],
+                                               provenance=provenance))
+    assert usable is False
+
+
+def test_a_missing_constituent_leaves_the_bar_with_no_total():
+    """`sum` skipping the gap produced a total no exchange ever printed."""
+    [(value, usable)] = folded_volume(constituents([100., np.nan, 300.]))
+    assert np.isnan(value)
+    assert usable is False
+
+
+def test_a_later_bad_bar_does_not_taint_an_earlier_clean_one():
+    out = folded_volume(constituents([100., 200., 300., 100., 200., 300.],
+                                     flags=[False] * 4 + [True, False]))
+    assert out[0] == (600.0, True)
+    assert out[1][1] is False
+
+
+@pytest.mark.parametrize("tail,flags", [
+    ([50., 60., 70.], [False] * 6 + [True, False, False]),     # synthetic
+    ([50., np.nan, 70.], None),                                # missing
+    ([50., 60., 70.], None),                                   # clean
+])
+def test_completed_aggregates_do_not_change_when_later_bars_arrive(tail, flags):
+    """Prefix invariance, including validity and not only the numbers."""
+    clean = [100., 200., 300., 100., 200., 300.]
+    reference = folded_volume(constituents(clean))
+    longer = folded_volume(constituents(clean + tail, flags=flags))
+
+    assert longer[:len(reference)] == reference
+
+
+def test_an_untrusted_aggregate_stays_unavailable_downstream():
+    """The bins around a flagged constituent must not read as participation."""
+    volumes = [100., 200., 300.] * 10
+    flags = [False] * 6 + [True] + [False] * 23
+    folded = timeframes.fold(constituents(volumes, flags=flags), 3, as_of=LATE)
+    enriched = indicators.enrich(folded)
+
+    assert not indicators.has_real_volume(folded)
+    assert enriched["rvol"].isna().all()          # not 0.0, not neutral
+    # The bad bin and everything after it in the session lose VWAP too.
+    assert enriched["vwap"].iloc[2:].isna().all()
+
+
+def test_a_clean_fold_is_still_the_plain_six_columns():
+    """The validity column appears only when it has something to say."""
+    clean = timeframes.fold(constituents([100., 200., 300.]), 3, as_of=LATE)
+    marked = timeframes.fold(constituents([100., 200., 300.],
+                                          flags=[False, True, False]), 3, as_of=LATE)
+
+    assert list(clean.columns) == indicators.REQUIRED_COLS
+    assert "volume_is_synthetic" in marked.columns
+
+
+def test_an_invalid_aggregate_survives_a_six_column_projection():
+    """The escape path: metadata disappears, the number must not lie.
+
+    Downstream code routinely selects the six standard columns and copies
+    the frame, which drops both the row-level validity column and the
+    frame's provenance. If the untrusted bin still held its arithmetic
+    sum, that projection handed the next component a confident number on
+    a frame that then read as ordinary market data — and VWAP computed
+    happily from it.
+    """
+    folded = timeframes.fold(constituents([100., 200., 300.] * 4,
+                                          flags=[False] * 6 + [True] + [False] * 5),
+                             3, as_of=LATE)
+
+    projected = folded[indicators.REQUIRED_COLS].copy()
+    projected.attrs.clear()                       # provenance gone
+    assert "volume_is_synthetic" not in projected.columns
+
+    bad = projected["volume"].isna()
+    assert bad.any(), "the fixture must contain an untrusted aggregate"
+    assert np.isnan(projected["volume"].iloc[2])
+
+    # Re-declared as genuine by a caller that has lost the history: the
+    # value itself still refuses to produce a reading.
+    indicators.declare_volume(projected, indicators.GENUINE)
+    enriched = indicators.enrich(projected)
+    assert not indicators.has_real_volume(projected)
+    assert enriched["vwap"].iloc[2:].isna().all()
+    assert enriched["rvol"].isna().all()
+
+
+def test_a_genuine_zero_is_not_lost_by_the_same_rule():
+    """The counter-case, so the fix cannot be "NaN everything"."""
+    folded = timeframes.fold(constituents([100., 0., 300.]), 3, as_of=LATE)
+    projected = folded[indicators.REQUIRED_COLS].copy()
+
+    assert projected["volume"].iloc[0] == 400.0
+    assert indicators.has_real_volume(folded)

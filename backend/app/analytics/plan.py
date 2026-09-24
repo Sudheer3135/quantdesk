@@ -515,7 +515,16 @@ def build(candles: pd.DataFrame, symbol: str = "NIFTY", timeframe: str = "5m",
     prefix of the archive therefore reproduces exactly what the desk would
     have said at that bar, which is what makes replaying the old signals
     against it legitimate.
+
+    The bar still forming is dropped here rather than trusted to the
+    caller. The folds held back an incomplete *fold*, but the base frame's
+    own last bar went straight into the bias and entry readings: injecting
+    one changed 17 of 25 sampled plans while leaving the signal untouched.
+    `decision_time` on the frame says when the plan is being made; without
+    it the plan is being made now.
     """
+    decision_time = candles.attrs.get("decision_time", pd.Timestamp.now(tz="UTC"))
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
     frame = indicators.validate(candles)
     if frame.empty:
         raise ValueError("cannot build a plan from an empty candle frame")
@@ -525,7 +534,9 @@ def build(candles: pd.DataFrame, symbol: str = "NIFTY", timeframe: str = "5m",
         chain_summary = options.summarise(chain, price)
 
     bias = read_bias(frame, chain_summary)
-    verdict = regime.classify_latest(frame)
+    # Already filtered above; the clock is passed anyway so the regime
+    # reading is bound to the same decision instant rather than to now.
+    verdict = regime.classify_latest(frame, as_of=decision_time, timeframe=timeframe)
     entry = read_entry(frame, bias, verdict)
 
     return Plan(symbol=symbol, timeframe=timeframe,

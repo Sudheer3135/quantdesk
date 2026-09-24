@@ -100,7 +100,9 @@ describe.skipIf(!present)("the terminal against live payloads", () => {
   it("fills the performance strip from the real outcome study", async () => {
     await mount();
     const overall = read("outcomes").overall;
-    expect(screen.getByText("Trades")).toBeTruthy();
+    // "Trades" until the strip was relabelled: these rows are hypothetical
+    // signal outcomes, not an executed account ledger.
+    expect(screen.getByText("Outcomes")).toBeTruthy();
     expect(screen.getAllByText(String(overall.n)).length).toBeGreaterThan(0);
     // The averages are derived from the per-signal rows, so a backend that
     // stopped sending them would show "Unavailable" here.

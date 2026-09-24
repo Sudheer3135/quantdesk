@@ -100,13 +100,22 @@ def test_a_contract_listed_later_is_not_visible_earlier():
 
 # ---- what counts as a current quote ----------------------------------
 
-def test_the_last_quote_at_or_before_the_moment_is_used():
+def test_the_last_quote_available_at_the_moment_is_used():
+    """The current quote is the last bucket that has *closed*.
+
+    Three minutes into a five-minute bucket, that bucket's high, low and
+    close are still moving and the collector has not written the row. The
+    quote available then is the bucket before it; the one forming becomes
+    available at its own close, and not a second earlier.
+    """
     store = a_store()
-    store.advance(STAMPS[10])
-    # Halfway through the bucket, the 11:00 bar is still the current quote.
     midway = STAMPS[10] + timedelta(minutes=3)
     store.advance(midway)
-    assert store.bar_at(KEY, midway).timestamp == STAMPS[10]
+    assert store.bar_at(KEY, midway).timestamp == STAMPS[9]
+
+    at_close = STAMPS[10] + timedelta(minutes=5)
+    store.advance(at_close)
+    assert store.bar_at(KEY, at_close).timestamp == STAMPS[10]
 
 
 def test_a_stale_quote_is_no_quote():

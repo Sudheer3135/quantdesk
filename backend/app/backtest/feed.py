@@ -38,6 +38,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_ANALYSIS_WINDOW = 300
 
+# The three outcomes of a causality run. UNVERIFIED is not a soft PASS.
+PASS = "PASS"
+FAIL = "FAIL"
+UNVERIFIED = "UNVERIFIED"
+
 
 class LookaheadError(RuntimeError):
     """Raised when something asks for data the walk has not reached.
@@ -61,16 +66,50 @@ class CausalityReport:
     checked: int = 0
     columns: tuple[str, ...] = ()
     leaks: tuple[str, ...] = ()
+    # Columns the check could not recompute from a prefix, and therefore
+    # never compared. Reported rather than counted as clean.
+    unverifiable: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        """PASS, FAIL or UNVERIFIED — three outcomes, never two.
+
+        A check that did not run is not a check that passed. Collapsing
+        UNVERIFIED into PASS is how "we never looked at that column" gets
+        reported as "no look-ahead", which is the failure this whole class
+        exists to make impossible.
+        """
+        if self.leaks:
+            return FAIL
+        if self.unverifiable or self.checked == 0:
+            return UNVERIFIED
+        return PASS
 
     @property
     def causal(self) -> bool:
-        return not self.leaks
+        """True only on a PASS: something was checked, and all of it held."""
+        return self.status == PASS
 
     def to_dict(self) -> dict:
         return {"checked_cut_points": self.checked,
                 "columns": list(self.columns),
+                "status": self.status,
                 "causal": self.causal,
-                "leaks": list(self.leaks)}
+                "leaks": list(self.leaks),
+                "unverifiable": list(self.unverifiable)}
+
+
+def _same_value(a, b) -> bool:
+    """Equality that survives whatever column the check is handed.
+
+    The causality check discovers its columns, so it can be pointed at a
+    label or a timestamp as easily as at a float. Numbers compare within a
+    tolerance; anything else compares as itself rather than raising and
+    taking the whole check down with it.
+    """
+    if isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)):
+        return bool(np.isclose(a, b, rtol=1e-9, atol=1e-9))
+    return bool(a == b)
 
 
 class HistoricalFeed:
@@ -229,7 +268,13 @@ class HistoricalFeed:
         on bars after `i` is one that cannot be computed in real time, and a
         backtest using it is measuring hindsight.
         """
-        columns = ("ema20", "ema50", "ema100", "ema200", "atr14", "vwap", "vwap_upper", "vwap_lower", "rvol")
+        # Every column the enrichment added, discovered rather than listed.
+        # A fixed list checks the indicators somebody thought of on the day
+        # it was written, which is exactly the set already known to be
+        # causal — the leak this is here to catch arrives in the column
+        # nobody has added yet.
+        columns = tuple(c for c in self._frame.columns
+                        if c not in ("timestamp", "open", "high", "low", "close", "volume"))
         report = CausalityReport(columns=columns)
         if len(self._frame) < 60 or not columns:
             return report
@@ -239,18 +284,31 @@ class HistoricalFeed:
         cuts = sorted(set(rng.integers(50, len(self._frame), size=samples).tolist()))
 
         leaks: set[str] = set()
+        unverifiable: set[str] = set()
         for cut in cuts:
             prefix = indicators.enrich(raw.iloc[: cut + 1])
             full_row, prefix_row = self._frame.iloc[cut], prefix.iloc[-1]
             for column in columns:
+                if column not in prefix_row.index:
+                    # Attached to the frame by something other than the
+                    # enrichment, so recomputing it from the prefix is not
+                    # possible here. Say so rather than reporting a column
+                    # as clean when it was never compared.
+                    unverifiable.add(column)
+                    continue
                 a, b = full_row[column], prefix_row[column]
                 if pd.isna(a) and pd.isna(b):
                     continue
-                if pd.isna(a) != pd.isna(b) or not np.isclose(a, b, rtol=1e-9, atol=1e-9):
+                if pd.isna(a) != pd.isna(b) or not _same_value(a, b):
                     leaks.add(column)
             report.checked += 1
 
         report.leaks = tuple(sorted(leaks))
+        report.unverifiable = tuple(sorted(unverifiable))
+        if unverifiable:
+            log.warning(
+                "columns not produced by the enrichment, so their causality "
+                "was not checked: %s", ", ".join(sorted(unverifiable)))
         if leaks:
             log.error(
                 "non-causal indicators detected: %s. Every backtest using "

@@ -431,8 +431,14 @@ def _feature_frame(df: pd.DataFrame) -> pd.DataFrame:
     # below has to special-case it; None flows through to "not part of this
     # read" in the reasons.
     out["rvol_hour"] = out["rvol"]
-    out["rvol_day"] = out["rvol"].groupby(session).transform(
-        lambda s: s.expanding().mean())
+    # The expanding mean skips what it cannot average, so a bar whose own
+    # volume is unavailable used to inherit the session's earlier readings
+    # and vote with them — two good bars followed by a blind one reported
+    # participation of 1.0 for the blind one. History stays in the
+    # statistic; it just does not speak for a bar that has no observation.
+    out["rvol_day"] = (out["rvol"].groupby(session)
+                       .transform(lambda s: s.expanding().mean())
+                       .where(out["rvol"].notna()))
 
     # --- opening range, frozen once the first fifteen minutes are done ----
     opening = bar_no <= OPENING_RANGE_BARS
@@ -511,12 +517,29 @@ def classify_frame(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def classify_latest(df: pd.DataFrame) -> dict | None:
-    """Both verdicts for the most recent bar, ready to serialise.
+def classify_latest(df: pd.DataFrame, *, as_of=None,
+                    timeframe: str = "5m") -> dict | None:
+    """Both verdicts for the most recent *closed* bar, ready to serialise.
 
     What the dashboard reads. None when there is nothing to classify, so a
     caller can render "no reading" rather than a fabricated RANGE.
+
+    The completed-bar filter lives here rather than in the callers. This is
+    a public entry point: handed a live frame whose last row is still
+    forming, it used to classify that row and stamp the verdict with its
+    timestamp, so the dashboard reported a regime for a bar that had not
+    happened. `plan.build` filtering first protected the plan, not this.
+
+    `as_of` is the decision clock: the moment the reading is being taken.
+    It falls back to the frame's own `decision_time`, then to now. A bar
+    counts as closed the instant it ends — the zero finality delay the
+    rest of the platform assumes — so a 10:00 five-minute bar is invisible
+    at 10:04:59.999 and readable at 10:05:00.000.
     """
+    if df.empty:
+        return None
+    decision = as_of or df.attrs.get("decision_time") or pd.Timestamp.now(tz="UTC")
+    df = indicators.drop_unclosed(df, timeframe, as_of=decision)
     if df.empty:
         return None
     enriched = _feature_frame(df)

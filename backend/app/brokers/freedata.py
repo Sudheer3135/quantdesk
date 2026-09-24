@@ -28,6 +28,7 @@ import pandas as pd
 from curl_cffi import requests as curl_requests
 
 from .. import net
+from ..analytics.indicators import SYNTHETIC, declare_volume
 from ..data.importer import TIMEFRAME_MINUTES
 from .base import Broker, UnknownSymbol
 from .nse import NSEClient, parse_index_value, parse_nse_timestamp, parse_option_chain
@@ -197,7 +198,10 @@ class FreeDataBroker(Broker):
                         .sort_values("timestamp")
                         .reset_index(drop=True))
 
-        df.attrs["volume_is_synthetic"] = True
+        # Yahoo reports no traded volume for index tickers, so this frame
+        # carries a substitute. Said once, here, where the substitution
+        # happens — analytics downstream never has to guess.
+        declare_volume(df, SYNTHETIC)
         return df
 
     def _yahoo_quote(self, symbol: str) -> dict:

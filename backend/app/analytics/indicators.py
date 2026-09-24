@@ -15,6 +15,72 @@ from .. import market_hours
 
 REQUIRED_COLS = ["timestamp", "open", "high", "low", "close", "volume"]
 
+# ---- volume provenance --------------------------------------------------
+#
+# Whether volume can be used is a question about where the numbers came
+# from, not about what they look like. A source that reports traded volume
+# is trustworthy when it is constant, when it is zero, and when it is
+# noisy; a source that substitutes a filler is untrustworthy however
+# convincing the filler is. Statistics can raise suspicion — and are used
+# below to do exactly that at import time — but they can never establish
+# authenticity, so nothing here promotes a frame to GENUINE.
+
+GENUINE = "genuine"            # the source reports traded volume
+SYNTHETIC = "synthetic"        # the source substituted a filler
+UNAVAILABLE = "unavailable"    # the source has no volume to give
+UNKNOWN = "unknown"            # nobody said; treated as unusable
+
+VOLUME_PROVENANCE = "volume_provenance"
+_PROVENANCES = (GENUINE, SYNTHETIC, UNAVAILABLE, UNKNOWN)
+
+
+def declare_volume(df: pd.DataFrame, provenance: str) -> pd.DataFrame:
+    """Record where this frame's volume came from. Sources call this.
+
+    Returns the same frame so it can be used inline. Declaring is the only
+    way a frame becomes usable for volume-weighted analytics.
+    """
+    if provenance not in _PROVENANCES:
+        raise ValueError(f"unknown volume provenance {provenance!r}; "
+                         f"expected one of {_PROVENANCES}")
+    df.attrs[VOLUME_PROVENANCE] = provenance
+    # Kept in step for readers predating the four-way distinction. Anything
+    # not declared genuine is untrustworthy as far as they are concerned.
+    df.attrs["volume_is_synthetic"] = provenance != GENUINE
+    return df
+
+
+def volume_provenance(df: pd.DataFrame) -> str:
+    """What the frame says about its own volume. UNKNOWN when it says nothing.
+
+    A legacy `volume_is_synthetic = False` means "no row was flagged", which
+    is not the same as a source vouching for the numbers, so it reads as
+    UNKNOWN rather than GENUINE.
+    """
+    declared = df.attrs.get(VOLUME_PROVENANCE)
+    if declared in _PROVENANCES:
+        return declared
+    if df.attrs.get("volume_is_synthetic"):
+        return SYNTHETIC
+    if any(isinstance(v, dict) and v.get("volume_is_synthetic")
+           for v in df.attrs.values()):
+        return SYNTHETIC
+    return UNKNOWN
+
+
+def looks_like_placeholder(df: pd.DataFrame) -> bool:
+    """Does this volume column look like filler?
+
+    Suspicion only. Used where a frame is being *demoted* — the importer
+    flagging rows on the way into the archive — never to certify anything.
+    """
+    if df.empty or "volume" not in df:
+        return True
+    volume = pd.to_numeric(df["volume"], errors="coerce").dropna()
+    if volume.empty:
+        return True
+    return bool(volume.nunique() <= 1 or volume.max() <= 2)
+
 
 def validate(df: pd.DataFrame) -> pd.DataFrame:
     missing = [c for c in REQUIRED_COLS if c not in df.columns]
@@ -53,21 +119,44 @@ def session_key(df: pd.DataFrame, tz: str = "Asia/Kolkata") -> pd.Series:
 
 
 def volume_weights(df: pd.DataFrame) -> pd.Series:
-    """Never infer traded volume from the index feed's 0/1/2 placeholders."""
+    """The weights VWAP and relative volume may use. NaN where unusable.
+
+    Decided by provenance alone:
+
+      GENUINE      the supplied numbers, whatever shape they take. Constant
+                   volume is a quiet market, and a genuine zero is a real
+                   observation of no trading — a zero weight, not a hole.
+      SYNTHETIC    unusable, however large, small, constant or varied.
+      UNAVAILABLE  unusable; there was nothing to report.
+      UNKNOWN      unusable. Nobody vouched for these numbers, and a series
+                   that happens to vary is not evidence that it is traded
+                   volume.
+
+    Only NaN — genuinely missing data — produces a NaN weight on a genuine
+    frame. That distinction matters downstream: a missing weight
+    invalidates the session's cumulative VWAP from that point, whereas a
+    zero simply adds nothing to it.
+
+    The verdict is a property of the frame, so it cannot change when a
+    later bar arrives, which keeps every reading derived from it causal.
+    """
     volume = pd.to_numeric(df["volume"], errors="coerce")
-    valid = volume.notna() & (volume > 2)
+    if volume_provenance(df) != GENUINE:
+        return volume.where(pd.Series(False, index=volume.index))
+    usable = volume.notna()
     if "volume_is_synthetic" in df:
-        valid &= ~df["volume_is_synthetic"].fillna(True).astype(bool)
-    # Repository provenance is conservative for mixed-source frames.
-    if any(isinstance(v, dict) and v.get("volume_is_synthetic")
-           for v in df.attrs.values()):
-        valid[:] = False
-    if df.attrs.get("volume_is_synthetic"):
-        valid[:] = False
-    return volume.where(valid)
+        # Row-level flags demote individual bars inside an otherwise
+        # genuine frame. They can only ever take usability away.
+        usable &= ~df["volume_is_synthetic"].fillna(True).astype(bool)
+    return volume.where(usable)
 
 
 def has_real_volume(df: pd.DataFrame) -> bool:
+    """Can volume-weighted analytics run on this frame at all?
+
+    Genuine provenance and no missing bar. A frame of genuine zeros
+    qualifies: it reports no trading, which is information.
+    """
     return not df.empty and bool(volume_weights(df).notna().all())
 
 

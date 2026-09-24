@@ -23,8 +23,18 @@ def cmp_cols(frame,label):
     nonnull={col:int(full[col].notna().sum()) for col in cols if col in full}
     out[label]={'mismatch_columns':{k:len(v) for k,v in bad.items()},'examples':{k:v[:2] for k,v in bad.items()},'non_null_counts_full':nonnull}
 cmp_cols(df,'indicators_real_snapshot_volume')
+# Repair 2A.1: volume usability now follows declared provenance, so this
+# leg declares the volume it constructs. The probe IS the source here: it
+# builds a series standing in for traded volume, precisely so that VWAP,
+# the bands and relative volume are live while prefix invariance is
+# checked. Left undeclared it reads as UNKNOWN, every volume-weighted
+# column comes back null, and this leg silently stops testing anything —
+# which is what it did between Pass 2A and this correction.
 syn=df.copy(); syn['volume']=rng.integers(1000,50000,N).astype(float)
+indicators.declare_volume(syn,indicators.GENUINE)
 cmp_cols(syn,'indicators_synthetic_real_volume')
+_live=out['indicators_synthetic_real_volume']['non_null_counts_full']
+assert _live['vwap']>0 and _live['rvol']>0, 'declared-genuine leg must exercise volume-weighted columns'
 # HTF: every closed bin in prefix must equal the same bin in full
 bad_htf=[]
 for n,per in (('15m',3),('1h',12)):

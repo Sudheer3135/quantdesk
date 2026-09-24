@@ -27,11 +27,15 @@ NEAR = date(2025, 6, 3)                       # Tuesday, the front weekly
 FAR = date(2025, 6, 10)                       # the following Tuesday
 MONTHLY = date(2025, 6, 24)
 
-# Monday 09:15 IST, decision time. From here the Tuesday weekly is 1.26
-# days out — the day *before* expiry, which clears the one-day floor.
-MOMENT = datetime(2025, 6, 2, 9, 15, tzinfo=IST)
+# Monday 09:20 IST, decision time: the first instant the 09:15 chain
+# bucket exists. A bucket is quotable when it closes, not when it opens —
+# at 09:15 the collector has not written it yet, so a decision stamped
+# then is reading a bar that has not happened. From here the Tuesday
+# weekly is 1.26 days out — the day *before* expiry, which clears the
+# one-day floor.
+MOMENT = datetime(2025, 6, 2, 9, 20, tzinfo=IST)
 # Tuesday morning, which is expiry day for the 3 June weekly: 0.26 days.
-ON_EXPIRY_DAY = datetime(2025, 6, 3, 9, 15, tzinfo=IST)
+ON_EXPIRY_DAY = datetime(2025, 6, 3, 9, 20, tzinfo=IST)
 SPOT = 24_000.0
 
 

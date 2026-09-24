@@ -14,15 +14,32 @@ cm=CostModel()
 out['CA1_win']={'hand':hand(100,120),'code':round(cm.round_trip(100,120,75).total,6)}
 out['CA2_loss_correct_legs']={'hand_buy120_sell100':hand(120,100),'code_correct_legs':round(cm.round_trip(120,100,75).total,6),
     'code_minmax_as_in_outcomes_and_engine':round(cm.round_trip(min(120,100),max(120,100),75).total,6)}
-# ---- FC-1: prices 1,2,3 equal volume -> population sigma 0.816497
+# ---- FC-1: prices 1,2,3 on equal GENUINE volume -> population sigma 0.816497
+# Repair 2A.1: volume usability is now decided by declared provenance, so
+# this arithmetic check declares its equal weights genuine. Without the
+# declaration the frame is UNKNOWN, weights are dropped and the check
+# silently produced NaN instead of validating the formula — which is what
+# it did between Pass 2A and this correction. The finite assertions below
+# make that failure loud rather than silent. Rejection of substituted and
+# unvouched volume is checked separately, under FC-2.
 t=pd.date_range('2026-06-01 09:15',periods=3,freq='5min',tz='Asia/Kolkata').tz_convert('UTC')
 f=pd.DataFrame(dict(timestamp=t,open=[1.,2,3],high=[1.,2,3],low=[1.,2,3],close=[1.,2,3],volume=[100.,100,100]))
+indicators.declare_volume(f,indicators.GENUINE)
 vw,up,lo=indicators.vwap_bands(f)
-out['FC1_vwap']={'vwap':float(vw.iloc[2]),'sigma':round(float(up.iloc[2]-vw.iloc[2]),6),'expected':0.816497}
-f2=f.copy(); f2['volume']=[1.,1,1]
+assert np.isfinite(vw.iloc[2]) and np.isfinite(up.iloc[2]), 'FC-1 VWAP/sigma must be finite'
+assert abs(float(vw.iloc[2])-2.0)<1e-9, f'FC-1 VWAP {float(vw.iloc[2])} != 2'
+assert abs(float(up.iloc[2]-vw.iloc[2])-0.81649658)<1e-6, 'FC-1 sigma != 0.81649658'
+out['FC1_vwap']={'vwap':float(vw.iloc[2]),'sigma':round(float(up.iloc[2]-vw.iloc[2]),6),
+                 'sigma_full':float(up.iloc[2]-vw.iloc[2]),'expected':0.816497,
+                 'weights':'genuine, equal'}
+f2=f.copy(); f2['volume']=[1.,1,1]; indicators.declare_volume(f2,indicators.SYNTHETIC)
 v2,_,_=indicators.vwap_bands(f2); out['FC2_vwap_placeholder_volume']=None if pd.isna(v2.iloc[2]) else float(v2.iloc[2])
-f3=f.copy(); f3['volume']=[1000.,1000,1000]
+f3=f.copy(); f3['volume']=[1000.,1000,1000]; indicators.declare_volume(f3,indicators.SYNTHETIC)
 out['FC2_constant_volume_1000_treated_real']=indicators.has_real_volume(f3)
+f4=f.copy(); f4['volume']=[1000.,1000,1000]; f4.attrs.clear()
+out['FC2_unvouched_constant_treated_real']=indicators.has_real_volume(f4)
+f5=f.copy(); f5['volume']=[900.,1500,1200]; f5.attrs.clear()
+out['FC2_unvouched_varying_treated_real']=indicators.has_real_volume(f5)
 # ---- lifecycle scenarios on engine.run
 def bars(n,price=100.):
     s=pd.date_range('2026-06-01 09:15',periods=n,freq='5min',tz='Asia/Kolkata').tz_convert('UTC')
