@@ -55,7 +55,13 @@ def test_importing_the_same_window_twice_writes_no_new_rows(db):
 
     second = import_index_candles(db, df, "NIFTY", "5m", "test")
     assert second.write.inserted == 0
-    assert second.write.updated == 12
+    # Pass 2C: an identical re-import no longer rewrites anything. It used
+    # to overwrite all 12 rows, resetting each bar's `ingested_at` to the
+    # re-import and bumping its revision, which made an unchanged bar look
+    # as though it had only just been learnt.
+    assert second.write.updated == 0
+    assert second.unchanged == 12
+    assert second.revised == 0
     assert count_rows(db) == 12
 
 

@@ -5,6 +5,8 @@
    to render a Recharts chart, and importing OIProfile to get at it would
    load Recharts to avoid loading Recharts. */
 
+import { oiValue } from "./oi.js";
+
 /* The 25-point band a spot sits in, as (b-25, b].
 
    OIProfile reads the spot three ways: which 14 strikes are nearest, which
@@ -46,8 +48,9 @@ export function sameOIPicture(prev, next) {
   if (!a || !b || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
     if (a[i].strike !== b[i].strike
-        || (a[i].call_oi || 0) !== (b[i].call_oi || 0)
-        || (a[i].put_oi || 0) !== (b[i].put_oi || 0)) return false;
+        // Missing and zero are different readings and must re-render.
+        || oiValue(a[i].call_oi) !== oiValue(b[i].call_oi)
+        || oiValue(a[i].put_oi) !== oiValue(b[i].put_oi)) return false;
   }
   return true;
 }

@@ -202,7 +202,12 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     out["vwap_upper"] = up
     out["vwap_lower"] = lo
     out["rvol"] = relative_volume(out)
-    return out
+    # Features are unavailable until their declared warmup is met (TC-5).
+    # Applied here, once, so no strategy has its own idea of when an EMA200
+    # starts meaning something. Positional, so it is prefix invariant: the
+    # same row is masked whether the frame ends there or runs on.
+    from . import warmup
+    return warmup.mask(out)
 
 
 TIMEFRAME_MINUTES = {

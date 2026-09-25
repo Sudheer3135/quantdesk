@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from ..data import dataset as dataset_module
 from ..data import repository
+from ..data import research
 from ..risk.manager import RiskConfig
 from . import chain, strategy
 from . import coverage as coverage_module
@@ -81,7 +82,8 @@ def execute(db: Session, request: OptionBuyRequest) -> OptionBuyResult:
     if not report.ok:
         raise CoverageRefused(report)
 
-    candles = repository.load_index_candles(
+    # Grid-validated, the research read (TC-1). See `data.research`.
+    candles = research.load_research_candles(
         db, request.symbol, request.timeframe,
         start=request.start, end=request.end)
 

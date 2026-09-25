@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState } from "react";
 
 import { chainSource, ageText } from "./chain-source.js";
+import { heaviest, oiValue } from "./oi.js";
 import { spotBand } from "./render-keys.js";
 
 /* The strike ladder.
@@ -27,7 +28,8 @@ import { spotBand } from "./render-keys.js";
    which is on the premium cell as a tooltip.
 */
 
-const lakh = (v) => `${(Math.abs(Number(v) || 0) / 1e5).toFixed(1)}L`;
+// Missing OI prints as a dash, never as 0.0L (OC-5).
+const lakh = (v) => (oiValue(v) === null ? "—" : `${(Math.abs(Number(v)) / 1e5).toFixed(1)}L`);
 const strikeLabel = (v) => Math.round(Number(v)).toLocaleString("en-IN");
 
 const premium = (v) =>
@@ -151,13 +153,12 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
   /* The scale for the open-interest bars. One scale across both sides and
      every visible row, because a bar that rescales per column would make a
      small put wall look like a large one. */
-  const widest = Math.max(
-    1, ...rows.flatMap((r) => [Number(r.call_oi) || 0, Number(r.put_oi) || 0]));
+  const widest = Math.max(1, ...rows.flatMap((r) => [oiValue(r.call_oi), oiValue(r.put_oi)])
+    .filter((v) => v !== null));
 
-  const callWall = rows.reduce((a, b) =>
-    (Number(b.call_oi) || 0) > (Number(a.call_oi) || 0) ? b : a, rows[0]);
-  const putWall = rows.reduce((a, b) =>
-    (Number(b.put_oi) || 0) > (Number(a.put_oi) || 0) ? b : a, rows[0]);
+  /* A strike with no recorded OI is never the wall (OC-5). */
+  const callWall = heaviest(rows, (r) => r.call_oi);
+  const putWall = heaviest(rows, (r) => r.put_oi);
 
   /* The row the money is nearest. Spot almost never lands on a 50-point
      strike, so this is the closest one rather than an equality test. */
@@ -167,7 +168,8 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
     : null;
   const maxPain = Number(chain?.summary?.max_pain) || null;
 
-  const bar = (value) => ({ "--oi-fill": `${((Number(value) || 0) / widest) * 100}%` });
+  const bar = (value) => (oiValue(value) === null ? {}
+    : { "--oi-fill": `${(oiValue(value) / widest) * 100}%` });
 
   /* Counted once. Both sides carry the same columns by construction, so
      a single number keeps the two `colSpan`s from drifting apart when a
@@ -298,7 +300,7 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
                     </td>
                   ))}
                   {hasIV && <td className={`num greek${callItm ? " itm" : ""}`}>{iv(r.call_iv)}</td>}
-                  <td className={`num oi${callItm ? " itm" : ""}${r.strike === callWall.strike ? " wall" : ""}`}
+                  <td className={`num oi${callItm ? " itm" : ""}${r.strike === callWall?.strike ? " wall" : ""}`}
                       style={bar(r.call_oi)}>
                     <span>{lakh(r.call_oi)}</span>
                   </td>
@@ -327,7 +329,7 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
                       {oiChange(r.put_oi_change)}
                     </td>
                   )}
-                  <td className={`num oi put-oi${putItm ? " itm" : ""}${r.strike === putWall.strike ? " wall" : ""}`}
+                  <td className={`num oi put-oi${putItm ? " itm" : ""}${r.strike === putWall?.strike ? " wall" : ""}`}
                       style={bar(r.put_oi)}>
                     <span>{lakh(r.put_oi)}</span>
                   </td>
@@ -347,8 +349,13 @@ export default function OptionChain({ chain, spot, nowMs = Date.now(), skewMs = 
       </div>
 
       <p className="chain-foot">
-        Heaviest call OI <b className="mono">{strikeLabel(callWall.strike)}</b> ({lakh(callWall.call_oi)})
-        {" · "}heaviest put OI <b className="mono">{strikeLabel(putWall.strike)}</b> ({lakh(putWall.put_oi)})
+        {callWall
+          ? <>Heaviest call OI <b className="mono">{strikeLabel(callWall.strike)}</b> ({lakh(callWall.call_oi)})</>
+          : <>Call OI <b>unavailable</b></>}
+        {" · "}
+        {putWall
+          ? <>heaviest put OI <b className="mono">{strikeLabel(putWall.strike)}</b> ({lakh(putWall.put_oi)})</>
+          : <>put OI <b>unavailable</b></>}
         {". "}Shaded cells are in the money. Rising call OI is written resistance,
         rising put OI written support — this is positioning, not prediction.
       </p>

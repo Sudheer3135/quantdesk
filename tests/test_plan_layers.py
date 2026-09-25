@@ -146,8 +146,15 @@ def test_an_extended_trend_is_told_to_wait_rather_than_chased():
 def test_a_trend_that_has_pulled_back_to_value_is_entered():
     """The other half of the same rule. Waiting forever is not a strategy —
     the state has to become ENTER_NOW when price actually returns to value,
-    or WAIT_PULLBACK is just a refusal wearing a better name."""
-    built = plan.build(frame(np.concatenate([calm(300), np.full(40, 2.5),
+    or WAIT_PULLBACK is just a refusal wearing a better name.
+
+    900 bars of calm lead-in, not 300 (Pass 2C, TC-5). At 300 the hourly
+    frame holds ~28 bars and its EMA50 was a value seeded from the first
+    close — the bullish 1h trend vote this scenario relied on did not exist.
+    With the declared warmup that vote is unavailable at 300 bars, so the
+    fixture now carries enough history for it to be real.
+    """
+    built = plan.build(frame(np.concatenate([calm(900), np.full(40, 2.5),
                                              np.full(4, -4.0)])))
 
     assert built.regime["day"]["label"] == regime.TREND_UP
@@ -169,7 +176,9 @@ def test_a_deeper_pullback_never_demands_a_deeper_one():
     """
     states, stretches = [], []
     for depth in range(0, 8, 2):
-        steps = [calm(300), np.full(40, 2.5)]
+        # 900, not 300: enough hourly history for the 1h EMA50 to be past its
+        # declared warmup, as above.
+        steps = [calm(900), np.full(40, 2.5)]
         if depth:
             steps.append(np.full(depth, -4.0))
         built = plan.build(frame(np.concatenate(steps)))

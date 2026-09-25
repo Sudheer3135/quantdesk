@@ -29,6 +29,7 @@ from ..backtest.option_engine import run as run_options
 from ..config import get_settings
 from ..data import dataset as dataset_module
 from ..data import repository
+from ..data import research
 from ..db import get_db
 from ..deps import get_broker
 from ..optionbuy import coverage as optionbuy_coverage
@@ -108,7 +109,9 @@ def load_candles(db: Session, payload: BacktestIn) -> tuple:
     if gap is not None:
         raise HTTPException(409, gap.to_dict())
 
-    candles = repository.load_index_candles(
+    # The grid-validated research read: bars off the exchange grid are
+    # quarantined rather than traded, and the report rides on `attrs`.
+    candles = research.load_research_candles(
         db, payload.symbol, payload.timeframe, start=payload.start, end=payload.end)
 
     print_ = dataset_module.fingerprint(candles, payload.symbol, payload.timeframe)

@@ -21,6 +21,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# Deferred-loading groups for columns added in migration 0009. See the note
+# on `SignalRecord` for why they are deferred.
+PROVENANCE_GROUP = "provenance_0009"
+CAPTURE_GROUP = "capture_clocks_0009"
+
+
 def utc_now() -> datetime:
     """The default for every `created_at`, timezone-aware.
 
@@ -84,6 +90,78 @@ class SignalRecord(Base):
     entry_state: Mapped[str | None] = mapped_column(
         String(16), nullable=True, index=True)
     plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    # ---- deferred, on purpose ------------------------------------------
+    #
+    # Every column below is `deferred`: a plain `select(SignalRecord)` does
+    # not name it. Research reads frozen archives that predate these columns
+    # — the audit snapshot, and the frozen comparator that replays it with
+    # audit-time code — and a SELECT naming a column the archive lacks fails
+    # outright. Readers that want them ask through `data.schema.loadable`,
+    # which loads them in the same query when the database has them.
+    # ---- the decision clocks (TC-2) ------------------------------------
+    #
+    # Persisted as columns rather than reconstructed from `context.timing`.
+    # The JSON copy is kept for readers that already use it, but a clock that
+    # only exists inside a blob can be rebuilt by any later code with any
+    # later idea of what it should have said, and nothing would show it had
+    # been. A column written at decision time cannot.
+    #
+    #   bar_open_time           the source bar's own open
+    #   bar_close_time          when that bar completed
+    #   available_at            when the completed bar could first be read
+    #   received_at             when Quant Desk actually received it — never
+    #                           derived from exchange time; NULL if unknown
+    #   decision_at             when the decision was made
+    #   earliest_execution_time the first instant an order could be working
+    #
+    # All nullable, with no backfill. `clock_basis` is NULL on every row
+    # written before these existed; guessing their timestamps now and storing
+    # them as if observed would be a fabricated record, which is exactly
+    # what the columns exist to prevent.
+    bar_open_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    bar_close_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    available_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    decision_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    earliest_execution_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    # "persisted" on rows written with the columns above; NULL on legacy
+    # rows, whose timing can only be inferred from `context`.
+    clock_basis: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, index=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+
+    # ---- what produced it (RP-2) ---------------------------------------
+    #
+    # On the signal, not only on a backtest's metadata. One row has to be
+    # enough to say which strategy, which parameters, which inputs and which
+    # code made it — otherwise two signals from different configurations
+    # sit in the same table indistinguishable from each other.
+    strategy_version: Mapped[str | None] = mapped_column(String(32), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    parameter_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    data_source: Mapped[str | None] = mapped_column(String(64), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    code_id: Mapped[str | None] = mapped_column(String(96), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    provenance: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
 
 
 class TradeRecord(Base):
@@ -167,9 +245,52 @@ class CandleRecord(Base):
     volume_is_synthetic: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
 
-    # Bumped every time an upsert overwrites this bar. A bar that keeps
-    # being restated is a bar worth looking at.
+    # The version number of the values on this row. Bumped only when a
+    # re-import actually changes them; the superseded values are kept in
+    # `candle_revisions` rather than destroyed. It used to bump on every
+    # re-import whether anything changed or not, which is how 5,818 of
+    # 6,750 archived bars came to carry a revision with nothing to show for
+    # it.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class CandleRevision(Base):
+    """A superseded version of an archived candle (TC-6).
+
+    Append-only. When a source restates a bar, the values that were on the
+    row until then are copied here before the row is overwritten, with the
+    window during which they were the known truth. A replay of a decision
+    made at 10:02 can then ask for the bar as it was known at 10:02 — the
+    original 100 — instead of the 101 the source published at 10:07, which
+    the decision could not have seen.
+
+    Nothing is ever updated or deleted here. A revision history that can be
+    rewritten is not a history.
+    """
+    __tablename__ = "candle_revisions"
+    __table_args__ = (
+        Index("ix_candle_revision_bar", "symbol", "timeframe", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    timeframe: Mapped[str] = mapped_column(String(8))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The version these values were. The live row carries a higher one.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    volume_is_synthetic: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    # When these values became known, and when they stopped being the latest.
+    # Together they bound the moments at which a replay should see them.
+    known_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    superseded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class OptionContract(Base):
@@ -235,6 +356,37 @@ class OptionCandle(Base):
     # quantity instead of an assumed one.
     bid: Mapped[float | None] = mapped_column(Float, nullable=True)
     ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Depth at the touch, where the source publishes it. NULL is
+    # "unavailable", never zero.
+    bid_size: Mapped[float | None] = mapped_column(Float, nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    ask_size: Mapped[float | None] = mapped_column(Float, nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+
+    # ---- three clocks, never one (OC-1) --------------------------------
+    #
+    #   exchange_time  the source's own timestamp for the quote, if it
+    #                  publishes one. NULL when it does not.
+    #   capture_time   when Quant Desk received the latest poll folded into
+    #                  this bar — the moment the stored close became known.
+    #   first_seen     when this bar was first recorded. Immutable: written
+    #                  on insert and never in an upsert's update set, so a
+    #                  re-import cannot make an old observation look newer
+    #                  or older than it was.
+    #
+    # `timestamp` above is the bucket start and is a grouping key only. It
+    # used to double as availability, which let a quote captured at 10:04
+    # count as known at 10:00. NULL on legacy rows, which are read under the
+    # old bucket-close rule and labelled as such.
+    exchange_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    capture_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    first_seen: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
 
     # The index level at this same bar. Stored alongside the premium because
     # without it, greeks and implied volatility cannot be recomputed later:

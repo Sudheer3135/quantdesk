@@ -38,6 +38,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..market_hours import IST
+from ..data import schema
 from ..models import OptionCandle, OptionContract
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,23 @@ SNAPSHOT = "snapshot"
 DEFAULT_STALENESS_MINUTES = 10
 
 HASH_VERSION = "2"
+
+# How a bar's availability is established.
+#   CAPTURED       the capture time Quant Desk recorded when it received the
+#                  poll whose price is stored — an observation.
+#   LEGACY_BUCKET  rows archived before capture times existed: available at
+#                  the bucket's close (or later, if the row says so). An
+#                  assumption, and labelled as one.
+CAPTURED = "capture_time"
+LEGACY_BUCKET = "legacy_bucket_close"
+
+# Which clock a quote's *age* is measured on — a different question from
+# when it became available. A quote can be newly received and already old:
+# printed at 10:00, captured at 10:09, it is available from 10:09 and nine
+# minutes old the moment it arrives.
+AGE_EXCHANGE = "exchange_time"
+AGE_CAPTURE = "capture_time_no_exchange_stamp"
+AGE_LEGACY_BUCKET = "legacy_bucket_start"
 
 
 class OptionLookaheadError(RuntimeError):
@@ -108,6 +126,40 @@ class OptionBar:
     samples: int | None
     session_date: date | None
     available_at: datetime | None = None
+    # The three clocks (OC-1). None on legacy rows, which are then read under
+    # the old bucket-close rule — see `ChainStore.available_from`.
+    exchange_time: datetime | None = None
+    capture_time: datetime | None = None
+    first_seen: datetime | None = None
+
+    @property
+    def timestamp_basis(self) -> str:
+        """Which clock this bar's availability and age are measured on."""
+        return CAPTURED if self.capture_time is not None else LEGACY_BUCKET
+
+    @property
+    def observed_at(self) -> datetime:
+        """When the stored price was true: the source's own stamp if it gave
+        one, else when it was captured. Never the bucket start, which is a
+        grouping key and not a time the price existed at."""
+        if self.exchange_time is not None:
+            return _as_utc(self.exchange_time)
+        if self.capture_time is not None:
+            return _as_utc(self.capture_time)
+        return _as_utc(self.timestamp)
+
+    @property
+    def age_basis(self) -> str:
+        """The clock `observed_at` came from, named so a fallback is visible."""
+        if self.exchange_time is not None:
+            return AGE_EXCHANGE
+        if self.capture_time is not None:
+            return AGE_CAPTURE
+        return AGE_LEGACY_BUCKET
+
+    def age(self, moment: datetime) -> timedelta:
+        """How old the observation is at `moment`, on the staleness clock."""
+        return _as_utc(moment) - self.observed_at
 
     @property
     def observed_tape(self) -> bool:
@@ -126,6 +178,12 @@ class OptionBar:
             "contract": self.key.label(),
             "bar_timestamp": self.timestamp.isoformat(),
             "available_at": self.available_at.isoformat() if self.available_at else None,
+            "exchange_time": self.exchange_time.isoformat() if self.exchange_time else None,
+            "capture_time": self.capture_time.isoformat() if self.capture_time else None,
+            "first_seen": self.first_seen.isoformat() if self.first_seen else None,
+            "timestamp_basis": self.timestamp_basis,
+            "observed_at": self.observed_at.isoformat(),
+            "age_basis": self.age_basis,
             "bar_kind": self.bar_kind,
             "samples": self.samples,
             "source": self.source,
@@ -157,9 +215,17 @@ class ChainStore:
         from ..analytics.indicators import TIMEFRAME_MINUTES
         duration = timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
         def available(bar):
+            listed = (_as_utc(contracts[bar.key].first_seen)
+                      if bar.key in contracts and contracts[bar.key].first_seen
+                      else _as_utc(bar.timestamp))
+            if bar.capture_time is not None:
+                # Available when it was captured — no earlier, however early
+                # its bucket started. A quote captured at 10:04 is not known
+                # at 10:02 because its bucket is stamped 10:00 (OC-1).
+                return max(_as_utc(bar.capture_time), listed)
             return max(_as_utc(bar.timestamp) + duration,
                        _as_utc(bar.available_at) if bar.available_at else _as_utc(bar.timestamp),
-                       _as_utc(contracts[bar.key].first_seen) if bar.key in contracts and contracts[bar.key].first_seen else _as_utc(bar.timestamp))
+                       listed)
         self._bars = {k: sorted(v, key=available) for k, v in bars.items()}
         self._stamps = {k: [available(b) for b in v] for k, v in self._bars.items()}
         self._available = available
@@ -258,12 +324,15 @@ class ChainStore:
 
         if allow_stale:
             return bar
-        if moment - bar.timestamp > self.staleness:
+        # Age from when the price was true — the exchange's stamp, else the
+        # capture — not from the bucket start. For a legacy row those are the
+        # same thing and nothing changes.
+        if bar.age(moment) > self.staleness:
             return None
         # A quote from the previous session is not a stale quote from this
         # one — it is a fact about a market that has since closed, gapped and
         # reopened. Age alone would let an overnight hold price off it.
-        if _session_of(bar.timestamp) != _session_of(moment):
+        if _session_of(bar.observed_at) != _session_of(moment):
             return None
         return bar
 
@@ -426,6 +495,13 @@ def load(
     bars: dict[ContractKey, list[OptionBar]] = {}
     contracts: dict[ContractKey, ContractMeta] = {}
 
+    # An archive from before migration 0009 has no capture clocks; read what
+    # it has and let those bars fall back to the labelled legacy rule.
+    only, _missing = schema.loadable(db, OptionCandle)
+    if only:
+        stmt = stmt.options(*only)
+    has_clocks = not _missing
+
     for candle, contract in db.execute(stmt).all():
         key = ContractKey(expiry=contract.expiry_date,
                           strike=float(contract.strike),
@@ -447,6 +523,12 @@ def load(
             bar_kind=candle.bar_kind, source=candle.source,
             samples=candle.samples, session_date=candle.session_date,
             available_at=_as_utc(candle.ingested_at) if candle.ingested_at else None,
+            exchange_time=(_as_utc(candle.exchange_time)
+                           if has_clocks and candle.exchange_time else None),
+            capture_time=(_as_utc(candle.capture_time)
+                          if has_clocks and candle.capture_time else None),
+            first_seen=(_as_utc(candle.first_seen)
+                        if has_clocks and candle.first_seen else None),
         ))
 
     log.info("loaded %d option bars over %d contracts for %s",

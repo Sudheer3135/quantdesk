@@ -82,6 +82,13 @@ def _minutes_ist(iso: str) -> int | None:
     return local.hour * 60 + local.minute
 
 
+def _count(values) -> dict:
+    out: dict = {}
+    for value in values:
+        out[value] = out.get(value, 0) + 1
+    return out
+
+
 def stats(trades: Sequence, curve: Sequence[float],
           starting_capital: float) -> dict:
     """The headline numbers, all after costs.
@@ -141,6 +148,15 @@ def stats(trades: Sequence, curve: Sequence[float],
         # level because the bar gapped through it. Both are properties of
         # the sample and belong beside the win rate, not in a footnote.
         "ambiguous_trade_count": sum(1 for t in trades if t.ambiguous_intrabar),
+        # How many trades were sized on a lot size somebody verified, and how
+        # many on the run's configured one (OC-4). A result sized on
+        # unverified lots is a result about the configuration.
+        "lot_size_verified_trades": sum(
+            1 for t in trades
+            if (t.selection.get("spec") or {}).get("lot_size_verified")),
+        "lot_size_bases": _count(
+            (t.selection.get("spec") or {}).get("lot_size_basis", "unrecorded")
+            for t in trades),
         "gapped_exit_count": sum(
             1 for t in trades if t.exit_reason in ("stop_gap", "target_gap")),
         "cost_per_trade": round(float(charges.mean()), 2),

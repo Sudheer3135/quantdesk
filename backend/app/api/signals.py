@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..analytics import options as option_analytics
 from ..analytics import plan as plan_builder
-from ..analytics import signal_engine, indicators
+from ..analytics import decision_provenance, indicators, signal_engine, warmup
 import pandas as pd
 from ..brokers.base import UnknownSymbol
 from ..db import get_db
@@ -49,8 +49,16 @@ def build_analysis(symbol: str, timeframe: str, days: int = 5) -> Analysis:
     symbol = validate_symbol(symbol)
     broker = get_broker()
     candles = broker.candles(symbol, timeframe, days)
+    # When Quant Desk actually received the candles — the moment the bars
+    # became available to it, never inferred from the exchange's clock. A
+    # bar is complete in *this copy* only if it had closed before the copy
+    # was taken, so completeness is judged at receipt: judging it at the
+    # later decision instant would admit a bar that was fetched while still
+    # forming and closed only afterwards.
+    received_at = pd.Timestamp.now(tz="UTC")
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=received_at)
+    candles.attrs["received_at"] = received_at.isoformat()
     decision_time = pd.Timestamp.now(tz="UTC")
-    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
     candles.attrs["decision_time"] = decision_time.isoformat()
     try:
         chain = broker.option_chain(symbol)
@@ -60,6 +68,11 @@ def build_analysis(symbol: str, timeframe: str, days: int = 5) -> Analysis:
     vix = broker.india_vix()
     decision_time = pd.Timestamp.now(tz="UTC")
     candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
+    # The same declared history a replay of this bar sees (TC-5). Five days
+    # of candles is ~375 bars; the backtest reads 300; the EMA200 of the two
+    # differ, so the live signal used to be computed on different inputs
+    # from any replay of it.
+    candles = warmup.declared_history(candles)
     candles.attrs["decision_time"] = decision_time.isoformat()
     if chain is not None:
         source_time = chain.attrs.get("source_time")
@@ -113,6 +126,20 @@ def plan_columns(built: plan_builder.Plan | None) -> dict:
             "plan": built.to_dict()}
 
 
+def provenance_columns(sig: signal_engine.Signal) -> dict:
+    """The signal row's clock and provenance columns (TC-2, RP-2).
+
+    One definition for both writers, like `plan_columns` above and for the
+    same reason. The code identifier is read here — once per stored signal,
+    not per bar inside the engine — and names a dirty tree as dirty.
+    """
+    from ..backtest import measurement
+    from ..config import get_settings
+
+    return decision_provenance.columns(
+        sig, data_source=get_settings().broker, code_id=measurement.code_id())
+
+
 @router.get("/live")
 def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
                 persist: bool = False, db: Session = Depends(get_db),
@@ -154,6 +181,7 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
             # whatever was on screen at the time.
             risk=payload["risk"],
             **plan_columns(analysis.plan),
+            **provenance_columns(sig),
         )
         db.add(record)
         db.commit()

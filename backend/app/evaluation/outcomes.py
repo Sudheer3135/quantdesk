@@ -41,11 +41,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .. import market_hours
+from ..analytics import decision_provenance
 from ..backtest import execution
 from ..backtest.costs import CostModel, FlatCostModel, SlippageModel
 from ..backtest.execution import ExecutionPolicy
 from ..backtest.feed import HistoricalFeed
 from ..data import repository
+from ..data import research, schema
 from ..models import SignalRecord
 
 log = logging.getLogger(__name__)
@@ -293,12 +295,15 @@ class NoExecutableBar(ValueError):
     """
 
 
+PERSISTED_CLOCK = "persisted_clock"
+
+
 def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecord,
                     costs: CostModel, slippage: SlippageModel,
                     quantity: int = EVALUATION_QUANTITY, *, execution_index: int | None = None,
                     timing_basis: str = "recorded_bar_time",
                     policy: ExecutionPolicy | None = None,
-                    decision_time=None) -> Outcome:
+                    decision_time=None, execution_floor=None) -> Outcome:
     """Replay one stored signal against the bars that followed it.
 
     `signal_index` is the bar the signal was computed on. The fill is the
@@ -320,6 +325,23 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
     the clock starts at the close of the bar the signal was computed on,
     which is the earliest the decision could possibly have existed.
 
+    Persisted clocks are enforced here, from the record itself (TC-2). A
+    row whose `clock_basis` is persisted is validated by
+    `decision_provenance.persisted` — the same check `collect` uses — before
+    any price is read, and fails closed if a clock is missing or out of
+    order. Its deadline is then
+
+        max(persisted earliest_execution_time,
+            persisted decision_at + policy latency,
+            execution_floor, if the caller gave one)
+
+    so a caller can make execution later and never earlier. It used to be
+    the caller's job to pass the persisted deadline in; a direct call that
+    left `execution_floor` out filled at whatever bar it named.
+    `execution_floor` earlier than the decision is refused as malformed.
+    Only a genuinely legacy row may be evaluated without persisted clocks,
+    and it may not be labelled `persisted_clock`.
+
     Returns an Outcome whose `outcome` is `entry_rejected_due_to_gap` when
     the fill invalidated the trade before it began. Such a row is not
     resolved, never carries an exit, and cannot be counted as a win or a
@@ -328,8 +350,22 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
     policy = policy or ExecutionPolicy()
     direction = 1 if record.action == "BUY" else -1
 
+    # 1. The record's own clocks, checked before anything else is touched.
+    clock = None
+    if decision_provenance.claims_persisted(record):
+        clock = decision_provenance.persisted(record, timeframe_minutes=5)
+        timing_basis = PERSISTED_CLOCK
+    elif timing_basis == PERSISTED_CLOCK:
+        raise decision_provenance.ClockViolation(
+            f"signal {record.id} has no persisted clocks and cannot be "
+            "evaluated as persisted_clock")
+
     feed.seek(signal_index)
     stamps = feed.stamps()
+    if clock is not None and stamps.iloc[signal_index] != clock["bar_open_time"]:
+        raise decision_provenance.ClockViolation(
+            f"signal bar {stamps.iloc[signal_index].isoformat()} is not the "
+            f"persisted bar {clock['bar_open_time'].isoformat()}")
     signal_bar_close = stamps.iloc[signal_index] + pd.Timedelta(minutes=5)
     # A decision cannot predate the close of the bar it was computed on, so
     # the bar close is the floor on the execution clock even when a recorded
@@ -340,11 +376,28 @@ def evaluate_signal(feed: HistoricalFeed, signal_index: int, record: SignalRecor
     signal_time = signal_bar_close
     if decision_time is not None:
         signal_time = max(pd.Timestamp(decision_time), signal_bar_close)
+    # 2. The effective floor: persisted deadline, policy deadline from the
+    # persisted decision, and a caller's floor — the latest of them.
+    if clock is not None:
+        signal_time = max(signal_time, clock["decision_at"])
     earliest = execution.earliest_execution_time(signal_time, policy)
+    if clock is not None:
+        earliest = max(earliest, clock["earliest_execution_time"])
+    if execution_floor is not None:
+        floor = pd.Timestamp(execution_floor)
+        if floor.tzinfo is None or floor < signal_time:
+            raise decision_provenance.ClockViolation(
+                f"execution floor {floor.isoformat()} precedes "
+                f"the decision {signal_time.isoformat()}")
+        earliest = max(earliest, floor)
 
     if execution_index is None:
-        found = execution.first_executable_index(
-            stamps, signal_index, signal_time, policy)
+        # Located from the deadline itself, so a persisted floor binds the
+        # search exactly as it binds the check below.
+        found = int(pd.Series(stamps).searchsorted(earliest, side="left"))
+        found = max(found, signal_index + 1)
+        if found >= len(stamps):
+            found = None
         if found is None:
             raise NoExecutableBar(
                 f"no stored bar opens at or after {earliest.isoformat()}; "
@@ -761,14 +814,23 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
     slippage = slippage_model or SlippageModel()
     policy = policy or ExecutionPolicy()
 
+    # Load only the columns this database has. A frozen archive from before
+    # migration 0009 carries no persisted clocks; reading it must still work,
+    # and those signals simply fall back to the JSON timing, labelled.
+    only, missing = schema.loadable(db, SignalRecord)
+    clocks_persisted = "decision_at" not in missing
     records = list(db.scalars(
         select(SignalRecord)
+        .options(*only)
         .where(SignalRecord.symbol == symbol, SignalRecord.timeframe == timeframe)
         .order_by(SignalRecord.created_at)
     ).all())
 
     selection = SelectionReport(stored=len(records))
-    candles = repository.load_index_candles(db, symbol, timeframe)
+    # The research read: bars off the exchange grid — a 15:30 bar, a
+    # duplicated or off-boundary stamp — are quarantined, not replayed
+    # against. See `data.research` and `data.clock_grid`.
+    candles = research.load_research_candles(db, symbol, timeframe)
 
     if candles.empty or not records:
         return Selection(outcomes=[], report=selection, candles=candles)
@@ -803,12 +865,35 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
             continue
 
         timing = (record.context or {}).get("timing") or {}
-        decision = pd.Timestamp(timing.get("signal_time") or stamped)
+        # The persisted clocks first (TC-2). A column written at decision time
+        # is the record; the JSON copy is what older rows have instead, and
+        # is used for them — labelled — rather than for everything.
+        #
+        # A row that claims persisted clocks is held to them. If any is
+        # missing or out of order the row fails closed — it is not quietly
+        # re-read through the legacy JSON, which would replace the recorded
+        # deadline with a weaker one computed from today's latency.
+        persisted = (clocks_persisted
+                     and record.clock_basis == decision_provenance.PERSISTED)
+        floor = None
+        if persisted:
+            try:
+                clock = decision_provenance.persisted(record, timeframe_minutes=5)
+            except decision_provenance.ClockViolation:
+                selection.invalid_timing += 1
+                continue
+            decision = clock["decision_at"]
+            recorded_bar = clock["bar_open_time"]
+            floor = clock["earliest_execution_time"]
+        else:
+            decision = pd.Timestamp(timing.get("signal_time") or stamped)
+            recorded_bar = (pd.Timestamp(timing["bar_open_time"])
+                            if timing.get("bar_open_time") else None)
         if decision.tzinfo is None:
             selection.invalid_timing += 1
             continue
-        if timing.get("bar_open_time"):
-            bar_time = pd.Timestamp(timing["bar_open_time"])
+        if recorded_bar is not None:
+            bar_time = recorded_bar
             if bar_time.tzinfo is None or bar_time + pd.Timedelta(minutes=5) > decision:
                 selection.invalid_timing += 1
                 continue
@@ -816,7 +901,7 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
             if position >= len(feed) or stamps.iloc[position] != bar_time:
                 selection.no_candle += 1
                 continue
-            basis = "recorded_bar_time"
+            basis = PERSISTED_CLOCK if persisted else "recorded_bar_time"
         else:
             position = int(stamps.searchsorted(decision-pd.Timedelta(minutes=5), side="right"))-1
             basis = "legacy_inferred_last_closed_bar"
@@ -828,8 +913,13 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
         # guard below must keep rejecting a signal whose executable bar is
         # not strictly after its own source bar, rather than quietly
         # advancing to the next one. The deadline is the shared one.
-        execution_bar = int(stamps.searchsorted(
-            execution.earliest_execution_time(decision, policy), side="left"))
+        #
+        # A persisted deadline is the floor (TC-2): the policy latency may
+        # push the fill later, never earlier than what the decision recorded.
+        deadline = execution.earliest_execution_time(decision, policy)
+        if floor is not None:
+            deadline = max(deadline, floor)
+        execution_bar = int(stamps.searchsorted(deadline, side="left"))
         if (position < 0 or execution_bar >= len(feed)
                 or execution_bar <= position):
             selection.no_candle += 1
@@ -849,7 +939,8 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
         # other was not.
         outcomes.append(evaluate_signal(feed, position, record, costs, slippage,
                         quantity, execution_index=execution_bar, timing_basis=basis,
-                        policy=policy, decision_time=decision))
+                        policy=policy, decision_time=decision,
+                        execution_floor=floor))
 
     selection.selected = len(outcomes)
     selection.distinct_bars = len(seen_bars)

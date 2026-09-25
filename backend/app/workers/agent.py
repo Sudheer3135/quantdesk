@@ -14,7 +14,7 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .. import net
-from ..api.signals import build_analysis, plan_columns
+from ..api.signals import build_analysis, plan_columns, provenance_columns
 from ..cache import publish
 from ..config import get_settings
 from ..data import importer, regime_store
@@ -136,6 +136,7 @@ def _analyse(s) -> None:
             checks=[c.to_dict() for c in sig.checks], context=sig.context,
             risk=payload["risk"],
             **plan_columns(analysis.plan),
+            **provenance_columns(sig),
         ))
         db.commit()
 

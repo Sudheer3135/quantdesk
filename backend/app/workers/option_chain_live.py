@@ -46,6 +46,10 @@ CHAIN_COLUMNS = ("strike", "call_oi", "put_oi", "call_ltp", "put_ltp",
                  "put_bid", "put_ask")
 
 
+def _or_nan(value) -> float:
+    return float(value) if value is not None else float("nan")
+
+
 @dataclass
 class Quote:
     """The latest state of one contract."""
@@ -183,21 +187,25 @@ class LiveChain:
 
         rows: dict[float, dict] = {}
         for q in fresh:
+            nan = float("nan")
             row = rows.setdefault(q.contract.strike, {
                 "strike": q.contract.strike,
-                "call_oi": 0.0, "put_oi": 0.0,
-                "call_ltp": 0.0, "put_ltp": 0.0,
-                "call_volume": 0.0, "put_volume": 0.0,
-                "call_bid": 0.0, "call_ask": 0.0,
-                "put_bid": 0.0, "put_ask": 0.0,
+                "call_oi": nan, "put_oi": nan,
+                "call_ltp": nan, "put_ltp": nan,
+                "call_volume": nan, "put_volume": nan,
+                "call_bid": nan, "call_ask": nan,
+                "put_bid": nan, "put_ask": nan,
                 "_sides": set(),
             })
             side = "call" if q.contract.option_type == CALL else "put"
-            row[f"{side}_oi"] = float(q.open_interest or 0.0)
+            # None is "the feed has not sent this", and stays NaN (OC-5).
+            # `or 0.0` turned it into a recorded zero, and a zero OI moved
+            # the put/call ratio and max pain exactly as a real one would.
+            row[f"{side}_oi"] = _or_nan(q.open_interest)
             row[f"{side}_ltp"] = float(q.price)
-            row[f"{side}_volume"] = float(q.volume or 0.0)
-            row[f"{side}_bid"] = float(q.bid or 0.0)
-            row[f"{side}_ask"] = float(q.ask or 0.0)
+            row[f"{side}_volume"] = _or_nan(q.volume)
+            row[f"{side}_bid"] = _or_nan(q.bid)
+            row[f"{side}_ask"] = _or_nan(q.ask)
             row["_sides"].add(q.contract.option_type)
 
         complete = [r for r in rows.values() if r["_sides"] == {CALL, PUT}]

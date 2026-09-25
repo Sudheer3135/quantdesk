@@ -537,7 +537,9 @@ def test_re_running_the_import_does_not_duplicate_rows(db):
     assert len(stored_rows(db)) == count_after_first, "re-import duplicated rows"
     assert first.stored["write"]["inserted"] == count_after_first
     assert second.stored["write"]["inserted"] == 0
-    assert second.stored["write"]["updated"] == count_after_first
+    # Pass 2C: identical bars are recognised and left alone, not rewritten.
+    assert second.stored["write"]["updated"] == 0
+    assert second.stored["unchanged"] == count_after_first
 
 
 def test_the_report_names_short_sessions(db):

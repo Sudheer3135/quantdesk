@@ -153,7 +153,12 @@ def allowed(policy: str) -> tuple[str, ...]:
 
 def _from_bar(bar: OptionBar, moment: datetime,
               available_from: datetime | None = None) -> Quote:
-    age = int((moment - bar.timestamp).total_seconds() // 60)
+    # The same clock the store's staleness guard used (`OptionBar.age`), not
+    # the bucket start. A quote printed at 10:00 into the 10:05 bucket and
+    # captured at 10:09 is nine minutes old at 10:09; measured from the
+    # bucket it read four, younger than the guard had just judged it.
+    elapsed = bar.age(moment)
+    age = int(elapsed.total_seconds() // 60)
     freshness = "at this bar" if age <= 0 else f"{age} min old"
     if bar.observed_tape:
         basis = f"Traded price from the archive, {freshness}."
@@ -164,9 +169,10 @@ def _from_bar(bar: OptionBar, moment: datetime,
         premium=float(bar.close),
         evidence=evidence_for(bar),
         basis=basis,
-        reference=bar.reference() | (
-            {"available_from": available_from.isoformat()}
-            if available_from is not None else {}),
+        reference=bar.reference() | {
+            "observation_age_seconds": round(elapsed.total_seconds(), 3),
+        } | ({"available_from": available_from.isoformat()}
+             if available_from is not None else {}),
         bid=bar.bid, ask=bar.ask, iv_used=bar.iv,
         open_interest=bar.open_interest, volume=bar.volume,
         bar_kind=bar.bar_kind,

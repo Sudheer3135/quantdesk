@@ -598,8 +598,18 @@ def _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state, equity,
         return None
 
     risk.capital = equity
+    # Size against the lot the exchange applied to this contract on this
+    # date when that is verified (OC-4) — published by the source's contract
+    # master or entered from a cited circular. Otherwise the run's configured
+    # lot stands, and the trade's `selection.spec.lot_size_basis` says it was
+    # not verified. A configured number is never promoted to a verified one.
+    sizing = risk
+    spec = chosen.spec or {}
+    if spec.get("lot_size_verified") and spec.get("lot_size") \
+            and int(spec["lot_size"]) != risk.lot_size:
+        sizing = replace(risk, lot_size=int(spec["lot_size"]))
     decision = evaluate(
-        config=risk, state=state,
+        config=sizing, state=state,
         entry=premium_entry,
         stop_loss=premium_entry - premium_risk,
         target=premium_entry + (premium_target - premium_entry),

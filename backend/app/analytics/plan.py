@@ -134,7 +134,12 @@ def _trend_reading(frame: pd.DataFrame, label: str) -> Reading:
                        available=False)
     enriched = indicators.enrich(frame)
     check = signal_engine.check_trend(enriched.iloc[-1])
-    return Reading(f"trend_{label}", check.score, f"{label}: {check.reason}")
+    # A check that could not run is left out of the bias, not counted as a
+    # zero. An hourly frame built from the declared 300 five-minute bars
+    # holds about 25 bars — short of the 50 an EMA50 needs — and its EMA50
+    # used to be a number seeded from the first close and read as a trend.
+    return Reading(f"trend_{label}", check.score, f"{label}: {check.reason}",
+                   available=not check.disabled)
 
 
 def _vwap_reading(frame: pd.DataFrame, label: str) -> Reading:
@@ -156,9 +161,16 @@ def _option_reading(summary: options.ChainSummary | None) -> Reading:
         return Reading("options", 0.0,
                        "No option chain available, so positioning is not part "
                        "of this bias.", available=False)
+    if not summary.oi_available:
+        return Reading("options", 0.0,
+                       "Option-chain open interest is unavailable, so "
+                       "positioning is not part of this bias.", available=False)
+    pcr = (f"PCR {summary.pcr_oi:.2f}" if summary.pcr_oi is not None
+           else "PCR unavailable")
+    pain = (f"max pain {summary.max_pain:.0f}" if summary.max_pain is not None
+            else "max pain unavailable")
     return Reading("options", _direction(summary.bias),
-                   f"Chain reads {summary.bias} "
-                   f"(PCR {summary.pcr_oi:.2f}, max pain {summary.max_pain:.0f}).")
+                   f"Chain reads {summary.bias} ({pcr}, {pain}).")
 
 
 def read_bias(candles: pd.DataFrame,

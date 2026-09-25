@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 
 from ..analytics import option_pricing
+from ..data import contract_specs
 from ..market_hours import IST, MARKET_CLOSE
 from .chain import ChainStore, ContractKey
 
@@ -141,6 +142,9 @@ class Selection:
     delta: float | None
     liquidity: Liquidity
     reasons: list[str] = field(default_factory=list)
+    # The dated contract specification (OC-4): where the expiry came from,
+    # and the lot size with its basis. See `data.contract_specs`.
+    spec: dict = field(default_factory=dict)
 
     @property
     def strike(self) -> float:
@@ -162,6 +166,7 @@ class Selection:
             "delta": round(self.delta, 4) if self.delta is not None else None,
             "liquidity": self.liquidity.to_dict(),
             "reasons": self.reasons,
+            "spec": self.spec,
         }
 
 
@@ -378,9 +383,18 @@ def select(
 
     delta = option_pricing.greeks(spot, strike, years, iv,
                                   kind=option_type).delta if years > 0 else None
+    # Listed by the archive, or computed from a weekday because a modelled
+    # run has no archive to list it. Never the second when the first exists:
+    # `choose_expiry` reads the archive whenever `use_archive` is set.
+    spec = contract_specs.resolve(
+        underlying=store.underlying, key=key, meta=store.contracts.get(key),
+        on=moment.date(),
+        expiry_basis=(contract_specs.ARCHIVE_LISTED if use_archive
+                      else contract_specs.SYNTHETIC_WEEKDAY))
     return Selection(key=key, expiry=expiry_at, days_to_expiry=tenor,
                      moneyness=moneyness, steps_from_atm=steps, delta=delta,
-                     liquidity=liquidity, reasons=reasons), None
+                     liquidity=liquidity, reasons=reasons,
+                     spec=spec.to_dict()), None
 
 
 def check_liquidity(

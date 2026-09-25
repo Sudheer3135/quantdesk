@@ -36,7 +36,9 @@ from ..analytics import indicators
 
 log = logging.getLogger(__name__)
 
-DEFAULT_ANALYSIS_WINDOW = 300
+# The declared history every decision sees, live and in replay. Defined in
+# `analytics.warmup` so the live path and this one cannot drift apart.
+from ..analytics.warmup import ANALYSIS_HISTORY_BARS as DEFAULT_ANALYSIS_WINDOW  # noqa: E402
 
 # The three outcomes of a causality run. UNVERIFIED is not a soft PASS.
 PASS = "PASS"

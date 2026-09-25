@@ -82,7 +82,13 @@ def capture(force: bool = False) -> dict | None:
             spot=spot,
             source=settings.broker,
             timeframe=settings.watch_timeframe,
-            lot_size=settings.lot_size,
+            # Only a lot size the source itself published for this contract
+            # (OC-4). The configured `settings.lot_size` is an undated
+            # default; recording it as contract metadata would put an
+            # unverified number in the archive looking exactly like a
+            # verified one. NSE's public chain publishes none, so there the
+            # contract's lot size is recorded as unavailable.
+            lot_size=chain.attrs.get("lot_size"),
         )
     return report.to_dict()
 
