@@ -155,6 +155,25 @@ def research_readiness(symbol: str = "NIFTY", timeframe: str = "5m",
     return readiness.report(db, symbol, timeframe, underlying=symbol)
 
 
+@router.get("/methodology")
+def methodology_readiness(symbol: str = "NIFTY", timeframe: str = "5m",
+                          db: Session = Depends(get_db)):
+    """Research methodology readiness (Pass 2D): how the archive is classified,
+    whether a prospective holdout exists, the trial registry, benchmarks and
+    the MTM ledger — one status per question. Reads no strategy output."""
+    from ..data import research
+    from ..methodology import readiness as methodology
+    from ..methodology import registry
+
+    # A trusted data-quality read: the summary counts sessions and their
+    # categories, and returns no bar of any of them.
+    archive = research.load_research_candles(
+        db, symbol, timeframe, access=registry.trusted_access(registry.DATA_QUALITY))
+    option = readiness.report(db, symbol, timeframe, underlying=symbol)
+    return methodology.summary(db, archive,
+                               option_execution=option["verdicts"]["option_execution"])
+
+
 @router.get("/datasets")
 def datasets(limit: int = Query(25, ge=1, le=200), db: Session = Depends(get_db)):
     """Recently fingerprinted datasets.

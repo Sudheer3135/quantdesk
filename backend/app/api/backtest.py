@@ -28,10 +28,10 @@ from ..backtest.engine import run
 from ..backtest.option_engine import run as run_options
 from ..config import get_settings
 from ..data import dataset as dataset_module
-from ..data import repository
-from ..data import research
+from ..data import repository, research
 from ..db import get_db
 from ..deps import get_broker
+from ..methodology import protection, registry
 from ..optionbuy import coverage as optionbuy_coverage
 from ..optionbuy import pricing as optionbuy_pricing
 from ..optionbuy import runner as optionbuy_runner
@@ -88,10 +88,18 @@ def load_candles(db: Session, payload: BacktestIn) -> tuple:
     """
     if payload.source == "broker":
         try:
-            candles = get_broker().candles(
+            pulled = get_broker().candles(
                 payload.symbol, payload.timeframe, payload.days)
         except Exception as exc:
             raise HTTPException(502, f"could not load candles: {exc}") from exc
+        # The broker's own raw pull, so it is certified here, then protected
+        # exactly as the database path is: a live pull is not a way around
+        # the holdout, or around the grid.
+        certified = protection.certify_raw_frame(
+            pulled, source=protection.BROKER, timeframe=payload.timeframe,
+            certification=registry.trusted_access(registry.RAW_CERTIFICATION))
+        candles = protection.protect_research_frame(
+            db, certified, source=protection.BROKER, timeframe=payload.timeframe)
 
         print_ = dataset_module.fingerprint(candles, payload.symbol, payload.timeframe)
         block = print_.to_dict()

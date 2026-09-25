@@ -250,3 +250,137 @@ def quarantine(frame: pd.DataFrame, timeframe: str = "5m", *,
         "policy": "quarantine_never_snap",
     }
     return clean, held, report
+
+
+CLEAN_SESSION = "clean"
+FAULTY_SESSION = "faulty"
+# No authoritative record says how this session arrived. Never clean.
+QUALITY_UNKNOWN = "unknown"
+
+# The durable session-quality record (Pass 2D.2/2D.3). Every row a raw
+# loader certifies is stamped with its session's *raw* verdict and where it
+# came from — "clean@<source>" or "faulty:<faults>@<source>" — taken before
+# quarantine removed anything. Only raw certification writes a verdict.
+# A column rather than `attrs` because rows carry it through everything
+# research does to a frame: slicing, filtering, copying, reindexing and,
+# above all, concatenating separately loaded sessions, which drops any
+# `attrs` the pieces disagree on. A row that arrives without it (a frame
+# that never passed a boundary, or reindexed padding) is QUALITY_UNKNOWN.
+# The column holds text, never a price, so no indicator can mistake it.
+QUALITY_COLUMN = "session_quality"
+
+
+def _session_days(frame: pd.DataFrame) -> pd.Series:
+    return _stamps(frame).dt.tz_convert(IST).dt.date.map(lambda d: d.isoformat())
+
+
+def _parse(value) -> tuple[str, list[str], str | None]:
+    """A record is "<verdict>@<source>"; anything else is no record."""
+    if not isinstance(value, str):
+        return QUALITY_UNKNOWN, [], None
+    verdict, _, source = value.partition("@")
+    source = source or None
+    if verdict == CLEAN_SESSION:
+        return CLEAN_SESSION, [], source
+    if verdict.startswith(FAULTY_SESSION + ":") or verdict == FAULTY_SESSION:
+        _, _, faults = verdict.partition(":")
+        return FAULTY_SESSION, [f for f in faults.split(",") if f], source
+    return QUALITY_UNKNOWN, [], source
+
+
+def _certify_raw_observations(frame: pd.DataFrame, timeframe: str, *, source: str,
+                              as_of: datetime | None = None
+                              ) -> tuple[pd.DataFrame, pd.DataFrame, GridReport]:
+    """Grade raw bars against the grid, quarantine them, stamp the verdicts.
+
+    The ONLY place a CLEAN or FAULTY verdict is created. Private on
+    purpose: it is reached solely through
+    `methodology.protection.certify_raw_frame`, which demands a raw-
+    certification grant held by a raw loader, and refuses any frame that
+    shows it has already been processed. Grading surviving rows of a
+    processed frame would launder it — a quarantined 15:30 bar leaves 75
+    clean-looking rows — so nothing downstream may call this.
+    """
+    clean, held, report = quarantine(frame, timeframe, as_of=as_of)
+    verdicts = {g.session: (CLEAN_SESSION if g.ok else
+                            FAULTY_SESSION + ":" + ",".join(g.faults())) + "@" + source
+                for g in report.sessions}
+    clean = clean.copy()
+    clean[QUALITY_COLUMN] = (_session_days(clean).map(verdicts).fillna(QUALITY_UNKNOWN)
+                             if len(clean) else pd.Series([], dtype=object))
+    clean.attrs = dict(clean.attrs)
+    return clean, held, report
+
+
+def mark_unknown(frame: pd.DataFrame) -> pd.DataFrame:
+    """Give every row without a quality record an explicit QUALITY_UNKNOWN.
+
+    Never grades and never upgrades: a recorded verdict is kept exactly,
+    and a missing one becomes unknown — so passing a frame through this
+    any number of times leaves unknown unknown.
+    """
+    out = frame.copy()
+    out.attrs = dict(frame.attrs)
+    if QUALITY_COLUMN not in out.columns:
+        out[QUALITY_COLUMN] = QUALITY_UNKNOWN
+    elif len(out):
+        out[QUALITY_COLUMN] = out[QUALITY_COLUMN].where(
+            out[QUALITY_COLUMN].map(lambda v: isinstance(v, str)), QUALITY_UNKNOWN)
+    return out
+
+
+def session_quality(frame: pd.DataFrame, timeframe: str = "5m") -> dict[str, dict]:
+    """Research quality per session — the one source every consumer uses.
+
+    Read from the durable record (`QUALITY_COLUMN`) stamped by raw
+    certification (`methodology.protection.certify_raw_frame`) and never
+    re-derived from rows: the raw verdict, so a session whose stray
+    15:30 bar was quarantined stays faulty however many clean-looking rows
+    it has left. Per session, any row without a record makes the session
+    QUALITY_UNKNOWN, any faulty row makes it faulty, and only a session
+    whose every row says clean is clean. A frame with no record at all is
+    entirely QUALITY_UNKNOWN: missing provenance never means clean, and
+    nothing here re-grades surviving rows.
+
+    `attrs["clock_grid"]` is diagnostic. It may *add* faults — including a
+    session quarantined away entirely, when it falls inside the frame's
+    span — but it can never certify anything clean. Folds, embargo
+    manifests, holdout observation, the MTM ledger and readiness all read
+    their exclusions from here.
+    """
+    if not len(frame):
+        return {}
+    days = _session_days(frame)
+    out: dict[str, dict] = {}
+    if QUALITY_COLUMN in frame.columns:
+        for day, values in frame[QUALITY_COLUMN].groupby(days.to_numpy(), sort=True):
+            parsed = [_parse(v) for v in values]
+            kinds = {k for k, _, _ in parsed}
+            quality = (QUALITY_UNKNOWN if QUALITY_UNKNOWN in kinds else
+                       FAULTY_SESSION if FAULTY_SESSION in kinds else CLEAN_SESSION)
+            faults = sorted({f for _, fs, _ in parsed for f in fs})
+            sources = sorted({src for _, _, src in parsed if src})
+            out[day] = {"quality": quality, "faults": faults,
+                        "basis": ("raw_certification" if quality != QUALITY_UNKNOWN
+                                  else "no_raw_certification"),
+                        "certified_from_raw": quality != QUALITY_UNKNOWN,
+                        "source": ",".join(sources) or None}
+    else:
+        out = {day: {"quality": QUALITY_UNKNOWN, "faults": [],
+                     "basis": "no_raw_certification", "certified_from_raw": False,
+                     "source": None}
+               for day in sorted(set(days))}
+    raw = frame.attrs.get("clock_grid") or {}
+    faulty = {s["session"]: s["faults"] for s in raw.get("faulty_sessions", [])}
+    span = (min(out), max(out)) if out else None
+    for day, faults in faulty.items():
+        if day in out:
+            if out[day]["quality"] != FAULTY_SESSION:     # clean or unknown → faulty
+                out[day] = {"quality": FAULTY_SESSION, "faults": sorted(faults),
+                            "basis": "diagnostic_grid_report",
+                            "certified_from_raw": False, "source": None}
+        elif span and span[0] <= day <= span[1]:
+            out[day] = {"quality": FAULTY_SESSION, "faults": sorted(faults),
+                        "basis": "diagnostic_grid_report",
+                        "certified_from_raw": False, "source": None}
+    return dict(sorted(out.items()))

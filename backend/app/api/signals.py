@@ -140,6 +140,20 @@ def provenance_columns(sig: signal_engine.Signal) -> dict:
         sig, data_source=get_settings().broker, code_id=measurement.code_id())
 
 
+def note_exposure(db: Session, sig, channel: str) -> None:
+    """Serving or storing a live signal shows the strategy that session. If
+    the session is protected prospective holdout data, it is seen from now
+    on (Pass 2D, `methodology.registry`)."""
+    from ..methodology import registry
+
+    timing = (sig.context or {}).get("timing") or {}
+    moment = timing.get("decision_at") or timing.get("signal_time")
+    moment = pd.Timestamp(moment).to_pydatetime() if moment else \
+        pd.Timestamp.now(tz="UTC").to_pydatetime()
+    registry.note_strategy_output(db, moment=moment, channel=channel,
+                                  detail=f"{sig.symbol} {sig.timeframe} {sig.action}")
+
+
 @router.get("/live")
 def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
                 persist: bool = False, db: Session = Depends(get_db),
@@ -169,6 +183,7 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
     # dashboard actually reads — ended up publishing signals with no risk
     # block at all. See audit finding H-4.
     risk_live.attach(db, payload, sig)
+    note_exposure(db, sig, "strategy_signal:/signals/live")
 
     if persist:
         record = SignalRecord(

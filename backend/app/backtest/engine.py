@@ -71,9 +71,16 @@ class Trade:
     # choice, not an observation, and a result should say how many of its
     # trades rest on it.
     ambiguous_intrabar: bool = False
-    brokerage: float = 0.0
-    statutory_fees: float = 0.0
+    # The fee split. None means not recorded — never "recorded as zero" —
+    # so evidence checks can tell an absent split from a genuine zero.
+    brokerage: float | None = None
+    statutory_fees: float | None = None
     net_pnl: float = 0.0
+    # The fills as the engine computed them, before `entry` and `exit` were
+    # rounded for display. Evidence for anything that re-derives the money
+    # (the MTM ledger), so it never has to rebuild a price from the P&L.
+    entry_fill_exact: float | None = None
+    exit_fill_exact: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -125,6 +132,13 @@ def _annualisation(trades: list[Trade]) -> tuple[float, str]:
     return per_year, (
         f"{len(trades)} trades over {days:.0f} days "
         f"({per_year:.0f} trades/year)")
+
+
+def _component_total(trades: list[Trade], name: str) -> float | None:
+    """A fee component summed over trades, or None if any trade lacks it:
+    a total over a partly unrecorded split would read as a recorded one."""
+    values = [getattr(t, name) for t in trades]
+    return None if any(v is None for v in values) else round(sum(values), 2)
 
 
 def compute_stats(trades: list[Trade], equity: list[float], starting_capital: float) -> dict:
@@ -179,8 +193,8 @@ def compute_stats(trades: list[Trade], equity: list[float], starting_capital: fl
         "gross_pnl": round(sum(t.gross_pnl for t in trades), 2),
         "execution_friction": round(sum(t.execution_friction for t in trades), 2),
         "fees_taxes": round(sum(t.fees for t in trades), 2),
-        "brokerage": round(sum(t.brokerage for t in trades), 2),
-        "statutory_fees": round(sum(t.statutory_fees for t in trades), 2),
+        "brokerage": _component_total(trades, "brokerage"),
+        "statutory_fees": _component_total(trades, "statutory_fees"),
         # How much of this result is an assumption rather than an
         # observation. Every one of these trades had a bar covering both
         # levels with an open that settled neither, so its outcome was
@@ -352,6 +366,8 @@ def run(
                     brokerage=round(money.brokerage, 2),
                     statutory_fees=round(money.statutory_fees, 2),
                     net_pnl=round(money.net_pnl, 2),
+                    entry_fill_exact=float(open_trade["entry"]),
+                    exit_fill_exact=float(fill),
                 ))
                 pnl = round(pnl, 2)
                 # Account balances reconcile exactly to the reported monetary ledger.

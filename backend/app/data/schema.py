@@ -24,7 +24,12 @@ def columns(db: Session, table: str) -> frozenset[str] | None:
     change — a test that migrates in place, or an engine object recycled
     under a new database — and then answer for the wrong one.
     """
-    inspector = sa.inspect(db.get_bind())
+    # The session's own connection, not the engine. Inspecting through the
+    # engine checks a connection out of the pool and returns it with a
+    # reset — a ROLLBACK — and where the pool hands back the session's own
+    # connection (StaticPool, a single-connection setup) that silently
+    # discarded the caller's flushed, uncommitted rows.
+    inspector = sa.inspect(db.connection())
     if not inspector.has_table(table):
         return None
     return frozenset(c["name"] for c in inspector.get_columns(table))

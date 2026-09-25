@@ -14,7 +14,7 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .. import net
-from ..api.signals import build_analysis, plan_columns, provenance_columns
+from ..api.signals import build_analysis, note_exposure, plan_columns, provenance_columns
 from ..cache import publish
 from ..config import get_settings
 from ..data import importer, regime_store
@@ -128,6 +128,7 @@ def _analyse(s) -> None:
         # published one carry the same verdict rather than two evaluations
         # taken a moment apart.
         risk_live.attach(db, payload, sig)
+        note_exposure(db, sig, "strategy_signal:agent")
 
         db.add(SignalRecord(
             symbol=sig.symbol, timeframe=sig.timeframe, action=sig.action,

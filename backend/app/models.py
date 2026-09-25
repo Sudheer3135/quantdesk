@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -291,6 +292,47 @@ class CandleRevision(Base):
     known_from: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     superseded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+# At most one consumption per holdout generation, as a table constraint:
+# with `consumed_lock_id` unique this is UNIQUE(lock_id) WHERE event_type =
+# 'holdout_consumed'. A consumption row without the id, or with one that is
+# not its own subject, is not insertable at all.
+CONSUMPTION_RULE = (
+    "(event_type = 'holdout_consumed' AND consumed_lock_id IS NOT NULL "
+    "AND consumed_lock_id = subject) OR "
+    "(event_type <> 'holdout_consumed' AND consumed_lock_id IS NULL)")
+
+
+class ResearchEvent(Base):
+    """One entry in the append-only research methodology log (Pass 2D).
+
+    Seen-data registrations, holdout locks and consumptions, exposures,
+    trial preregistrations, results and invalidations all live here as
+    events. Rows are never updated or deleted — `methodology.events`
+    refuses both at the ORM level — and each carries the hash of its
+    predecessor, so an out-of-band edit is detectable.
+    """
+    __tablename__ = "research_events"
+    __table_args__ = (
+        Index("ix_research_events_stream", "stream", "subject"),
+        CheckConstraint(CONSUMPTION_RULE, name="ck_research_events_consumption"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    stream: Mapped[str] = mapped_column(String(24), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    prev_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # The holdout generation a consumption spends: required on (and only on)
+    # `holdout_consumed` events, equal to their subject, and unique — so the
+    # schema admits one consumption per generation, not the application.
+    consumed_lock_id: Mapped[str | None] = mapped_column(String(128), nullable=True,
+                                                         unique=True)
 
 
 class OptionContract(Base):

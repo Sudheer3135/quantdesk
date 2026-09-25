@@ -34,6 +34,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
+import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -502,7 +503,20 @@ def load(
         stmt = stmt.options(*only)
     has_clocks = not _missing
 
-    for candle, contract in db.execute(stmt).all():
+    # Option bars from a protected prospective holdout session are withheld
+    # from strategy access here, like index bars in the repository (2D.1).
+    from ..methodology import registry
+    rows = db.execute(stmt).all()
+    day_of = {}
+    if rows:
+        stamps = pd.to_datetime([_as_utc(candle.timestamp) for candle, _ in rows], utc=True)
+        day_of = dict(zip(range(len(rows)),
+                          stamps.tz_convert(IST).date.astype(str), strict=True))
+    protected = registry.protected_sessions(db, set(day_of.values())) if rows else set()
+
+    for n, (candle, contract) in enumerate(rows):
+        if protected and day_of[n] in protected:
+            continue
         key = ContractKey(expiry=contract.expiry_date,
                           strike=float(contract.strike),
                           option_type=contract.option_type)

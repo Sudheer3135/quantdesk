@@ -209,8 +209,16 @@ def load_index_candles(
     limit: int | None = None,
     sources: Sequence[str] | None = None,
     newest: bool = False,
+    access=None,
 ) -> pd.DataFrame:
     """Candles in the platform's standard shape, oldest first.
+
+    Strategy access by default — research, features, regimes, charts with
+    indicators — and sessions protected as prospective holdout data are
+    withheld from it here, below every caller, so none of them has to
+    remember. Only trusted collection and data-quality code, holding a
+    `registry.trusted_access` grant as `access`, sees them; a purpose
+    string is refused, not honoured.
 
     The returned frame carries a `.attrs` entry describing where the rows
     came from. It is deliberately not a column: every indicator and check in
@@ -256,6 +264,8 @@ def load_index_candles(
         # Selected newest-first so the database could apply the limit; the
         # contract is oldest-first, so it is restored here.
         rows = list(reversed(rows))
+    from ..methodology import registry
+    registry.access_purpose(access)          # refuse a bad grant before reading
     if not rows:
         empty = pd.DataFrame(columns=CANDLE_COLUMNS)
         empty.attrs[PROVENANCE] = {"rows": 0, "sources": {}, "volume_is_synthetic": False}
@@ -281,7 +291,8 @@ def load_index_candles(
         "volume_is_synthetic": any(r.volume_is_synthetic for r in rows),
         "sessions": len({r.session_date for r in rows if r.session_date}),
     }
-    return df
+    from ..methodology import registry
+    return registry.withhold(db, df, access=access)
 
 
 def provenance_of(df: pd.DataFrame) -> dict:

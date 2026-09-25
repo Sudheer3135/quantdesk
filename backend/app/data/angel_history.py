@@ -86,6 +86,13 @@ MASTER_URL = ("https://margincalculator.angelone.in/OpenAPI_File/files/"
 IST = "Asia/Kolkata"
 
 
+def _collection():
+    """This module's grant to see every stored session, protected or not:
+    it only counts which bars already exist, to decide what to fetch."""
+    from ..methodology import registry
+    return registry.trusted_access(registry.COLLECTION)
+
+
 class AngelHistoryError(RuntimeError):
     """The fetch could not be completed and the caller must not proceed."""
 
@@ -849,7 +856,8 @@ def find_missing_sessions(
         return [], skipped
 
     stored = repository.load_index_candles(
-        db, symbol=symbol, timeframe=timeframe, start=past[0], end=past[-1])
+        db, symbol=symbol, timeframe=timeframe, start=past[0], end=past[-1],
+        access=_collection())
     counts: dict[date, int] = {}
     if not stored.empty:
         days = stored["timestamp"].dt.tz_convert(IST).dt.date
@@ -910,7 +918,8 @@ def fill_gaps(
     frame = frame[on_missing_day]
 
     existing = repository.load_index_candles(
-        db, symbol=symbol, timeframe=timeframe, start=days[0], end=days[-1])
+        db, symbol=symbol, timeframe=timeframe, start=days[0], end=days[-1],
+        access=_collection())
     held = set(existing["timestamp"]) if not existing.empty else set()
     report.overlap = compare_overlap(frame, existing)
 

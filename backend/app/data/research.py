@@ -5,11 +5,12 @@ and which research needs:
 
   **The exchange grid (TC-1).** Every row is checked against the session
   grid and anything off it — a 15:30 bar, an off-boundary stamp, a
-  duplicated bar — is quarantined, never snapped. The report travels on
-  `frame.attrs["clock_grid"]`. The plain loader stays as it is for the chart
-  and the live path, which have their own normalisation; this is the one
-  research uses, and the two are named apart so that nobody mistakes one
-  for the other.
+  duplicated bar — is quarantined, never snapped. Each kept row carries its
+  session's raw verdict in the `session_quality` column; the report also
+  travels on `frame.attrs["clock_grid"]`, as diagnostics. The plain loader
+  stays as it is for the chart and the live path, which have their own
+  normalisation; this is the one research uses, and the two are named
+  apart so that nobody mistakes one for the other.
 
   **As-known reads (TC-6).** `as_known_at` rebuilds each bar as it was
   known at that instant, from `candle_revisions`, instead of the latest
@@ -29,10 +30,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import CandleRecord, CandleRevision
-from . import clock_grid, repository, schema
+from . import repository, schema
 
 LATEST = "latest_known"
 AS_KNOWN = "as_known_at"
+
+# Strategy access is the default everywhere below. Seeing protected
+# holdout sessions takes a `registry.trusted_access` grant passed as
+# `access`; a purpose string is refused (Pass 2D.2).
 
 
 def _utc(moment: datetime | None) -> datetime | None:
@@ -49,7 +54,8 @@ def _bar(record) -> dict:
 
 def as_known(db: Session, symbol: str, timeframe: str, as_known_at: datetime,
              start: datetime | date | None = None,
-             end: datetime | date | None = None) -> tuple[pd.DataFrame, dict]:
+             end: datetime | date | None = None, *,
+             access=None) -> tuple[pd.DataFrame, dict]:
     """Every bar exactly as it was known at `as_known_at`.
 
     For each stored bar, one of three things is true at that instant:
@@ -108,6 +114,10 @@ def as_known(db: Session, symbol: str, timeframe: str, as_known_at: datetime,
              else pd.DataFrame(columns=repository.CANDLE_COLUMNS))
     if len(frame):
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    # This reads CandleRecord directly, below the repository, so it applies
+    # the holdout boundary itself (Pass 2D.1).
+    from ..methodology import registry
+    frame = registry.withhold(db, frame, access=access)
     return frame, {"basis": AS_KNOWN, "as_known_at": moment.isoformat(),
                    "revision_history": "archived" if archived else "table_absent",
                    **counts}
@@ -117,14 +127,26 @@ def load_research_candles(db: Session, symbol: str = "NIFTY",
                           timeframe: str = "5m", *,
                           start: datetime | date | None = None,
                           end: datetime | date | None = None,
-                          as_known_at: datetime | None = None) -> pd.DataFrame:
-    """Grid-validated research candles, latest-known or as-known."""
+                          as_known_at: datetime | None = None,
+                          access=None) -> pd.DataFrame:
+    """Grid-validated research candles, latest-known or as-known.
+
+    The database source of `methodology.protection.protect_research_frame`,
+    which every research source passes through: sessions the registry
+    protects as prospective holdout data are withheld — their bars never
+    reach the caller — and named in `attrs["holdout"]`, and every kept row
+    carries its session's raw grid verdict. Only a trusted grant as
+    `access` sees protected sessions.
+    """
     latest = repository.load_index_candles(db, symbol, timeframe,
-                                           start=start, end=end)
+                                           start=start, end=end, access=access)
     attrs = dict(latest.attrs)
 
     if as_known_at is not None:
-        frame, basis = as_known(db, symbol, timeframe, as_known_at, start, end)
+        frame, basis = as_known(db, symbol, timeframe, as_known_at, start, end,
+                                access=access)
+        if "holdout" in frame.attrs:
+            attrs["holdout"] = frame.attrs["holdout"]
     else:
         frame = latest
         restated = db.scalars(
@@ -150,9 +172,16 @@ def load_research_candles(db: Session, symbol: str = "NIFTY",
                  "revised_without_history": len(
                      {_utc(t) for t in restated} - {_utc(t) for t in archived})}
 
-    clean, held, _report = clock_grid.quarantine(frame, timeframe)
+    # This loader read these bars from the database itself, so it is a raw
+    # loader: it certifies their session quality (the only kind of code
+    # that may), then passes the result through the shared research
+    # protection every source goes through.
+    from ..methodology import protection, registry
+    certified = protection.certify_raw_frame(
+        frame, source=protection.DATABASE, timeframe=timeframe,
+        certification=registry.trusted_access(registry.RAW_CERTIFICATION))
+    clean = protection.protect_research_frame(
+        db, certified, source=protection.DATABASE, timeframe=timeframe, access=access)
     clean.attrs = attrs | clean.attrs
     clean.attrs["revisions"] = basis
-    clean.attrs["quarantined"] = [
-        str(t) for t in pd.to_datetime(held["timestamp"], utc=True)][:50] if len(held) else []
     return clean
