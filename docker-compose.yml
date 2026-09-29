@@ -65,9 +65,21 @@ services:
     # that is not at this code's head refuses the start; the app then takes
     # the shared schema lock (app.migration_guard) before any job writes.
     # Migrating is the `migrate` service below, run on purpose.
+    #
+    # Shutdown (Pass 2E-B): uvicorn gets the policy's connection grace, and
+    # Docker waits stop_grace_period before SIGKILL — its default is 10 s,
+    # which would cut the writer drain short. Compose cannot compute that
+    # from the settings, so the same number is handed to the API as
+    # QUANTDESK_STOP_DEADLINE_SECONDS and the API refuses to start if its
+    # shutdown settings (from .env) need longer. Change the two together;
+    # tests/test_graceful_shutdown.py checks that they agree.
     command: >
       sh -c "python -m app.schema_check &&
-             exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+             exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+             --timeout-graceful-shutdown $$(python -m app.shutdown_policy | sed -n 's/^grace=//p')"
+    stop_grace_period: 150s
+    environment:
+      QUANTDESK_STOP_DEADLINE_SECONDS: "150"
 
   # The explicit migration path. In a profile, so `docker compose up` never
   # starts it:

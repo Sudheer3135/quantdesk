@@ -101,6 +101,14 @@ class Settings(BaseSettings):
     # monitoring only; 0 turns it off. Write safety comes from the per-
     # transaction schema lock, not from this (Pass 2E-A.2).
     writer_lease_heartbeat_seconds: float = 5.0
+    # The API's shutdown, as one deadline (app.shutdown_policy). uvicorn
+    # gives open connections — dashboard WebSockets — this long to close
+    # before cancelling them; the lifespan then drains the writers for up
+    # to the drain time; the margin covers the exit itself. scripts/stop.sh
+    # waits for the sum before it would ever SIGKILL (Pass 2E-B).
+    shutdown_connection_grace_seconds: float = 10.0
+    shutdown_drain_seconds: float = 120.0
+    shutdown_exit_margin_seconds: float = 15.0
 
     capital: float = 100_000.0
     risk_per_trade_pct: float = 1.0

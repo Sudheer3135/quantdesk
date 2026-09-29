@@ -13,13 +13,19 @@ from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
 from .migration_guard import Step, Writer, release_after_drain, scheduler_drained, writer_lease
+from .redact import install_log_redaction, settings_secrets
 from .security import verify_startup
+from .shutdown_policy import check_supervisor
 from .strategy_v2 import paper as v2_paper
 from .workers import agent, angel_feed, chain_publisher, option_collector, ticker, watchdog
 
 settings = get_settings()
 logging.basicConfig(level=settings.log_level,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# Before the first request can be logged. uvicorn's access and error loggers
+# do not propagate to the root logger, so a filter there never saw the
+# dashboard's `?key=` — this redacts every handler's output (Pass 2E-B).
+install_log_redaction(settings.database_url, settings_secrets(settings))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -34,6 +40,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # misconfiguration, and one that fails loudly here gets fixed rather
     # than shipped.
     verify_startup()
+    # A shutdown that cannot finish before the supervisor's SIGKILL — or
+    # settings that make no sense — refuse the start (Pass 2E-B).
+    check_supervisor(settings)
 
     # The API process hosts every scheduled writer, so it is one writer to
     # the migration protocol: the shared schema lock is taken, the schema
@@ -93,7 +102,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             Step("angel-feed", angel_feed.stop),
             Writer("scheduler", lambda: scheduler.shutdown(wait=True),
                    lambda: scheduler_drained(scheduler)),
-        ])
+        ], timeout=settings.shutdown_drain_seconds)   # app.shutdown_policy
 
 
 app = FastAPI(
