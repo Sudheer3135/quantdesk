@@ -240,7 +240,8 @@ def _execution_fill(price, model, bid, ask, *, buying):
     if min(model.ticks, model.estimated_spread_pct, model.impact_ticks, model.tick_size) < 0:
         raise ValueError("execution friction cannot be negative")
     impact = model.impact_ticks * model.tick_size
-    if bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask:
+    if (bid is not None and ask is not None and math.isfinite(bid) and math.isfinite(ask)
+            and 0 < bid <= ask):
         # Reference is midpoint, never arbitrary LTP. Crossing the spread is
         # friction, and the two components are kept apart:
         #

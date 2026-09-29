@@ -1,11 +1,12 @@
 """Shared clocks, position ledger and deterministic research provenance."""
-from dataclasses import asdict, dataclass, field
-from enum import Enum
 import hashlib
 import json
 import math
-from pathlib import Path
 import platform
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+
 import pandas as pd
 
 
@@ -13,7 +14,9 @@ def bar_close(stamp, minutes=5):
     return pd.Timestamp(stamp) + pd.Timedelta(minutes=minutes)
 
 
-class State(str, Enum):
+# str + Enum, not StrEnum: StrEnum changes str(), which feeds persisted
+# ledgers and reproducibility hashes.
+class State(str, Enum):  # noqa: UP042
     FLAT = 'FLAT'
     ENTRY_PENDING = 'ENTRY_PENDING'
     OPEN = 'OPEN'

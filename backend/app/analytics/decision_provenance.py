@@ -201,7 +201,8 @@ and, given `timeframe_minutes`, bar_close − bar_open equal to it.
         # SQLite hands aware datetimes back naive, and they are stored UTC.
         stamps[name] = stamp.tz_localize("UTC") if stamp.tzinfo is None \
             else stamp.tz_convert("UTC")
-    ordered = list(zip(PERSISTED_CLOCKS, PERSISTED_CLOCKS[1:]))
+    # Adjacent pairs: the second sequence is one shorter by design.
+    ordered = list(zip(PERSISTED_CLOCKS, PERSISTED_CLOCKS[1:], strict=False))
     if not stamps["bar_open_time"] < stamps["bar_close_time"]:
         raise ClockViolation("persisted bar_close_time is not after bar_open_time")
     for earlier, later in ordered[1:]:

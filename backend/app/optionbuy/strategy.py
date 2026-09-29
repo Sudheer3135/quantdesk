@@ -52,6 +52,7 @@ import pandas as pd
 
 from ..analytics import option_pricing, signal_engine
 from ..analytics import plan as plan_builder
+from ..backtest import execution as execution_module
 from ..backtest.costs import (
     CostModel,
     FlatCostModel,
@@ -60,7 +61,6 @@ from ..backtest.costs import (
     describe,
     sell_fill,
 )
-from ..backtest import execution as execution_module
 from ..backtest.execution import ExecutionPolicy
 from ..backtest.feed import HistoricalFeed
 from ..backtest.measurement import PositionLedger, provenance
@@ -380,7 +380,8 @@ def run(
         if open_trade is not None:
             continue
         if not feed.can_enter(i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute):
-            rejections.add(FILL_CROSSES_SESSION, "No contiguous executable bar before the session cutoff.")
+            rejections.add(FILL_CROSSES_SESSION,
+                           "No contiguous executable bar before the session cutoff.")
             continue
 
         opened = _maybe_enter(feed, i, ist, store, cfg, sel, model, risk, state,
@@ -711,7 +712,10 @@ def _maybe_exit(trade, feed, i, bar, ist, store, cfg, sel, model, costs,
                 slippage):
     """Close the trade if a rule fires, and price the exit honestly."""
     index_exit, reason, trigger, ambiguous = _exit_trigger(trade, bar, ist, i, cfg)
-    if index_exit is None and (i == len(feed) - 1 or (not cfg.hold_overnight and not feed.can_enter(i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute))):
+    if index_exit is None and (i == len(feed) - 1 or (
+            not cfg.hold_overnight
+            and not feed.can_enter(
+                i, cfg.session_exit_ist.hour * 60 + cfg.session_exit_ist.minute))):
         index_exit = float(bar["close"])
         reason = "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
     if index_exit is None:

@@ -165,7 +165,8 @@ def check_structure(state: structure.StructureState, current_index: int,
 def check_vwap(row: pd.Series) -> Check:
     price, vw = float(row["close"]), float(row["vwap"])
     if pd.isna(vw):
-        return Check("vwap", 0.0, WEIGHTS["vwap"], "VWAP unavailable: valid traded volume is required.", disabled=True)
+        return Check("vwap", 0.0, WEIGHTS["vwap"],
+                     "VWAP unavailable: valid traded volume is required.", disabled=True)
     dist = (price - vw) / vw * 100
     if abs(dist) < 0.05:
         return Check("vwap", 0.0, WEIGHTS["vwap"],

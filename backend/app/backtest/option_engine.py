@@ -233,7 +233,8 @@ def run(
     default. See `backtest/costs.py`.
     """
     feed = HistoricalFeed(candles, analysis_window=analysis_window)
-    cfg = replace(risk_config) if risk_config else RiskConfig(capital=starting_capital, lot_size=lot_size)
+    cfg = (replace(risk_config) if risk_config
+           else RiskConfig(capital=starting_capital, lot_size=lot_size))
     signal_fn = signal_fn or (lambda frame: signal_engine.generate(frame))
 
     costs = cost_model or (
@@ -282,7 +283,8 @@ def run(
                 index_exit, reason = index_now, "session end"
 
             if index_exit is None and (i == len(feed) - 1 or not feed.can_enter(i)):
-                index_exit, reason = float(bar["close"]), "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
+                index_exit, reason = float(bar["close"]), (
+                    "end_of_data" if i == len(feed)-1 else "session_or_data_boundary")
 
             if index_exit is not None:
                 quoted_exit = option_pricing.price(

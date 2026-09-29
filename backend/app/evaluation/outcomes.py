@@ -46,8 +46,7 @@ from ..backtest import execution
 from ..backtest.costs import CostModel, FlatCostModel, SlippageModel
 from ..backtest.execution import ExecutionPolicy
 from ..backtest.feed import HistoricalFeed
-from ..data import repository
-from ..data import research, schema
+from ..data import repository, research, schema
 from ..models import SignalRecord
 
 log = logging.getLogger(__name__)
@@ -752,7 +751,8 @@ class EvaluationReport:
 
 
 CAVEATS = [
-    "Legacy signals lack source-bar timestamps: last-closed-bar alignment is inferred, not verified. "
+    "Legacy signals lack source-bar timestamps: last-closed-bar alignment is inferred, "
+    "not verified. "
     "Duplicate source bars are excluded. This is signal analytics, not executed-trade performance.",
     "Hypothetical. No order was placed; these are stored signals replayed "
     "against stored candles.",
@@ -925,7 +925,8 @@ def collect(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
             selection.no_candle += 1
             continue
         # Never fill a signal at an earlier open or carry a late signal overnight.
-        if stamps.iloc[execution_bar].tz_convert("Asia/Kolkata").date() != decision.tz_convert("Asia/Kolkata").date():
+        if (stamps.iloc[execution_bar].tz_convert("Asia/Kolkata").date()
+                != decision.tz_convert("Asia/Kolkata").date()):
             selection.no_candle += 1
             continue
         if position in seen_bars:

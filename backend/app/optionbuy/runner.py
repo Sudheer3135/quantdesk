@@ -17,14 +17,13 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
+from ..backtest.costs import CostModel, SlippageModel
 from ..data import dataset as dataset_module
-from ..data import repository
 from ..data import research
 from ..risk.manager import RiskConfig
 from . import chain, strategy
 from . import coverage as coverage_module
 from .contracts import SelectionConfig
-from ..backtest.costs import CostModel, SlippageModel
 from .coverage import CoverageReport
 from .pricing import MODELLED_ONLY, ModelAssumptions
 from .strategy import OptionBuyConfig, OptionBuyResult

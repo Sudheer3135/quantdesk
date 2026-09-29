@@ -329,8 +329,10 @@ def target_fill_price(side: str, target: float, bar_open: float) -> float:
     order would have been filled any deeper into the move.
     """
     if _direction(side) == 1:
-        return max(float(target), float(bar_open)) if float(bar_open) >= float(target) else float(target)
-    return min(float(target), float(bar_open)) if float(bar_open) <= float(target) else float(target)
+        return (max(float(target), float(bar_open)) if float(bar_open) >= float(target)
+                else float(target))
+    return (min(float(target), float(bar_open)) if float(bar_open) <= float(target)
+            else float(target))
 
 
 def resolve_levels(side: str, *, bar_open: float, high: float, low: float,

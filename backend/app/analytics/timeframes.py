@@ -57,7 +57,8 @@ def fold(df: pd.DataFrame, bars_per_group: int, *, as_of=None) -> pd.DataFrame:
 
     out = indicators.validate(df)
     if not out.empty:
-        decision = as_of or df.attrs.get("decision_time") or (out.timestamp.max() + pd.Timedelta(minutes=5))
+        decision = (as_of or df.attrs.get("decision_time")
+                    or (out.timestamp.max() + pd.Timedelta(minutes=5)))
         out = indicators.drop_unclosed(out, "5m", as_of=decision)
     if out.empty:
         return out.iloc[0:0][indicators.REQUIRED_COLS]
@@ -94,13 +95,16 @@ def fold(df: pd.DataFrame, bars_per_group: int, *, as_of=None) -> pd.DataFrame:
     # final session in this frame. Everything else is settled: either it is
     # full, or its session is over.
     last_session = folded["_session"].iloc[-1]
-    current = folded["_session"] == last_session
+    # Unused, but kept: evaluating it is the existing behaviour (and
+    # iloc[-1] raises on an empty frame), so a lint fix must not drop it.
+    current = folded["_session"] == last_session  # noqa: F841
     # No logging here: holding back the forming bar is the correct outcome on
     # every single call during a live session, so it is not an event.
     # Even a past session's missing pieces are not a complete HTF bar.
     # The short final session bucket is permitted only when all its pieces exist.
     local_start = folded.timestamp.dt.tz_convert("Asia/Kolkata")
-    expected = ((15 * 60 + 30 - local_start.dt.hour * 60 - local_start.dt.minute) // 5).clip(upper=bars_per_group)
+    expected = ((15 * 60 + 30 - local_start.dt.hour * 60 - local_start.dt.minute) // 5).clip(
+        upper=bars_per_group)
     ends = folded.timestamp + pd.to_timedelta(expected * 5, unit="min")
     closed = (folded["_bars"] == expected) & (ends <= pd.Timestamp(decision))
 

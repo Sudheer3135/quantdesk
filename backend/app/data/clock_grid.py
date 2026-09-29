@@ -226,7 +226,7 @@ def quarantine(frame: pd.DataFrame, timeframe: str = "5m", *,
     Missing bars stay missing. Nothing is interpolated, forward-filled or
     snapped; the report says where the holes are.
     """
-    minutes = _minutes(timeframe)
+    _minutes(timeframe)            # refuses an undeclared timeframe before any work
     report = validate(frame, timeframe, as_of=as_of)
     if frame.empty:
         return frame.copy(), frame.copy(), report

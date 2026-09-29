@@ -321,7 +321,8 @@ def run(
                 exit_price, reason = float(bar["close"]), "session end"
 
             if exit_price is None and (i == len(feed) - 1 or not feed.can_enter(i)):
-                exit_price, reason = float(bar["close"]), "end_of_data" if i == len(feed)-1 else "session_or_data_boundary"
+                exit_price, reason = float(bar["close"]), (
+                    "end_of_data" if i == len(feed)-1 else "session_or_data_boundary")
 
             if exit_price is not None:
                 qty = open_trade["quantity"]
