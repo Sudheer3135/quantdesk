@@ -10,8 +10,10 @@ fixes takes one message instead of five.
     python3 scripts/doctor.py --no-network # skip NSE and Yahoo
     python3 scripts/doctor.py --api        # also hit a running backend
 
-Safe to run any time. It only reads. It never places an order and never
-writes to your database.
+Safe to run any time. It never places an order and never changes the
+schema. One check writes: the candle-upsert check inserts and then deletes
+twenty `__DOCTOR__` bars, under the writer lease, so it cannot run during
+a migration (Pass 2E-A.1).
 """
 from __future__ import annotations
 
@@ -165,14 +167,15 @@ def run_infrastructure() -> None:
         s = get_settings()
         return f"broker={s.broker} live_trading={s.live_trading} env={s.environment}"
 
-    @check("postgres reachable and tables create")
+    @check("postgres reachable and schema at head")
     def _():
-        from app.db import engine, init_db
-        from sqlalchemy import text
-        with engine.connect() as conn:
-            version = conn.execute(text("select version()")).scalar()
-        init_db()
-        return str(version).split(",")[0]
+        # Read-only. This used to call init_db(), which builds every table on
+        # an empty database — a schema change from a diagnostic.
+        from app import schema_check
+        status = schema_check.check()
+        if not status.ok:
+            raise RuntimeError(status.message)
+        return status.message
 
     @check("candle upsert is idempotent")
     def _():
@@ -203,7 +206,8 @@ def run_infrastructure() -> None:
             "low": 23_990.0 + i, "close": 24_005.0 + i, "volume": 1000.0 + i,
         } for i in range(20)])
 
-        with SessionLocal() as db:
+        from app.migration_guard import writer_lease
+        with writer_lease("doctor"), SessionLocal() as db:
             first_write = import_index_candles(db, df, "__DOCTOR__", "5m", "doctor")
             second_write = import_index_candles(db, df, "__DOCTOR__", "5m", "doctor")
             back = load_index_candles(db, "__DOCTOR__", "5m")

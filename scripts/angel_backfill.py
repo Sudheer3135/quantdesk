@@ -218,4 +218,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # A database writer: it runs under the shared schema lock, so it cannot
+    # start during a migration and a migration cannot start under it.
+    from app.migration_guard import run_as_writer
+    raise SystemExit(run_as_writer("angel_backfill", main))

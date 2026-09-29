@@ -6,12 +6,18 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
+from .migration_guard import protect_writes
 from .models import Base
 
 log = logging.getLogger(__name__)
 
 settings = get_settings()
 engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
+# Every write transaction on this engine — every Session, flush and execute
+# of every supported writer — takes the shared schema lock on its own
+# connection before its first write, and holds it to commit or rollback. A
+# migration in progress refuses the write before it is sent (Pass 2E-A.2).
+protect_writes(engine)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

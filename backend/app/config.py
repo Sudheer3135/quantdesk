@@ -97,6 +97,10 @@ class Settings(BaseSettings):
 
     # Nothing places a real order unless this is explicitly true.
     live_trading: bool = False
+    # How often the writer-process lease checks its own connection. Lifecycle
+    # monitoring only; 0 turns it off. Write safety comes from the per-
+    # transaction schema lock, not from this (Pass 2E-A.2).
+    writer_lease_heartbeat_seconds: float = 5.0
 
     capital: float = 100_000.0
     risk_per_trade_pct: float = 1.0

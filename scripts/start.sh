@@ -26,9 +26,16 @@ if ! port_busy "$REDIS_PORT"; then
 fi
 echo "           Redis on :$REDIS_PORT"
 
-echo "migrations ..."
-( cd "$ROOT/backend" && "$ROOT/.venv/bin/alembic" upgrade head >>"$LOG_DIR/migrations.log" 2>&1 )
-echo "           schema up to date"
+# Checked, never applied. Starting used to run `alembic upgrade head`, which
+# is how migration 0010 reached the live database on 28 Sep without anyone
+# deciding it should. Migrating is ./scripts/migrate.sh, run on purpose.
+echo "schema     ..."
+if ! schema="$(cd "$ROOT/backend" && "$ROOT/.venv/bin/python" -m app.schema_check 2>&1)"; then
+  echo "           $schema"
+  echo "           API not started."
+  exit 1
+fi
+echo "           $schema"
 
 echo "api        ..."
 if pid="$(our_listener "$API_PORT")"; then

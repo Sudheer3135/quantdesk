@@ -12,6 +12,7 @@ from .api import strategy_v2 as strategy_v2_api
 from .brokers.base import UnknownSymbol
 from .config import get_settings
 from .db import init_db
+from .migration_guard import Step, Writer, release_after_drain, scheduler_drained, writer_lease
 from .security import verify_startup
 from .strategy_v2 import paper as v2_paper
 from .workers import agent, angel_feed, chain_publisher, option_collector, ticker, watchdog
@@ -33,6 +34,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # misconfiguration, and one that fails loudly here gets fixed rather
     # than shipped.
     verify_startup()
+
+    # The API process hosts every scheduled writer, so it is one writer to
+    # the migration protocol: the shared schema lock is taken, the schema
+    # verified under it, and the lock held until everything below has
+    # stopped. A migration in progress or a schema that is not this code's
+    # head refuses startup here, before any job can write (Pass 2E-A.1).
+    lease = writer_lease("api", heartbeat=settings.writer_lease_heartbeat_seconds).acquire()
     init_db()
 
     # Share one scheduler. Three jobs, three different reasons:
@@ -70,14 +78,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        v2_paper.stop()
-        # Stop publishing before the feed that supplies it, so the last
-        # chain out is one the feed actually produced.
-        chain_publisher.stop()
-        # Close the socket before the scheduler, so the ticker is still
-        # alive to serve prices while the feed is shutting down.
-        angel_feed.stop()
-        scheduler.shutdown(wait=False)
+        # Every in-process database writer is stopped and positively
+        # confirmed drained before the lease is released (Pass 2E-A.2/3).
+        # Same order as ever: the paper trader first; the chain publisher
+        # before the feed that supplies it; the feed before the scheduler, so
+        # the ticker serves prices while the socket closes. The publisher and
+        # the feed write to Redis only, so they are Steps and never gate the
+        # lease. A writer whose stop raises, or that is still running when
+        # its stop returns, keeps the lease held and ends the process.
+        release_after_drain(lease, [
+            # Its stop is a timed join; only the thread being gone counts.
+            Writer("v2-paper", v2_paper.stop, lambda: not v2_paper.TRADER.running),
+            Step("chain-publisher", chain_publisher.stop),
+            Step("angel-feed", angel_feed.stop),
+            Writer("scheduler", lambda: scheduler.shutdown(wait=True),
+                   lambda: scheduler_drained(scheduler)),
+        ])
 
 
 app = FastAPI(

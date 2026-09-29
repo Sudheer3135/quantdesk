@@ -52,25 +52,31 @@ Open `.env`. For the first run change nothing. Two lines matter later:
 ## Step 3 — start everything
 
 ```bash
+docker compose --profile migrate run --rm migrate --apply   # build the schema, once
 docker compose up --build
 ```
 
-First build takes 3–5 minutes. The backend runs `alembic upgrade head`
-before it starts serving, so the schema is always migrated before anything
-touches it. You are looking for:
+Starting never changes the schema. The backend checks that the database is
+at exactly the revision this code expects and refuses to start otherwise,
+naming what is pending. Migrating is always the explicit command above
+(`./scripts/migrate.sh --apply` on a native install). Without `--apply`
+it is a dry run: the schema state, the pending revisions and every running
+writer. `--apply` takes the database's exclusive schema lock, which any
+running writer — the backend, a backfill, a second copy anywhere — refuses,
+so stop them and take a backup first. You are looking for:
 
 ```
-backend  | INFO  [alembic.runtime.migration] Running upgrade  -> 0001, Baseline
-backend  | INFO  [alembic.runtime.migration] Running upgrade 0001 -> 0002, Candle provenance
-backend  | INFO  [alembic.runtime.migration] Running upgrade 0002 -> 0003, Option contracts
+migrate  | INFO  [alembic.runtime.migration] Running upgrade  -> 0001, Baseline
+migrate  | ... is at revision 0010, as this code expects
+backend  | ... is at revision 0010, as this code expects
 backend  | Uvicorn running on http://0.0.0.0:8000
-backend  | Nifty agent scheduled every 5 minutes.
 frontend | Local: http://localhost:5173/
 ```
 
-**Upgrading an install that already has archived candles?** Nothing to do.
-The baseline migration skips tables that already exist and 0002 backfills
-the new provenance columns from the data already in the table. Your history
+**Upgrading an install that already has archived candles?** Stop the
+backend, back the database up, then run the migrate command. The baseline
+migration skips tables that already exist and 0002 backfills the new
+provenance columns from the data already in the table. Your history
 survives; there is no stamping step to remember.
 
 Now open:

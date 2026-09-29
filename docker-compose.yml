@@ -59,12 +59,33 @@ services:
     dns_opt:
       - timeout:2
       - attempts:2
-    # Migrations run before the app, never from inside it. A process that
-    # migrates its own schema on boot will happily run three copies of the
-    # same migration when you scale it to three replicas.
+    # Starting never migrates (Pass 2E-A.1). `alembic upgrade head` used to
+    # run here on every `up`, the Docker twin of how 0010 reached the live
+    # database unasked. The schema is checked, read-only, and a database
+    # that is not at this code's head refuses the start; the app then takes
+    # the shared schema lock (app.migration_guard) before any job writes.
+    # Migrating is the `migrate` service below, run on purpose.
     command: >
-      sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+      sh -c "python -m app.schema_check &&
+             exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # The explicit migration path. In a profile, so `docker compose up` never
+  # starts it:
+  #   docker compose --profile migrate run --rm migrate            # dry run
+  #   docker compose --profile migrate run --rm migrate --apply    # migrate
+  # --apply takes the exclusive schema lock, which every running writer
+  # (this stack's backend included) refuses — stop them first.
+  migrate:
+    build: ./backend
+    profiles: ["migrate"]
+    env_file: .env
+    depends_on:
+      postgres: {condition: service_healthy}
+    volumes:
+      - ./backend/app:/srv/app
+      - ./backend/alembic:/srv/alembic
+    entrypoint: ["python", "-m", "app.migrate"]
+    command: []
 
   frontend:
     build: ./frontend
