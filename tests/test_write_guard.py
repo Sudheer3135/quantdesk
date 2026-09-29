@@ -171,9 +171,29 @@ def test_reads_are_not_locked(sql):
     assert not is_write(sql)
 
 
-def test_the_application_engine_is_protected():
+def test_the_application_engine_is_protected(tmp_path):
+    """app.db guards its engine when the app runs on PostgreSQL. Checked in a
+    fresh interpreter with a PostgreSQL URL (create_engine never connects), so
+    it holds however this test run's own DATABASE_URL is set — CI's is SQLite,
+    where the guard is deliberately a no-op."""
+    probe = ("from sqlalchemy import event\n"
+             "from app import db, migration_guard\n"
+             "assert db.engine.dialect.name == 'postgresql'\n"
+             "assert event.contains(db.engine, 'before_cursor_execute',"
+             " migration_guard._guard_write)\n")
+    env = {**os.environ, "PYTHONPATH": str(BACKEND),
+           "DATABASE_URL": "postgresql+psycopg://quant:quant@127.0.0.1:1/unused"}
+    # Run outside the project so no .env is read.
+    run = subprocess.run([sys.executable, "-c", probe], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr[-2000:]
+
+
+def test_the_application_engine_matches_its_dialect():
+    """In this process: guarded on PostgreSQL, left alone on SQLite."""
     from app import db
-    assert event.contains(db.engine, "before_cursor_execute", migration_guard._guard_write)
+    guarded = event.contains(db.engine, "before_cursor_execute", migration_guard._guard_write)
+    assert guarded == (db.engine.dialect.name == "postgresql")
 
 
 # --- A: lost lease + migration + attempted write -------------------------------
