@@ -275,6 +275,14 @@ def _mid(c: Candidate) -> float:
     return c.ltp
 
 
+# The checks `_liquidity_problem` applies, in the order it applies them, and
+# the code each one refuses with. It stops at the first failure, so the checks
+# after a failing one were never evaluated for that contract. Kept beside the
+# function so the evidence trace cannot drift from it.
+LIQUIDITY_CHECKS = (("quote_age", STALE_QUOTE), ("two_sided_quote", NO_DEPTH),
+                    ("spread", WIDE_SPREAD), ("premium_floor", CHEAP))
+
+
 def _liquidity_problem(c: Candidate, mid: float, cfg: V2Config) -> Rejection | None:
     if c.age_seconds > cfg.max_quote_age_seconds:
         return Rejection(STALE_QUOTE, f"{c.strike:.0f}{c.option_type} last quoted "
@@ -293,16 +301,26 @@ def _liquidity_problem(c: Candidate, mid: float, cfg: V2Config) -> Rejection | N
 
 def pick_contract(candidates: Iterable[Candidate], *, option_type: str, spot: float,
                   years: float, cfg: V2Config,
-                  rate: float = option_pricing.DEFAULT_RATE
+                  rate: float = option_pricing.DEFAULT_RATE,
+                  trace: dict | None = None,
                   ) -> tuple[Pick | None, Rejection | None]:
     """The liquid strike whose delta is nearest the target, inside the band.
 
     Delta is implied from each contract's own quote rather than from one
     assumed volatility: the smile makes a single IV place the 0.50 delta a
     strike or more away from where the market actually has it.
+
+    `trace`, when given, is filled with one entry per candidate saying how
+    far the selection took it and why it stopped there (`alternatives`), and
+    what the selection concluded (`result`). It is written to and never
+    read: the pick is the same with or without it (Phase 3B evidence).
     """
+    candidates = list(candidates)
+    steps = _Trace(candidates, option_type) if trace is not None else None
     pool = [c for c in candidates if c.option_type == option_type]
     if not pool or years <= 0:
+        if steps:
+            steps.finish(trace, refused=CHAIN_NOT_READY)
         return None, Rejection(CHAIN_NOT_READY,
                                f"no {option_type} quotes for the chosen expiry")
 
@@ -311,6 +329,8 @@ def pick_contract(candidates: Iterable[Candidate], *, option_type: str, spot: fl
         mid = _mid(c)
         iv = option_pricing.implied_volatility(mid, spot, c.strike, years, rate,
                                                kind=option_type)
+        if steps:
+            steps.priced(c, mid, iv)
         if iv is None:
             continue
         delta = abs(option_pricing.greeks(spot, c.strike, years, iv, rate,
@@ -318,27 +338,106 @@ def pick_contract(candidates: Iterable[Candidate], *, option_type: str, spot: fl
         spread = ((c.ask - c.bid) / mid * 100
                   if c.bid and c.ask and c.ask >= c.bid and mid > 0 else None)
         priced.append(Pick(c, mid, iv, delta, spread))
+        if steps:
+            steps.delta(c, delta, spread, cfg.min_delta <= delta <= cfg.max_delta)
     if not priced:
+        if steps:
+            steps.finish(trace, refused=NO_IV)
         return None, Rejection(NO_IV, "no quote reproduced a volatility")
 
     band = sorted((p for p in priced if cfg.min_delta <= p.delta <= cfg.max_delta),
                   key=lambda p: (abs(p.delta - cfg.target_delta), p.mid))
     if not band:
         nearest = min(priced, key=lambda p: abs(p.delta - cfg.target_delta))
+        if steps:
+            steps.finish(trace, refused=NO_DELTA)
         return None, Rejection(
             NO_DELTA,
             f"nearest delta {nearest.delta:.2f} at {nearest.candidate.strike:.0f}, "
             f"outside {cfg.min_delta:.2f}–{cfg.max_delta:.2f}")
 
+    if steps:
+        steps.ranked(band)
     first_problem: Rejection | None = None
     for p in band:
         problem = _liquidity_problem(p.candidate, p.mid, cfg)
+        if steps:
+            steps.liquidity(p.candidate, problem)
         if problem is None:
             p.reasons.append(f"delta {p.delta:.2f} at IV {p.iv:.1%}, the nearest "
                              f"liquid strike to {cfg.target_delta:.2f}")
+            if steps:
+                steps.finish(trace, selected=p.candidate)
             return p, None
         first_problem = first_problem or problem
+    if steps:
+        steps.finish(trace, refused=first_problem.code)
     return None, first_problem
+
+
+class _Trace:
+    """What `pick_contract` did with each candidate, in the order it did it.
+
+    Every candidate starts `not_assessed` at the stage before the first one,
+    and moves forward only when the selector actually evaluated it. A stage
+    the selector never reached for a contract stays unreached — a contract
+    ranked behind the one selected was not refused, it was not looked at.
+    """
+
+    def __init__(self, candidates: list[Candidate], option_type: str) -> None:
+        self._rows: dict[int, dict] = {}
+        self._order: list[int] = []
+        for c in candidates:
+            row = {"token": c.token, "symbol": c.symbol, "strike": c.strike,
+                   "option_type": c.option_type, "stage": "option_type",
+                   "status": "not_assessed", "code": None}
+            if c.option_type != option_type:
+                row["status"] = "excluded"
+                row["code"] = "other_option_type"
+            self._rows[id(c)] = row
+            self._order.append(id(c))
+
+    def priced(self, c: Candidate, mid: float, iv: float | None) -> None:
+        row = self._rows[id(c)]
+        two_sided = bool(c.bid and c.ask and c.ask >= c.bid > 0)
+        row.update(stage="implied_volatility", mid=mid,
+                   mid_basis="bid_ask_mid" if two_sided else "ltp_fallback",
+                   iv=iv, status="excluded" if iv is None else "passed",
+                   code=NO_IV if iv is None else None)
+
+    def delta(self, c: Candidate, delta: float, spread: float | None, inside: bool) -> None:
+        self._rows[id(c)].update(stage="delta_band", delta=delta, spread_pct=spread,
+                                 status="passed" if inside else "excluded",
+                                 code=None if inside else NO_DELTA)
+
+    def ranked(self, band: list[Pick]) -> None:
+        for rank, p in enumerate(band, start=1):
+            self._rows[id(p.candidate)].update(band_rank=rank, stage="liquidity",
+                                               status="not_assessed")
+
+    def liquidity(self, c: Candidate, problem: Rejection | None) -> None:
+        failed_at = next((i for i, (_, code) in enumerate(LIQUIDITY_CHECKS)
+                          if problem is not None and code == problem.code), None)
+        checks = []
+        for i, (name, _) in enumerate(LIQUIDITY_CHECKS):
+            if failed_at is None or i < failed_at:
+                checks.append({"check": name, "status": "passed"})
+            elif i == failed_at:
+                checks.append({"check": name, "status": "failed"})
+            else:
+                checks.append({"check": name, "status": "not_assessed"})
+        self._rows[id(c)].update(
+            liquidity_checks=checks,
+            status="selected" if problem is None else "failed",
+            code=None if problem is None else problem.code,
+            reason=None if problem is None else problem.detail)
+
+    def finish(self, trace: dict, *, selected: Candidate | None = None,
+               refused: str | None = None) -> None:
+        trace["alternatives"] = [dict(self._rows[key]) for key in self._order]
+        trace["result"] = {"status": "selected" if selected is not None else "refused",
+                           "token": selected.token if selected is not None else None,
+                           "code": refused}
 
 
 # --------------------------------------------------------------------------

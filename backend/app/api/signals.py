@@ -140,6 +140,32 @@ def provenance_columns(sig: signal_engine.Signal) -> dict:
         sig, data_source=get_settings().broker, code_id=measurement.code_id())
 
 
+OBSERVATION_SCHEMA = "signal_observation/1"
+
+
+def new_observation(columns: dict) -> dict:
+    """An identity for one stored signal observation (Phase 3B).
+
+    Names this reading of the market by this engine at this moment — not an
+    opportunity and not a thesis: two readings of the same move get two ids.
+    Written into the row's provenance when the row has provenance (a legacy
+    row without it stays a legacy row), and returned for the published
+    payload, where the caller adds the row id once it exists. Whoever
+    consumes the payload can then say exactly which stored row it acted on
+    instead of matching timestamps.
+    """
+    import uuid
+    observation_id = f"obs-{uuid.uuid4().hex}"
+    if columns.get("provenance") is not None:
+        columns["provenance"] = {**columns["provenance"], "observation_id": observation_id}
+    return {"schema": OBSERVATION_SCHEMA, "observation_id": observation_id,
+            "signal_id": None,
+            "row_provenance": "persisted" if columns else "legacy",
+            "code_id": columns.get("code_id"),
+            "code_id_basis": "git state on disk when the row was written",
+            "data_source": columns.get("data_source")}
+
+
 def note_exposure(db: Session, sig, channel: str) -> None:
     """Serving or storing a live signal shows the strategy that session. If
     the session is protected prospective holdout data, it is seen from now
@@ -186,6 +212,8 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
     note_exposure(db, sig, "strategy_signal:/signals/live")
 
     if persist:
+        columns = provenance_columns(sig)
+        observation = new_observation(columns)
         record = SignalRecord(
             symbol=sig.symbol, timeframe=sig.timeframe, action=sig.action,
             confidence=sig.confidence, price=sig.price, entry=sig.entry,
@@ -196,11 +224,14 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
             # whatever was on screen at the time.
             risk=payload["risk"],
             **plan_columns(analysis.plan),
-            **provenance_columns(sig),
+            **columns,
         )
         db.add(record)
         db.commit()
         payload["id"] = record.id
+        # Not published: this route answers its caller only, so nothing
+        # downstream consumes this observation (the agent's is the one v2 reads).
+        payload["observation"] = {**observation, "signal_id": record.id}
 
     return payload
 

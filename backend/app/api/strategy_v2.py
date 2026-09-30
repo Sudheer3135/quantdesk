@@ -62,8 +62,27 @@ def decisions(day: date | None = None, limit: int = Query(default=200, ge=1, le=
     return {"decisions": [{
         "id": d.id, "decided_at": d.decided_at.isoformat() if d.decided_at else None,
         "session_date": d.session_date.isoformat(), "signal_time": d.signal_time,
-        "action": d.action, "outcome": d.outcome, "code": d.code, "detail": d.detail,
+        "action": d.action, "outcome": d.outcome, "code": d.code,
+        # The evidence envelope is served on its own below; the list keeps
+        # the shape it always had.
+        "detail": {k: v for k, v in (d.detail or {}).items() if k != "evidence"},
+        "evidence_status": ((d.detail or {}).get("evidence") or {}).get("status",
+                                                                        "not_recorded"),
     } for d in db.scalars(stmt).all()]}
+
+
+@router.get("/decisions/{decision_id}/evidence")
+def decision_evidence(decision_id: int, db: Session = Depends(get_db)):
+    """What v2 saw when it made this decision (Phase 3B). Decisions filed
+    before evidence existed say so rather than returning an empty record."""
+    d = db.get(PaperDecision, decision_id)
+    if d is None or d.strategy != NAME:
+        raise HTTPException(status_code=404, detail="no such v2 decision")
+    envelope = (d.detail or {}).get("evidence")
+    return {"id": d.id, "outcome": d.outcome, "code": d.code,
+            "evidence": envelope if envelope is not None
+            else {"status": "not_recorded",
+                  "note": "filed before decision evidence was captured"}}
 
 
 @router.get("/vix")

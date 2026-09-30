@@ -43,9 +43,9 @@ from ..models import PaperDecision, PaperPosition
 from ..optionbuy.contracts import expiry_moment
 from ..risk.manager import DayState, RiskConfig, day_state_from_trades, evaluate
 from ..workers import option_chain_live, vix_live
-from . import rules
+from . import evidence, rules
 from . import vix as vix_history
-from .config import DEFAULT, NAME, Rejection, V2Config
+from .config import DEFAULT, NAME, VERSION, Rejection, V2Config
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +136,9 @@ class PaperTrader:
         self._vix_recorded_for: date | None = None
         self.last_decision: dict | None = None
         self.errors = 0
+        # Decision evidence (Phase 3B). Recorded after each decision is
+        # fixed, from what the decision already read; it never feeds back.
+        self._evidence = evidence.Recorder(cfg, strategy=NAME, version=VERSION)
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -222,84 +225,115 @@ class PaperTrader:
         """Run one signal through every rule. Returns the filed decision."""
         cfg = self.cfg
         sig = dict(signal)
+        # What this decision reads, kept as it reads it (Phase 3B evidence).
+        cap = evidence.Capture(
+            consumed_at=now,
+            generated_at_basis=("signal payload" if sig.get("generated_at")
+                                else "stamped by v2 on receipt: the payload carried none"),
+            disabled={gate for gate, on in (("signal.entry_state", cfg.require_entry_states),
+                                            ("signal.bias", cfg.require_bias_agreement),
+                                            ("expiry_day", cfg.no_entry_on_expiry_day))
+                      if not on})
         sig.setdefault("generated_at", now.isoformat())
         ist = now.astimezone(IST)
         today = ist.date()
         action = str(sig.get("action"))
 
         with self._session() as db:
-            def refuse(rejection: Rejection, **extra) -> dict:
+            def refuse(rejection: Rejection, gate: str | None, **extra) -> dict:
+                cap.failed_gate = gate
                 return self._file(db, now, sig, "rejected", rejection.code,
-                                  {"detail": rejection.detail, **rejection.data, **extra})
+                                  {"detail": rejection.detail, **rejection.data, **extra},
+                                  cap=cap)
 
             rejected = rules.signal_rejection(sig, now=now, cfg=cfg)
             if rejected:
-                return refuse(rejected)
+                # An unrecognised code names no gate; the evidence then records the
+                # decision as unreconciled rather than inventing a gate for it.
+                return refuse(rejected, SIGNAL_GATES.get(rejected.code))
             if self._open_id is not None:
-                return refuse(Rejection(rules.POSITION_OPEN, "one paper position at a time"))
-            if self._kill():
-                return refuse(Rejection(rules.KILL_SWITCH, "kill switch is on"))
+                return refuse(Rejection(rules.POSITION_OPEN, "one paper position at a time"),
+                              "position")
+            cap.killed = self._kill()
+            if cap.killed:
+                return refuse(Rejection(rules.KILL_SWITCH, "kill switch is on"), "kill_switch")
             if not rules.in_entry_window(ist, cfg):
                 return refuse(Rejection(
                     rules.OUTSIDE_WINDOW,
-                    f"{ist:%H:%M} is outside {cfg.entry_start:%H:%M}–{cfg.entry_end:%H:%M}"))
+                    f"{ist:%H:%M} is outside {cfg.entry_start:%H:%M}–{cfg.entry_end:%H:%M}"),
+                    "entry_window")
 
             listed = self._listed()
+            cap.listed = [d.isoformat() for d in listed] if listed else []
             if not listed:
                 return refuse(Rejection(rules.CHAIN_NOT_READY,
-                                        "the instrument master has not been read yet"))
+                                        "the instrument master has not been read yet"),
+                              "instrument_master")
             if cfg.no_entry_on_expiry_day and rules.is_expiry_day(today, listed):
-                return refuse(Rejection(rules.EXPIRY_DAY, f"{today} is a NIFTY expiry day"))
-            if not self._feed_ok():
+                return refuse(Rejection(rules.EXPIRY_DAY, f"{today} is a NIFTY expiry day"),
+                              "expiry_day")
+            cap.feed_ok = self._feed_ok()
+            if not cap.feed_ok:
                 return refuse(Rejection(rules.FEED_DOWN,
-                                        "the Angel feed is not live; no quote to trust"))
+                                        "the Angel feed is not live; no quote to trust"),
+                              "feed")
             spot = self._spot()
+            cap.spot = spot
             if spot is None:
-                return refuse(Rejection(rules.NO_SPOT, "no live NIFTY price"))
+                return refuse(Rejection(rules.NO_SPOT, "no live NIFTY price"), "spot")
 
             stop, target = float(sig["stop_loss"]), float(sig["target"])
             rejected = rules.level_rejection(action, spot, stop, target)
             if rejected:
-                return refuse(rejected)
+                return refuse(rejected, "levels_vs_spot")
 
             reading = rules.vix_gate(vix_history.load_closes(db, before=today),
                                      self._vix(), cfg)
+            cap.vix = reading.to_dict()
             if not reading.ok:
-                return refuse(Rejection(reading.code, reading.detail),
+                return refuse(Rejection(reading.code, reading.detail), "vix",
                               vix=reading.to_dict())
 
             expiry = rules.choose_expiry(listed, today, cfg)
             if expiry is None:
                 return refuse(Rejection(rules.NO_EXPIRY,
                                         f"no listed expiry has {cfg.min_sessions_to_expiry} "
-                                        "sessions left"))
+                                        "sessions left"), "expiry_choice")
+            cap.expiry = expiry.isoformat()
             store = self._chain_for(expiry)
             if store is None:
                 return refuse(Rejection(rules.CHAIN_NOT_READY,
-                                        f"{expiry} is not being streamed yet"))
+                                        f"{expiry} is not being streamed yet"), "chain")
 
             option_type = rules.option_type_for(action)
-            candidates = [self._candidate(q, now) for q in store.quotes(now=now)]
+            quotes = store.quotes(now=now)
+            candidates = [self._candidate(q, now) for q in quotes]
             years = option_pricing.years_to_expiry(ist, expiry_moment(expiry))
             pick, rejected = rules.pick_contract(candidates, option_type=option_type,
                                                  spot=spot, years=years, cfg=cfg)
+            self._capture_selection(cap, store, quotes, candidates, now,
+                                    option_type=option_type, spot=spot, years=years,
+                                    decided=(pick, rejected))
             if rejected:
-                return refuse(rejected, expiry=expiry.isoformat())
+                return refuse(rejected, "contract_selection", expiry=expiry.isoformat())
 
             chosen = pick.candidate
+            cap.pick = pick.to_dict()
             if not chosen.lot_size:
                 return refuse(Rejection(rules.CHAIN_NOT_READY,
                                         f"no lot size listed for {chosen.symbol}; "
-                                        "a size is never assumed"))
+                                        "a size is never assumed"), "lot_size")
 
             entry = float(chosen.ask)
             levels = rules.premium_levels(entry=entry, strike=chosen.strike,
                                           option_type=option_type, years=years, iv=pick.iv,
                                           index_stop=stop, index_target=target, cfg=cfg)
+            cap.levels = levels.to_dict()
             if not (levels.stop < entry < levels.target):
                 return refuse(Rejection(rules.NO_DEFINED_RISK,
                                         f"stop {levels.stop:.2f} / target {levels.target:.2f} "
-                                        f"do not straddle the {entry:.2f} entry"))
+                                        f"do not straddle the {entry:.2f} entry"),
+                              "premium_risk")
 
             equity = self._equity(db)
             state = self._day_state(db, today)
@@ -318,9 +352,10 @@ class PaperTrader:
             context = {"expiry": expiry.isoformat(), "spot": spot, "vix": reading.to_dict(),
                        "pick": pick.to_dict(), "levels": levels.to_dict(),
                        "risk": decision.to_dict(), "equity": round(equity, 2)}
+            cap.risk, cap.equity = decision.to_dict(), round(equity, 2)
             if not decision.approved:
                 return refuse(Rejection(rules.RISK_VETO, "; ".join(decision.reasons)),
-                              **context)
+                              "risk_manager", **context)
 
             row = PaperPosition(
                 strategy=NAME, status="open", session_date=today, opened_at=now,
@@ -340,13 +375,53 @@ class PaperTrader:
             db.flush()
             self._open_id = row.id
             self._persisted_at = now
+            cap.position_id = row.id
             filed = self._file(db, now, sig, "entered", rules.ENTERED,
                                {"position_id": row.id, "contract": row.contract,
-                                "lots": row.lots, "entry": entry, **context})
+                                "lots": row.lots, "entry": entry, **context}, cap=cap)
             log.info("v2 paper entry: %s x%s at %.2f (stop %.2f, target %.2f)",
                      row.contract, row.quantity, entry, levels.stop, levels.target)
             self._published_at = None
             return filed
+
+    def _capture_selection(self, cap, store, quotes, candidates, now, *, option_type,
+                           spot, years, decided) -> None:
+        """Keep the selector's inputs and trace, without touching its decision.
+
+        The quotes are copied from the list the selector was given. The trace
+        comes from a second run of the same pure selector on the same
+        candidates, so tracing code is never on the path that decided; the
+        two runs are compared and a disagreement is recorded, not hidden.
+        """
+        cap.selection_reached = True
+        cap.chain_max_age_seconds = getattr(store, "max_age_seconds", None)
+        # Two stages, each allowed to fail on its own: a failed snapshot does
+        # not cost the trace, and neither is replaced by an invented stand-in.
+        # A failure is filed as a capture error — counted and logged by the
+        # recorder — and is a different thing from a trace that disagrees.
+        try:
+            cap.quotes = evidence.quote_snapshot(
+                quotes, now, max_quote_age_seconds=self.cfg.max_quote_age_seconds)
+        except Exception as exc:                                  # noqa: BLE001
+            cap.capture_errors.append({"kind": evidence.CAPTURE_ERROR,
+                                       "stage": "quote_snapshot",
+                                       "detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
+        try:
+            trace: dict = {}
+            pick, rejected = rules.pick_contract(candidates, option_type=option_type,
+                                                 spot=spot, years=years, cfg=self.cfg,
+                                                 trace=trace)
+            want_pick, want_rejected = decided
+            trace["consistent_with_decision"] = (
+                (pick.candidate.token if pick else None)
+                == (want_pick.candidate.token if want_pick else None)
+                and (rejected.code if rejected else None)
+                == (want_rejected.code if want_rejected else None))
+            cap.selection = trace
+        except Exception as exc:                                  # noqa: BLE001
+            cap.capture_errors.append({"kind": evidence.CAPTURE_ERROR,
+                                       "stage": "selector_trace",
+                                       "detail": f"{type(exc).__name__}: {str(exc)[:200]}"})
 
     @staticmethod
     def _candidate(quote, now: datetime) -> rules.Candidate:
@@ -478,16 +553,25 @@ class PaperTrader:
     # ---- records and publishing ---------------------------------------------------
 
     def _file(self, db, now: datetime, sig: dict, outcome: str, code: str,
-              detail: dict) -> dict:
+              detail: dict, *, cap: evidence.Capture | None = None) -> dict:
         ist = now.astimezone(IST)
+        filed = json.loads(json.dumps(detail, default=str))
+        stored = filed
+        if cap is not None:
+            # Assembled after the decision; a failure here is recorded as a
+            # failed capture on the same row and changes nothing decided.
+            stored = {**filed, "evidence": self._evidence.record(
+                sig, cap, outcome=outcome, code=code)}
         record = PaperDecision(strategy=NAME, decided_at=now, session_date=ist.date(),
                                signal_time=str(sig.get("timestamp") or "")[:40] or None,
                                action=str(sig.get("action") or "")[:8], outcome=outcome,
-                               code=code, detail=json.loads(json.dumps(detail, default=str)))
+                               code=code, detail=stored)
         db.add(record)
         db.commit()
+        # The published last decision stays what it was: the evidence lives
+        # on the row, not on the dashboard's once-a-second state.
         self.last_decision = {"at": now.isoformat(), "action": record.action,
-                              "outcome": outcome, "code": code, **record.detail}
+                              "outcome": outcome, "code": code, **filed}
         self._published_at = None
         return self.last_decision
 
@@ -575,8 +659,17 @@ class PaperTrader:
             },
             "last_decision": self.last_decision,
             "decisions_today": counts,
+            "evidence_capture_failures": self._evidence.failures,
+            "evidence_trace_disagreements": self._evidence.trace_disagreements,
             "config": cfg.to_dict(),
         }
+
+
+# Which gate a `rules.signal_rejection` code belongs to, in the order that
+# function checks them.
+SIGNAL_GATES = {rules.HOLD: "signal.direction", rules.NO_LEVELS: "signal.levels",
+                rules.STALE_SIGNAL: "signal.age", rules.ENTRY_STATE: "signal.entry_state",
+                rules.BIAS: "signal.bias"}
 
 
 class _Journal:
