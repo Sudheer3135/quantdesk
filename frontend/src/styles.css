@@ -270,8 +270,9 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
   width: 6px; height: 6px; border-radius: 50%;
   background: currentColor; flex: none;
 }
-.pill.link-live { color: var(--bull); border-color: currentColor; }
-.pill.link-live .dot { animation: pulse 2s ease-in-out infinite; }
+.pill.link-connected { color: var(--bull); border-color: currentColor; }
+.pill.link-connected .dot { animation: pulse 2s ease-in-out infinite; }
+.pill.link-reconnecting { color: var(--amber); border-color: currentColor; }
 .pill.link-polling { color: var(--amber); border-color: currentColor; }
 .pill.link-connecting { color: var(--muted); }
 
@@ -290,7 +291,7 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pill.link-live .dot { animation: none; }
+  .pill.link-connected .dot { animation: none; }
 }
 
 /* ---- live price ticker ---- */

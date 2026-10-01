@@ -47,6 +47,15 @@ const AGE_LABEL = {
   closed: "CLOSED", unknown: "AGE UNKNOWN",
 };
 
+/* The browser's link to the desk. Deliberately never the word "live": that
+   word belongs to the freshness pill beside it, and two pills both reading
+   LIVE — one about a socket, one about a price — let a connected socket pass
+   for fresh data. */
+const LINK_LABEL = {
+  connecting: "connecting", connected: "connected",
+  reconnecting: "reconnecting", polling: "polling",
+};
+
 const AGE_TONE = {
   live: "go", delayed: "wait", stale: "stop", closed: "flat", unknown: "wait",
 };
@@ -89,13 +98,13 @@ export default function TopBar({
           <i className="dot" />
           {session ? (SESSION_LABEL[session] ?? session) : "…"}
         </span>
-        <span className={`pill tone-${AGE_TONE[ageState] ?? "wait"}`} title="Feed freshness">
+        <span className={`pill tone-${AGE_TONE[ageState] ?? "wait"}`} title="Age of the latest NIFTY tick (feed freshness)">
           <i className="dot" />
           {AGE_LABEL[ageState] ?? ageState}
           {ageText ? ` ${ageText}` : ""}
         </span>
-        <span className={`pill link-${link}`} title="Transport to the backend">
-          <i className="dot" />{link}
+        <span className={`pill link-${link}`} title="Connection to the QuantDesk backend — not the age of the data">
+          <i className="dot" />{LINK_LABEL[link] ?? link}
         </span>
         <span className="clock mono">{istTime(clock, true)} IST</span>
         <button className="ghost-btn" onClick={onRefresh}><svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M20 7v5h-5M19 12a7 7 0 1 0-2 5M20 12l-3-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /></svg>refresh</button>

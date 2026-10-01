@@ -72,9 +72,10 @@ const MAX_RECONNECT_MS = 30_000;
 // A connected browser socket does not prove option ticks are still arriving.
 const CHAIN_PUSH_TIMEOUT_MS = 15_000;
 
-/* Mirrors LIVE_SECONDS / DELAYED_SECONDS in backend/app/workers/ticker.py.
-   Both ends classify the same way so the dashboard and the API never
-   disagree about what "stale" means. */
+/* Mirrors LIVE_SECONDS / DELAYED_SECONDS in backend/app/workers/prices.py
+   (re-exported by ticker.py). Both ends classify the same way so the
+   dashboard and the API never disagree about what "stale" means;
+   tests/test_freshness_contract.py fails if the two ever drift. */
 const LIVE_SECONDS = 15;
 const DELAYED_SECONDS = 60;
 
@@ -96,6 +97,41 @@ export function classifyAge(seconds, sessionLive = true) {
   if (seconds <= LIVE_SECONDS) return "live";
   if (seconds <= DELAYED_SECONDS) return "delayed";
   return "stale";
+}
+
+/* One reading of freshness: the state, and the age that explains it.
+
+   The state is classified on the worse of two ages — since the desk last
+   received a tick (`streamAge`), and since the exchange printed it
+   (`exchangeLag`) — so neither a quiet feed nor a feed pushing old prints
+   passes as live. The age shown is the smooth received age, *unless* it is
+   the print's age that made the state worse: then the print's age is shown,
+   marked as such. Showing "STALE just now" — a state from one clock beside a
+   number from the other — explained nothing. */
+export function freshnessReading(streamAge, exchangeLag, sessionLive = true) {
+  const worst = streamAge === null || streamAge === undefined ? exchangeLag
+    : exchangeLag === null || exchangeLag === undefined ? streamAge
+    : Math.max(streamAge, exchangeLag);
+  const state = classifyAge(worst, sessionLive);
+  const receivedOnly = streamAge === null || streamAge === undefined
+    ? null : classifyAge(streamAge, sessionLive);
+  const printDrives = exchangeLag !== null && exchangeLag !== undefined
+    && (receivedOnly === null || receivedOnly !== state);
+  return {
+    state,
+    alarmSeconds: worst,
+    seconds: printDrives ? exchangeLag : streamAge,
+    basis: printDrives ? "print" : "received",
+  };
+}
+
+/* The text after the state: an elapsed age, "print …" when it is the
+   exchange's stamp, or the fixed instant of the last print out of session. */
+export function freshnessText(reading, price) {
+  if (!price) return "";
+  if (reading.state === "closed") return formatClock(price.source_time);
+  const age = formatAge(reading.seconds);
+  return reading.basis === "print" ? `print ${age}` : age;
 }
 
 export function formatAge(seconds) {
@@ -203,7 +239,9 @@ function useLiveSignal() {
      market rather than of the signal, so it arrives on the heartbeat and
      keeps updating between agent ticks. */
   const [regime, setRegime] = useState(null);
-  const [link, setLink] = useState("connecting");   // connecting | live | polling
+  /* The browser's connection to the desk — never a claim about the data.
+     connecting | connected | reconnecting | polling */
+  const [link, setLink] = useState("connecting");
   const [skewMs, setSkewMs] = useState(0);
 
   const socket = useRef(null);
@@ -229,14 +267,27 @@ function useLiveSignal() {
      open, so its P&L moves with the premium rather than on a poll. */
   const [v2, setV2] = useState(null);
 
+  /* Each sample is (browser now − server stamp) = true skew + delivery
+     delay. Delay is never negative, so a late frame can only overstate the
+     skew — and an overstated skew makes every age read younger. A heartbeat
+     stalled 70s would turn an 80s-old price into "live 10s ago". So the
+     first sample sets the estimate and later ones may only lower it: the
+     smallest sample seen is the closest to the true skew, so a late frame
+     after the first can never make data read younger. The first sample is
+     the exception — if it arrived late, ages read younger by that delay
+     until a quicker sample lowers the estimate. Sub-second wobble is still
+     ignored; it is network jitter, not clock drift. */
+  const clockSampled = useRef(false);
   const noteServerClock = useCallback((serverIso) => {
     if (!serverIso) return;
     const server = new Date(serverIso).getTime();
     if (Number.isNaN(server)) return;
+    const observed = Date.now() - server;
+    const first = !clockSampled.current;
+    clockSampled.current = true;
     setSkewMs((previous) => {
-      const observed = Date.now() - server;
-      /* Ignore sub-second wobble; it is network jitter, not clock drift. */
-      return Math.abs(observed - previous) > 1000 ? observed : previous;
+      if (first) return Math.abs(observed) > 1000 ? observed : previous;
+      return previous - observed > 1000 ? observed : previous;
     });
   }, []);
 
@@ -308,7 +359,7 @@ function useLiveSignal() {
     ws.onopen = () => {
       attempts.current = 0;
       stopPolling();
-      setLink("live");
+      setLink("connected");
     };
 
     ws.onmessage = (event) => {
@@ -330,9 +381,15 @@ function useLiveSignal() {
       // ticker still read as "3s ago" — the socket was alive, so the screen
       // claimed the data was too. Age now comes from the price's own
       // source timestamp, and nothing but a new price can make it younger.
+      //
+      // The price's `at` is not a clock sample. It is when that price was
+      // published, and the connect snapshot replays the cached price with
+      // its original `at` — syncing to it would shift the clock by the
+      // price's own age and render a stale cache as "live just now". The
+      // clock comes only from `market.server_time`, which is stamped as
+      // the frame is sent (snapshot, heartbeat, signal, poll).
       if (msg.price && msg.price.price !== null && msg.price.price !== undefined) {
         setPrice(msg.price);
-        noteServerClock(msg.price.at);
       }
       /* Arrives on both the connect snapshot and every chain publish. A
          frame carrying no chain leaves the last one alone: the publisher
@@ -368,7 +425,12 @@ function useLiveSignal() {
       // so the dashboard degrades instead of silently freezing.
       const wait = Math.min(1000 * 2 ** attempts.current, MAX_RECONNECT_MS);
       attempts.current += 1;
+      /* Said at once: the socket is down from this instant, and a pill still
+         reading "connected" until the second failure was claiming a link
+         that no longer existed. Polling takes over from the second failure,
+         as before; `startPolling` keeps the label once it is polling. */
       if (attempts.current >= 2) startPolling();
+      else setLink("reconnecting");
       setTimeout(connect, wait);
     };
 
@@ -640,8 +702,8 @@ function SessionClock({ market, secondsToBoundary }) {
    exchange stamp so a feed pushing stale prints cannot read as live. One
    prop for both is how a fresh-looking arrival time used to be able to
    paint a ninety-second-old print green. */
-function DataAge({ seconds, price, sessionLive, alarmSeconds }) {
-  const state = classifyAge(alarmSeconds ?? seconds, sessionLive);
+function DataAge({ reading, price }) {
+  const { state } = reading;
   if (!price) {
     return (
       <p className="data-age age-unknown">
@@ -656,7 +718,8 @@ function DataAge({ seconds, price, sessionLive, alarmSeconds }) {
       <span className="data-age-value">
         {/* A fixed instant once the session is over. The number stops
             moving because the thing it describes stopped moving. */}
-        {state === "closed" ? `${formatClock(price.source_time)} IST` : formatAge(seconds)}
+        {state === "closed" ? `${formatClock(price.source_time)} IST`
+          : freshnessText(reading, price)}
       </span>
       {state === "unknown" && (
         <span className="data-age-note">source gave no timestamp</span>
@@ -1175,21 +1238,6 @@ export default function App() {
     ? (clock - skewMs - new Date(price.source_time).getTime()) / 1000
     : null;
 
-  /* What gets *shown*: the smooth reading. Never the quantised one — that
-     is the whole point of the split above. */
-  const priceAge = streamAge ?? exchangeLag;
-
-  /* What gets *alarmed on*: the worse of the two, so neither a feed that
-     has gone quiet nor a feed that is still pushing yesterday's print can
-     pass as live. Safe to build from the quantised stamp because the only
-     thresholds it ever meets are 15s and 60s, where a second of rounding
-     changes nothing. It must not reach `formatAge` — at the one-second
-     resolution the pill renders, that same rounding is the entire
-     signal. */
-  const worstAge = streamAge === null ? exchangeLag
-    : exchangeLag === null ? streamAge
-    : Math.max(streamAge, exchangeLag);
-
   /* Is the feed supposed to be producing right now? Only the backend's
      session decides — never `Date.now()` here, which would put the desk back
      in the business of guessing the market clock for itself.
@@ -1200,7 +1248,16 @@ export default function App() {
      a bodyless payload, and treating that as "not open" would suppress the
      alarm exactly when the backend is in trouble. */
   const sessionLive = market?.session ? market.session === "open" : true;
-  const ageState = classifyAge(worstAge, sessionLive);
+
+  /* What gets *alarmed on* is the worse of the two ages, so neither a feed
+     that has gone quiet nor a feed still pushing yesterday's print can pass
+     as live; safe to build from the quantised stamp because the only lines it
+     meets are 15s and 60s. What gets *shown* is the smooth received age,
+     except when the print's age is what made the state worse — then that age
+     is shown, labelled "print" (see `freshnessReading`). */
+  const reading = freshnessReading(streamAge, exchangeLag, sessionLive);
+  const worstAge = reading.alarmSeconds;
+  const ageState = reading.state;
 
   /* Seconds to the next session boundary, recomputed on every tick against
      the absolute instant the backend supplied. Falls as time passes; it
@@ -1222,9 +1279,7 @@ export default function App() {
   /* What the freshness pill says after the label. A fixed instant once the
      session is over, because the number stops moving when the thing it
      describes stops moving. */
-  const ageText = !price ? ""
-    : ageState === "closed" ? formatClock(price.source_time)
-    : formatAge(priceAge);
+  const ageText = freshnessText(reading, price);
 
   return (
     <div className="shell">
@@ -1323,8 +1378,7 @@ export default function App() {
                   {price?.source ? `via ${price.source}` : "no feed"}
                 </span>
               </div>
-              <DataAge seconds={priceAge} alarmSeconds={worstAge}
-                       price={price} sessionLive={sessionLive} />
+              <DataAge reading={reading} price={price} />
             </div>
             <div className="pane">
               <div className="panel-head"><h2>Session</h2></div>
