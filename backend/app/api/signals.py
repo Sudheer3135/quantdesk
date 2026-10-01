@@ -140,7 +140,8 @@ def provenance_columns(sig: signal_engine.Signal) -> dict:
         sig, data_source=get_settings().broker, code_id=measurement.code_id())
 
 
-OBSERVATION_SCHEMA = "signal_observation/1"
+# /2 adds `api_init_provenance`. /1 observations stay as they were written.
+OBSERVATION_SCHEMA = "signal_observation/2"
 
 
 def new_observation(columns: dict) -> dict:
@@ -153,17 +154,29 @@ def new_observation(columns: dict) -> dict:
     payload, where the caller adds the row id once it exists. Whoever
     consumes the payload can then say exactly which stored row it acted on
     instead of matching timestamps.
+
+    Also stamped with the producer's API-initialization provenance — the
+    repository state this application started on, held for the run. It is
+    the producing process's, attached here and nowhere later, so an
+    observation read back after a restart keeps its own producer's record.
     """
+    import copy
     import uuid
+
+    from .. import runtime_provenance
     observation_id = f"obs-{uuid.uuid4().hex}"
+    producer = runtime_provenance.current()
     if columns.get("provenance") is not None:
-        columns["provenance"] = {**columns["provenance"], "observation_id": observation_id}
+        columns["provenance"] = {**columns["provenance"], "observation_id": observation_id,
+                                 "api_init_provenance": producer}
     return {"schema": OBSERVATION_SCHEMA, "observation_id": observation_id,
             "signal_id": None,
             "row_provenance": "persisted" if columns else "legacy",
             "code_id": columns.get("code_id"),
             "code_id_basis": "git state on disk when the row was written",
-            "data_source": columns.get("data_source")}
+            "data_source": columns.get("data_source"),
+            # The same snapshot as the row's, as its own copy.
+            "api_init_provenance": copy.deepcopy(producer)}
 
 
 def note_exposure(db: Session, sig, channel: str) -> None:

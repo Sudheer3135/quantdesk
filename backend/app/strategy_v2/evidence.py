@@ -41,6 +41,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,7 +50,8 @@ from . import rules
 
 log = logging.getLogger(__name__)
 
-EVIDENCE_SCHEMA = "v2_decision_evidence/1"
+# /2 adds `vector.versions.api_init_provenance`. /1 envelopes stay as written.
+EVIDENCE_SCHEMA = "v2_decision_evidence/2"
 
 COMPLETE = "complete"
 PARTIAL = "partial"
@@ -214,6 +216,147 @@ def _declared(src, keys, path: str, rejected: list[dict]) -> dict | None:
         rejected.append({"path": path, "undeclared_fields": extra,
                          "reason": "undeclared fields are not copied"})
     return {k: _scalar(src.get(k), f"{path}.{k}", rejected) for k in keys}
+
+
+_GIT_HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _aware_stamp(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return moment.tzinfo is not None and moment.utcoffset() is not None
+
+
+def _provenance_problems(p: dict) -> list[str]:
+    """Why a copied snapshot is not one `runtime_provenance` could have made.
+
+    The contract is exactly what `initialize()` and `current()` emit: every
+    declared field present, typed by status, and `code_id_at_init` equal to
+    `code_id()` of the repository state beside it. Nothing beyond that.
+    """
+    from .. import runtime_provenance as rp
+    from ..backtest import measurement
+
+    problems: list[str] = []
+    if p["schema"] != rp.SCHEMA:
+        problems.append(f"schema {p['schema']!r} is not {rp.SCHEMA!r}")
+    if not isinstance(p["basis"], str) or not p["basis"]:
+        problems.append("basis is missing")
+    if p["reason"] is not None and not isinstance(p["reason"], str):
+        problems.append("reason is not text")
+
+    status, repo = p["status"], p["repo_state"]
+    if status == rp.NOT_CAPTURED:
+        for key in ("repo_state", "code_id_at_init", "pid", "initialized_at"):
+            if p[key] is not None:
+                problems.append(f"{key} is set on a snapshot that was never taken")
+        if not isinstance(p["reason"], str):
+            problems.append("not_captured carries no reason")
+        return problems
+
+    # captured and git_unavailable were both taken at initialization.
+    if type(p["pid"]) is not int or p["pid"] <= 0:
+        problems.append("pid is not a positive integer")
+    if not _aware_stamp(p["initialized_at"]):
+        problems.append("initialized_at is not a timezone-aware ISO timestamp")
+    if not isinstance(repo, dict):
+        problems.append("repo_state is missing")
+        return problems
+    # `type(...) is bool`, not membership: 1 == True and 0.0 == False.
+    if repo["dirty_worktree"] is not None and type(repo["dirty_worktree"]) is not bool:
+        problems.append("repo_state.dirty_worktree is not a boolean")
+    if repo["dirty_diff_sha256"] is not None and not (
+            isinstance(repo["dirty_diff_sha256"], str)
+            and _SHA256.fullmatch(repo["dirty_diff_sha256"])):
+        problems.append("repo_state.dirty_diff_sha256 is not a sha256")
+    if repo["note"] is not None and not isinstance(repo["note"], str):
+        problems.append("repo_state.note is not text")
+
+    if status == rp.GIT_UNAVAILABLE:
+        if repo["git_commit"] not in (None, "", measurement.GIT_UNAVAILABLE):
+            problems.append("git_unavailable names a commit")
+        if p["code_id_at_init"] is not None:
+            problems.append("git_unavailable carries a code_id_at_init")
+        if not isinstance(p["reason"], str):
+            problems.append("git_unavailable carries no reason")
+        return problems
+
+    # captured
+    commit = repo["git_commit"]
+    if not (isinstance(commit, str) and _GIT_HASH.fullmatch(commit)):
+        problems.append("repo_state.git_commit is not a git commit hash")
+    if type(repo["dirty_worktree"]) is not bool:
+        problems.append("repo_state.dirty_worktree is required when captured")
+    elif repo["dirty_worktree"] and repo["dirty_diff_sha256"] is None:
+        problems.append("a dirty tree carries no fingerprint")
+    elif not repo["dirty_worktree"] and repo["dirty_diff_sha256"] is not None:
+        problems.append("a clean tree carries a fingerprint")
+    if not isinstance(p["code_id_at_init"], str):
+        problems.append("code_id_at_init is missing")
+    elif not problems and p["code_id_at_init"] != measurement.code_id(repo):
+        problems.append("code_id_at_init does not match repo_state")
+    return problems
+
+
+def producer_provenance(obs: dict, rejected: list[dict]) -> dict:
+    """The producing API's initialization snapshot, as the observation carried it.
+
+    Declared fields only, each a scalar except `repo_state`, itself declared
+    scalars; built afresh, so nothing that later touches the observation can
+    change evidence already made. An observation without one (schema /1, or
+    none at all) says so — it is never filled in from this process.
+
+    A block that is not exactly what `runtime_provenance` emits — a field
+    missing, undeclared or mistyped, or values that contradict each other —
+    is `invalid`, each problem listed in the diagnostics. Never `captured`.
+    Observation only: it changes no decision.
+    """
+    from .. import runtime_provenance as rp
+
+    path = "versions.api_init_provenance"
+    if "api_init_provenance" not in obs:
+        return {"status": "absent",
+                "reason": "the observation carried no API-initialization provenance "
+                          f"(schema {obs.get('schema')!r})"}
+    src = obs.get("api_init_provenance")
+    if not isinstance(src, dict):
+        rejected.append({"path": path, "type": type(src).__name__,
+                         "reason": "expected an object"})
+        return {"status": "invalid", "reason": "not an object"}
+
+    problems: list[str] = []
+    before = len(rejected)
+    extra = sorted(set(src) - set(rp.FIELDS))
+    if extra:
+        rejected.append({"path": path, "undeclared_fields": extra,
+                         "reason": "undeclared fields are not copied"})
+    problems += [f"{k} is missing" for k in rp.FIELDS if k not in src]
+    copied = {k: _scalar(src.get(k), f"{path}.{k}", rejected)
+              for k in rp.FIELDS if k != "repo_state"}
+    repo_src = src.get("repo_state")
+    if isinstance(repo_src, dict):
+        problems += [f"repo_state.{k} is missing"
+                     for k in rp.REPO_STATE_FIELDS if k not in repo_src]
+    copied["repo_state"] = _declared(repo_src, rp.REPO_STATE_FIELDS,
+                                     f"{path}.repo_state", rejected)
+    if len(rejected) > before:
+        problems.append("undeclared or non-scalar values were set aside")
+
+    if copied["status"] not in rp.STATUSES:
+        problems.append(f"status {copied['status']!r} is not a provenance status")
+    elif not problems:
+        problems = _provenance_problems(copied)
+
+    if problems:
+        rejected.extend({"path": path, "reason": f"invalid provenance: {problem}"}
+                        for problem in problems)
+        return {"status": "invalid", "reason": "; ".join(problems)}
+    return {k: copied[k] for k in rp.FIELDS}
 
 
 def _checks(checks, rejected: list[dict]) -> list | None:
@@ -567,6 +710,9 @@ class Recorder:
                     "v2_config_hash": self.config_hash,
                 }.items()},
         }
+        # Structured, so not through `_scalar`. Copied from the observation —
+        # the producer's — never from this consuming process.
+        vector["versions"]["api_init_provenance"] = producer_provenance(obs, rejected)
         trace, gate_problem = gate_trace(cap, code=code, outcome=outcome)
         if gate_problem:
             issues.append({"kind": GATE_UNRECONCILED, "detail": gate_problem})

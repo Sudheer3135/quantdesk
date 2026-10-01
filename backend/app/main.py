@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from . import runtime_provenance
 from .api import backtest, data, health, journal, market, news, signals, stream
 from .api import strategy_v2 as strategy_v2_api
 from .brokers.base import UnknownSymbol
@@ -36,6 +37,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Starlette security fixes. The scheduler is a local rather than a module
     global now, so its lifetime is visibly tied to the application's.
     """
+    # What the repository looked like as this application initialized, held
+    # unchanged for the run and stamped on every observation it produces.
+    # First, so it predates every scheduled writer (runtime_provenance).
+    runtime_provenance.initialize()
+
     # Before anything else. A production deployment with no key is a
     # misconfiguration, and one that fails loudly here gets fixed rather
     # than shipped.

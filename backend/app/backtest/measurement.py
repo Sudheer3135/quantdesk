@@ -77,14 +77,21 @@ def _git(root, *args):
 
 
 def git_state(root=None):
-    """Which code this is, including code that has not been committed (RP-4).
+    """The repository's git state on disk at the moment of the call (RP-4).
 
-    A HEAD commit alone describes a clean tree. On a dirty one it names code
-    that is not the code that ran, and a result labelled with it would be
-    reproducible only by luck. So a dirty tree is reported as dirty, with a
-    fingerprint of exactly what differs from HEAD: the tracked diff and the
-    contents of every untracked, non-ignored file. Two runs on the same
-    uncommitted edit share a fingerprint; any further edit changes it.
+    The whole repository, read now: HEAD, and whether the working tree
+    differs from it. A HEAD commit alone describes a clean tree; on a dirty
+    one it would name files that are not the files on disk, and a result
+    labelled with it would be reproducible only by luck. So a dirty tree is
+    reported as dirty, with a fingerprint of exactly what differs from HEAD:
+    the tracked diff and the contents of every untracked, non-ignored file.
+    Two calls on the same uncommitted edit share a fingerprint; any further
+    edit — in any directory, frontend included — changes it.
+
+    It describes the disk, not the code a running process loaded: a
+    long-running process calling this later sees later edits and commits.
+    `runtime_provenance` keeps the separate sample taken when the API
+    initialized.
 
     Research on a dirty tree is not forbidden — it is labelled.
     """
@@ -115,7 +122,7 @@ def git_state(root=None):
 
 
 def code_id(state=None):
-    """One short string naming the code: the commit, and the diff if dirty."""
+    """One short string naming that repository state: the commit, and the diff if dirty."""
     state = state or git_state()
     commit = state.get("git_commit")
     if not commit or commit == GIT_UNAVAILABLE:
