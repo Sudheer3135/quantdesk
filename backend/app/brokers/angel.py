@@ -503,20 +503,38 @@ class OptionTick:
         return round(self.ask - self.bid, 2)
 
 
-def _best_price(levels, want_buy: bool) -> float | None:
-    """Top of book from the SDK's best-5 block.
+def _is_bid_level(level) -> bool | None:
+    """Which side a depth level is on: True bid, False ask, None unknown.
 
-    The block carries both sides in one list, flagged by `buy_sell_flag`,
-    and pads unused levels with zeros. A zero is an absent level, not a
-    price of nothing, so it is dropped rather than returned as 0.0.
+    SmartAPI 1.5.5 parses each best-5 level as {"flag", "quantity", "price",
+    "no of orders"}, `flag` an unsigned short. Its outer parser then hands
+    back `best_5_buy_data` holding the nonzero-flag levels and
+    `best_5_sell_data` the zero-flag ones. A level with no `flag`, or one
+    that is not a non-negative integer, is on no side we can name: it is
+    not guessed into either, and above all never counted as an ask.
+    """
+    if not isinstance(level, dict):
+        return None
+    flag = level.get("flag")
+    if type(flag) is not int or flag < 0:
+        return None
+    return flag != 0
+
+
+def _best_price(levels, want_buy: bool) -> float | None:
+    """Top of book from one of the SDK's best-5 lists.
+
+    Each level's own `flag` must agree with the list it arrived in, so a
+    level on the wrong side cannot leak across. Unused levels are padded
+    with zeros; a zero is an absent level, not a price of nothing, so it is
+    dropped rather than returned as 0.0.
     """
     if not isinstance(levels, list):
         return None
     prices = [
         float(level.get("price", 0)) / PAISE
         for level in levels
-        if isinstance(level, dict)
-        and bool(level.get("buy_sell_flag")) == want_buy
+        if _is_bid_level(level) is want_buy
         and float(level.get("price", 0) or 0) > 0
     ]
     if not prices:

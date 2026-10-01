@@ -54,6 +54,17 @@ def master(strikes=range(23500, 24600, 50), expiry="01SEP2026"):
     return rows
 
 
+def depth_level(price, *, bid, quantity=50, orders=1):
+    """One best-5 level as SmartAPI 1.5.5 parses it.
+
+    `flag` is nonzero on the buy side and zero on the sell side — the SDK's
+    outer parser puts the nonzero ones in `best_5_buy_data`.
+    `tests/test_angel_depth.py` checks this shape against the SDK itself.
+    """
+    return {"flag": 1 if bid else 0, "quantity": quantity,
+            "price": int(round(price * 100)), "no of orders": orders}
+
+
 def option_frame(token, *, ltp=100.0, oi=1000, volume=500,
                  bid=99.0, ask=101.0, stamp=STAMP):
     """A SNAP_QUOTE frame in the SDK's parsed shape."""
@@ -66,11 +77,9 @@ def option_frame(token, *, ltp=100.0, oi=1000, volume=500,
         "best_5_buy_data": [], "best_5_sell_data": [],
     }
     if bid is not None:
-        frame["best_5_buy_data"] = [{"buy_sell_flag": 1, "price": int(bid * 100),
-                                     "quantity": 50}]
+        frame["best_5_buy_data"] = [depth_level(bid, bid=True)]
     if ask is not None:
-        frame["best_5_sell_data"] = [{"buy_sell_flag": 0, "price": int(ask * 100),
-                                      "quantity": 50}]
+        frame["best_5_sell_data"] = [depth_level(ask, bid=False)]
     return frame
 
 
@@ -205,11 +214,11 @@ def test_a_contract_with_neither_trade_nor_quote_is_refused():
 def test_the_best_bid_is_the_highest_and_the_best_ask_the_lowest():
     frame = option_frame("40001", ltp=100.0)
     frame["best_5_buy_data"] = [
-        {"buy_sell_flag": 1, "price": 9800}, {"buy_sell_flag": 1, "price": 9900},
-        {"buy_sell_flag": 1, "price": 0}]
+        depth_level(98.0, bid=True), depth_level(99.0, bid=True),
+        depth_level(0.0, bid=True)]
     frame["best_5_sell_data"] = [
-        {"buy_sell_flag": 0, "price": 10200}, {"buy_sell_flag": 0, "price": 10100},
-        {"buy_sell_flag": 0, "price": 0}]
+        depth_level(102.0, bid=False), depth_level(101.0, bid=False),
+        depth_level(0.0, bid=False)]
 
     tick = angel_api.decode_option_tick(frame, now=NOW)
 
