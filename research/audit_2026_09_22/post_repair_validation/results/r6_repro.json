@@ -1,0 +1,27 @@
+{
+ "run1_sha": "adffd6564e4f15dd2b4e3f56b1b8fcc8d526a200c68ba219d9f1d1f11154f19e",
+ "run2_sha": "adffd6564e4f15dd2b4e3f56b1b8fcc8d526a200c68ba219d9f1d1f11154f19e",
+ "identical": true,
+ "trades": 0,
+ "provenance_keys": [
+  "clock",
+  "code_sha256",
+  "config",
+  "config_sha256",
+  "custom_signal",
+  "data_sha256",
+  "execution_accuracy",
+  "input_attributes",
+  "measurement_version",
+  "pandas",
+  "python"
+ ],
+ "code_sha256": "d8868d6028327c6c",
+ "config_sha256": "5b743d031a24dc08",
+ "data_sha256": "f7110b57f8474c9b",
+ "records_git_commit": false,
+ "records_dirty_flag": false,
+ "strategy_version_field": [
+  "measurement_version"
+ ]
+}

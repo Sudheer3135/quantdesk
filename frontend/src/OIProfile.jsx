@@ -3,18 +3,27 @@ import {
   Bar, BarChart, Cell, ReferenceLine, ResponsiveContainer,
   Tooltip, XAxis, YAxis,
 } from "recharts";
+import { heaviest, oiValue } from "./oi.js";
+import { THEME } from "./theme.js";
 
 /* Consistent units. The old formatter only switched to lakhs above 1e5, so
    one axis carried "74893" and "2.2L" side by side and the reader had to
    convert between them mid-glance. Everything is lakhs now, small end
    included. */
-const lakh = (v) => `${(Math.abs(v) / 1e5).toFixed(1)}L`;
-const strikeLabel = (v) => Math.round(v).toLocaleString("en-IN");
+const lakh = (v) => (oiValue(v) === null ? "—" : `${(Math.abs(v) / 1e5).toFixed(1)}L`);
+// The axis ticks are always numbers; only readings can be missing.
+const tickLakh = (v) => `${(Math.abs(v) / 1e5).toFixed(1)}L`;
+// Missing is not zero (OC-5). `Math.round(null)` is 0, so an unavailable max
+// pain used to render as strike 0 — a reading nobody took.
+const strikeLabel = (v) =>
+  v === null || v === undefined || !Number.isFinite(Number(v))
+    ? "—" : Math.round(v).toLocaleString("en-IN");
 
 function Callout({ active, payload }) {
   if (!active || !payload?.length) return null;
   const row = payload[0].payload;
-  const heavier = row.callOI > row.putOI ? "calls" : "puts";
+  const heavier = row.callOI === null || row.putOI === null ? "comparison unavailable"
+    : row.callOI > row.putOI ? "calls heavier" : "puts heavier";
   return (
     <div className="callout">
       <div className="callout-time">{strikeLabel(row.strike)}</div>
@@ -22,10 +31,35 @@ function Callout({ active, payload }) {
       <div className="callout-row"><span>Put OI</span><b>{lakh(row.putOI)}</b></div>
       <div className="callout-row">
         <span>{row.aboveSpot ? "Above spot" : "Below spot"}</span>
-        <b>{heavier} heavier</b>
+        <b>{heavier}</b>
       </div>
     </div>
   );
+}
+
+/* The chart rows. Exported so the missing-versus-zero rule can be tested
+   on the data the chart is given, not only on the captions around it. */
+export function profileRows(strikes, spot, span = 14) {
+  if (!strikes?.length || !spot) return [];
+  const near = [...strikes]
+    .sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))
+    .slice(0, span)
+    .sort((a, b) => b.strike - a.strike);
+
+  // Missing stays null all the way to the chart: recharts draws no bar
+  // for a null, where a 0 would draw a genuine-looking empty reading.
+  return near.map((s) => {
+    const callOI = oiValue(s.call_oi);
+    const putOI = oiValue(s.put_oi);
+    return {
+      strike: s.strike,
+      callOI,
+      putOI,
+      call: callOI === null ? null : -callOI,   // negative so it draws to the left
+      put: putOI,
+      aboveSpot: s.strike >= spot,
+    };
+  });
 }
 
 /* Where option writers have committed capital.
@@ -45,29 +79,17 @@ function Callout({ active, payload }) {
 
    This is positioning, not prediction. Crowds are sometimes right. */
 export default function OIProfile({ strikes, summary, spot, span = 14 }) {
-  const data = useMemo(() => {
-    if (!strikes?.length || !spot) return [];
-    const near = [...strikes]
-      .sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))
-      .slice(0, span)
-      .sort((a, b) => b.strike - a.strike);
-
-    return near.map((s) => ({
-      strike: s.strike,
-      callOI: s.call_oi || 0,
-      putOI: s.put_oi || 0,
-      call: -(s.call_oi || 0),   // negative so it draws to the left
-      put: s.put_oi || 0,
-      aboveSpot: s.strike >= spot,
-    }));
-  }, [strikes, spot, span]);
+  const data = useMemo(() => profileRows(strikes, spot, span), [strikes, spot, span]);
 
   if (!data.length) {
     return <div className="panel"><h3>Open interest</h3>
       <p className="muted-body">No option chain loaded.</p></div>;
   }
 
-  const widest = Math.max(...data.flatMap((d) => [d.callOI, d.putOI]));
+  const recorded = data.flatMap((d) => [d.callOI, d.putOI]).filter((v) => v !== null);
+  // One unit wide when nothing (or only zeros) was recorded, so the axis
+  // still has a domain; no bar is drawn for a missing reading either way.
+  const widest = Math.max(1, ...recorded);
 
   // The strike nearest spot, so the chart has an anchor. Spot itself never
   // lands exactly on a 50-point strike, and a reference line on a category
@@ -79,9 +101,9 @@ export default function OIProfile({ strikes, summary, spot, span = 14 }) {
   const maxPainInView = data.some((d) => d.strike === maxPain);
 
   // The two levels a reader actually acts on: the heaviest committed
-  // capital on each side.
-  const callWall = data.reduce((a, b) => (b.callOI > a.callOI ? b : a), data[0]);
-  const putWall = data.reduce((a, b) => (b.putOI > a.putOI ? b : a), data[0]);
+  // capital on each side. A strike with no recorded OI is never a wall.
+  const callWall = heaviest(data, (d) => d.callOI);
+  const putWall = heaviest(data, (d) => d.putOI);
 
   // The backend computes (spot - max_pain) / spot, so a negative reading
   // means max pain sits *above* spot. "vs spot −0.26%" left the reader to
@@ -112,46 +134,51 @@ export default function OIProfile({ strikes, summary, spot, span = 14 }) {
                   margin={{ top: 4, right: 8, bottom: 4, left: 0 }}>
           <XAxis
             type="number" domain={[-widest, widest]} ticks={ticks}
-            tickFormatter={lakh}
-            tick={{ fill: "#7c8899", fontSize: 10 }} axisLine={false} tickLine={false}
+            tickFormatter={tickLakh}
+            tick={{ fill: THEME.dim, fontSize: 10 }} axisLine={false} tickLine={false}
           />
           <YAxis
             type="category" dataKey="strike" width={54}
             tickFormatter={strikeLabel}
-            tick={{ fill: "#7c8899", fontSize: 10 }} axisLine={false} tickLine={false}
+            tick={{ fill: THEME.dim, fontSize: 10 }} axisLine={false} tickLine={false}
           />
-          <Tooltip content={<Callout />} cursor={{ fill: "#ffffff08" }} />
-          <ReferenceLine x={0} stroke="#232d3a" />
+          <Tooltip content={<Callout />} cursor={{ fill: THEME.raise }} />
+          <ReferenceLine x={0} stroke={THEME.grid} />
 
           <ReferenceLine
-            y={atm.strike} stroke="#e8b339" strokeDasharray="3 3"
+            y={atm.strike} stroke={THEME.wait} strokeDasharray="3 3"
             label={{ value: `spot ${strikeLabel(spot)}`, position: "insideTopRight",
-                     fill: "#e8b339", fontSize: 9 }}
+                     fill: THEME.wait, fontSize: 9 }}
           />
           {maxPainInView && maxPain !== atm.strike && (
             <ReferenceLine
-              y={maxPain} stroke="#7c8899" strokeDasharray="2 4"
+              y={maxPain} stroke={THEME.dim} strokeDasharray="2 4"
               label={{ value: "max pain", position: "insideTopRight",
-                       fill: "#7c8899", fontSize: 9 }}
+                       fill: THEME.dim, fontSize: 9 }}
             />
           )}
 
           <Bar dataKey="call" isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill="#d9614c" fillOpacity={d.aboveSpot ? 0.85 : 0.3} />
+              <Cell key={i} fill={THEME.down} fillOpacity={d.aboveSpot ? 0.85 : 0.3} />
             ))}
           </Bar>
           <Bar dataKey="put" isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill="#45b880" fillOpacity={d.aboveSpot ? 0.3 : 0.85} />
+              <Cell key={i} fill={THEME.up} fillOpacity={d.aboveSpot ? 0.3 : 0.85} />
             ))}
           </Bar>
         </BarChart>
       </ResponsiveContainer>
 
       <p className="chart-caption">
-        Heaviest call OI at <b>{strikeLabel(callWall.strike)}</b> ({lakh(callWall.callOI)})
-        {" · "}heaviest put OI at <b>{strikeLabel(putWall.strike)}</b> ({lakh(putWall.putOI)})
+        {callWall
+          ? <>Heaviest call OI at <b>{strikeLabel(callWall.strike)}</b> ({lakh(callWall.callOI)})</>
+          : <>Call OI <b>unavailable</b></>}
+        {" · "}
+        {putWall
+          ? <>heaviest put OI at <b>{strikeLabel(putWall.strike)}</b> ({lakh(putWall.putOI)})</>
+          : <>put OI <b>unavailable</b></>}
         {maxPain && !maxPainInView && (
           <> {" · "}max pain {strikeLabel(maxPain)} is outside this range</>
         )}
@@ -159,7 +186,8 @@ export default function OIProfile({ strikes, summary, spot, span = 14 }) {
 
       {summary && (
         <div className="chain-strip">
-          <div><span>PCR</span><b>{summary.pcr_oi?.toFixed(2)}</b></div>
+          <div><span>PCR</span><b>{summary.pcr_oi == null
+            ? "unavailable" : summary.pcr_oi.toFixed(2)}</b></div>
           <div><span>Max pain</span><b>{strikeLabel(summary.max_pain)}</b></div>
           <div><span>Max pain sits</span>
             <b className={distance > 0 ? "down" : distance < 0 ? "up" : ""}>

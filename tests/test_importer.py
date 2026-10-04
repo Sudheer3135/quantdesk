@@ -55,7 +55,13 @@ def test_importing_the_same_window_twice_writes_no_new_rows(db):
 
     second = import_index_candles(db, df, "NIFTY", "5m", "test")
     assert second.write.inserted == 0
-    assert second.write.updated == 12
+    # Pass 2C: an identical re-import no longer rewrites anything. It used
+    # to overwrite all 12 rows, resetting each bar's `ingested_at` to the
+    # re-import and bumping its revision, which made an unchanged bar look
+    # as though it had only just been learnt.
+    assert second.write.updated == 0
+    assert second.unchanged == 12
+    assert second.revised == 0
     assert count_rows(db) == 12
 
 
@@ -260,3 +266,57 @@ def test_unknown_calendar_year_is_reported_not_guessed():
     assert len(clean) == 12
     assert 2019 in report.unverified_calendar_years
     assert any("2019" in w for w in report.warnings())
+
+
+# ---- an untrusted higher-timeframe bar cannot be imported as genuine ----
+
+def test_a_folded_bar_with_an_untrusted_constituent_is_never_stored_as_genuine(db):
+    """The durable half of the guarantee.
+
+    A fifteen-minute bar built over a flagged five-minute bar carries no
+    volume total. Import strips attrs and row-level flags, so the value
+    itself is what has to survive — and it does: the archive's volume
+    column is NOT NULL, so the bar is refused and counted as failed
+    rather than arriving with a number nobody measured.
+    """
+    from app.analytics import indicators, timeframes
+
+    day = date(2025, 6, 2)
+    five = session_bars(day, count=12)
+    indicators.declare_volume(five, indicators.GENUINE)
+    five["volume_is_synthetic"] = [False] * 6 + [True] + [False] * 5
+
+    folded = timeframes.fold(five, 3, as_of=pd.Timestamp("2025-06-02 16:00", tz=IST))
+    assert folded["volume"].isna().any(), "fixture must contain an untrusted bar"
+
+    # Exactly what an importer receives: the six columns, nothing else.
+    projected = folded[indicators.REQUIRED_COLS].copy()
+    projected.attrs.clear()
+
+    report = import_index_candles(db, projected, "NIFTY", "15m", "test")
+
+    stored = db.scalars(select(CandleRecord)
+                        .where(CandleRecord.timeframe == "15m")).all()
+    untrusted_ts = set(folded.loc[folded["volume"].isna(), "timestamp"])
+    assert report.write.failed > 0                      # refused, not swallowed
+    assert not any(pd.Timestamp(r.timestamp, tz="UTC") in untrusted_ts for r in stored)
+    assert all(r.volume is not None and not pd.isna(r.volume) for r in stored)
+
+
+def test_the_same_import_succeeds_when_every_constituent_is_genuine(db):
+    """The control: the rule above rejects untrusted bars, not all bars."""
+    from app.analytics import indicators, timeframes
+
+    five = session_bars(date(2025, 6, 3), count=12)
+    indicators.declare_volume(five, indicators.GENUINE)
+    folded = timeframes.fold(five, 3, as_of=pd.Timestamp("2025-06-03 16:00", tz=IST))
+    projected = folded[indicators.REQUIRED_COLS].copy()
+    projected.attrs.clear()
+
+    report = import_index_candles(db, projected, "NIFTY", "15m", "test")
+
+    assert report.write.failed == 0
+    stored = db.scalars(select(CandleRecord)
+                        .where(CandleRecord.timeframe == "15m")).all()
+    assert len(stored) == len(folded)
+    assert all(r.volume > 0 for r in stored)

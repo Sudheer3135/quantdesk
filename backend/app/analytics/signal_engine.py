@@ -15,7 +15,7 @@ from typing import Any
 
 import pandas as pd
 
-from . import indicators, options, smc, structure
+from . import decision_provenance, indicators, options, smc, structure
 
 # Weights sum to 1.0. Tune these, then re-run the backtest before trusting them.
 WEIGHTS: dict[str, float] = {
@@ -30,6 +30,33 @@ WEIGHTS: dict[str, float] = {
 
 # Below this, the engine returns HOLD no matter which way the score leans.
 MIN_CONFIDENCE = 0.35
+
+# High VIX means wider noise, so more agreement is demanded above this
+# level. Named rather than written inline so the parameter hash on every
+# signal is computed from the same numbers the engine decides with.
+HIGH_VIX_LEVEL = 20.0
+HIGH_VIX_THRESHOLD_BUMP = 0.10
+
+
+def parameters(timeframe: str, rr_target: float, atr_stop_multiple: float) -> dict:
+    """Every number this engine decides with, for the per-signal hash (RP-2).
+
+    Read from the same module constants `generate` uses, so the hash cannot
+    describe different rules from the ones that ran.
+    """
+    return {
+        "timeframe": timeframe,
+        "weights": dict(WEIGHTS),
+        "min_confidence": MIN_CONFIDENCE,
+        "high_vix_level": HIGH_VIX_LEVEL,
+        "high_vix_threshold_bump": HIGH_VIX_THRESHOLD_BUMP,
+        "fresh_bars": FRESH_BARS,
+        "stale_bars": STALE_BARS,
+        "fvg_reach_atr": FVG_REACH_ATR,
+        "rr_target": rr_target,
+        "atr_stop_multiple": atr_stop_multiple,
+        "min_candles": 30,
+    }
 
 
 @dataclass
@@ -138,7 +165,8 @@ def check_structure(state: structure.StructureState, current_index: int,
 def check_vwap(row: pd.Series) -> Check:
     price, vw = float(row["close"]), float(row["vwap"])
     if pd.isna(vw):
-        return Check("vwap", 0.0, WEIGHTS["vwap"], "VWAP not available yet.")
+        return Check("vwap", 0.0, WEIGHTS["vwap"],
+                     "VWAP unavailable: valid traded volume is required.", disabled=True)
     dist = (price - vw) / vw * 100
     if abs(dist) < 0.05:
         return Check("vwap", 0.0, WEIGHTS["vwap"],
@@ -163,6 +191,17 @@ def check_vwap(row: pd.Series) -> Check:
 def check_trend(row: pd.Series) -> Check:
     price = float(row["close"])
     e20, e50, e200 = float(row["ema20"]), float(row["ema50"]), float(row["ema200"])
+    # The 20 and 50 are the stack; without both there is no trend to read.
+    # Before the declared warmup they are NaN (see `analytics.warmup`), and
+    # that is unavailable — not tangled, not neutral. A NaN compared with a
+    # price is simply False, so this used to fall through every branch and
+    # report "EMAs tangled", a zero vote that diluted everything it was
+    # averaged with.
+    if pd.isna(e20) or pd.isna(e50):
+        return Check("trend", 0.0, WEIGHTS["trend"],
+                     "Not enough history for the 20/50 EMA stack — the trend "
+                     "check is unavailable until its declared warmup is met.",
+                     disabled=True)
     if pd.isna(e200):
         stacked_up = price > e20 > e50
         stacked_down = price < e20 < e50
@@ -239,8 +278,22 @@ def check_option_chain(summary: options.ChainSummary | None) -> Check:
                      "No option chain available, so this check is disabled "
                      "and its weight is shared across the others.",
                      disabled=True)
+    if not summary.oi_available:
+        # Missing OI is unavailable, not a reading (OC-5). It used to arrive
+        # here as a PCR of 0.0 and a max pain on the lowest strike — two
+        # bearish votes on no data at all.
+        return Check("option_chain", 0.0, WEIGHTS["option_chain"],
+                     "Option-chain open interest is unavailable, so this "
+                     "check is disabled and its weight is shared across the "
+                     "others.", disabled=True)
     score = {"bullish": 1.0, "bearish": -1.0, "neutral": 0.0}[summary.bias]
-    bits = [f"PCR {summary.pcr_oi:.2f}", f"max pain {summary.max_pain:.0f}"]
+    bits = [f"PCR {summary.pcr_oi:.2f}" if summary.pcr_oi is not None
+            else f"PCR unavailable ({summary.pcr_status})",
+            f"max pain {summary.max_pain:.0f}" if summary.max_pain is not None
+            else "max pain unavailable"]
+    if summary.oi_status != options.OI_AVAILABLE:
+        bits.append(f"OI recorded on both sides for {summary.oi_paired_strikes}"
+                    f" of {summary.oi_total_strikes} strikes")
     if summary.put_writing:
         bits.append(f"put writing at {summary.put_writing[0]:.0f}")
     if summary.call_writing:
@@ -282,6 +335,8 @@ def generate(
     rr_target: float = 2.0,
     atr_stop_multiple: float = 1.2,
 ) -> Signal:
+    decision_time = candles.attrs.get("decision_time", pd.Timestamp.now(tz="UTC"))
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
     df = indicators.enrich(candles)
     if len(df) < 30:
         raise ValueError("need at least 30 candles to read structure reliably")
@@ -321,8 +376,8 @@ def generate(
 
     # High VIX means wider noise; demand more agreement before acting.
     threshold = MIN_CONFIDENCE
-    if india_vix is not None and india_vix > 20:
-        threshold += 0.10
+    if india_vix is not None and india_vix > HIGH_VIX_LEVEL:
+        threshold += HIGH_VIX_THRESHOLD_BUMP
 
     if confidence < threshold:
         action = "HOLD"
@@ -338,6 +393,19 @@ def generate(
         price=price,
         checks=checks,
         context={
+            # The six decision clocks, checked for order (TC-2). The agent
+            # persists them as columns; this copy is what the dashboard and
+            # older readers see.
+            "timing": decision_provenance.clocks(
+                bar_open=row["timestamp"],
+                timeframe_minutes=indicators.TIMEFRAME_MINUTES[timeframe],
+                received_at=candles.attrs.get("received_at"),
+                decision_at=decision_time),
+            # What produced this signal (RP-2): enough on the row alone to
+            # say which rules, which parameters and which inputs made it.
+            "provenance": decision_provenance.record(
+                parameters=parameters(timeframe, rr_target, atr_stop_multiple),
+                candles=candles, chain=chain, india_vix=india_vix),
             "trend": state.trend,
             "last_structure_event": structure.last_event(state).to_dict()
             if structure.last_event(state) else None,

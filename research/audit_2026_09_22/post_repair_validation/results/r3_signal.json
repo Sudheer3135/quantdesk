@@ -1,0 +1,20 @@
+{
+ "forming_bar_injection": {
+  "tested": 25,
+  "signal_changed": 0,
+  "plan_changed": 17
+ },
+ "boundary": {
+  "at_close_minus_1ms": 2,
+  "at_close_exact": 3,
+  "rows": 3,
+  "finality_latency_modelled": false
+ },
+ "warmup_parity": {
+  "tested": 30,
+  "backtest300_vs_live5d_signal_differs": 0,
+  "action_differs": 0,
+  "live5d_vs_fullhistory_differs": 3,
+  "examples": []
+ }
+}

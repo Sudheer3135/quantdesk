@@ -1,0 +1,136 @@
+{
+ "CA1_win": {
+  "hand": 63.362161,
+  "code": 63.362161
+ },
+ "CA2_loss_correct_legs": {
+  "hand_buy120_sell100": 61.907161,
+  "code_correct_legs": 61.907161,
+  "code_minmax_as_in_outcomes_and_engine": 63.362161
+ },
+ "FC1_vwap": {
+  "vwap": 2.0,
+  "sigma": 0.816497,
+  "expected": 0.816497
+ },
+ "FC2_vwap_placeholder_volume": null,
+ "FC2_constant_volume_1000_treated_real": true,
+ "lifecycle": {
+  "target": {
+   "trades": [
+    [
+     "target",
+     "08:55",
+     "09:05",
+     102.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "stop": {
+   "trades": [
+    [
+     "stop",
+     "08:55",
+     "09:05",
+     99.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "stop_gap": {
+   "trades": [
+    [
+     "stop_gap",
+     "08:55",
+     "09:05",
+     97.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "time_exit_24bars": {
+   "trades": [
+    [
+     "session end",
+     "08:55",
+     "09:45",
+     100.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "session_end": {
+   "trades": [
+    [
+     "session end",
+     "09:40",
+     "09:45",
+     100.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "final_bar": {
+   "trades": [
+    [
+     "end_of_data",
+     "08:55",
+     "09:00",
+     100.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "signal_while_open_every_bar": {
+   "trades": [
+    [
+     "session end",
+     "08:50",
+     "09:45",
+     100.0
+    ]
+   ],
+   "entries": 1,
+   "closed": 1,
+   "final_state": "CLOSED"
+  },
+  "signal_on_last_bar_of_session": {
+   "trades": [],
+   "entries": 0,
+   "closed": 0,
+   "final_state": "FLAT"
+  },
+  "daily_limits_repeated_losses": {
+   "trades": [
+    [
+     "stop",
+     "08:50",
+     "09:00",
+     99.0
+    ],
+    [
+     "stop",
+     "09:00",
+     "09:05",
+     99.0
+    ]
+   ],
+   "entries": 2,
+   "closed": 2,
+   "final_state": "CLOSED"
+  }
+ }
+}

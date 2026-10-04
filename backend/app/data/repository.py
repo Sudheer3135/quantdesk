@@ -14,14 +14,15 @@ to "do you actually have the window I asked for?".
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..market_hours import trading_date
+from ..market_hours import IST, trading_date
 from ..models import CandleRecord, TradeRecord
 
 log = logging.getLogger(__name__)
@@ -206,20 +207,51 @@ def load_index_candles(
     start: datetime | date | None = None,
     end: datetime | date | None = None,
     limit: int | None = None,
+    sources: Sequence[str] | None = None,
+    newest: bool = False,
+    access=None,
 ) -> pd.DataFrame:
     """Candles in the platform's standard shape, oldest first.
+
+    Strategy access by default — research, features, regimes, charts with
+    indicators — and sessions protected as prospective holdout data are
+    withheld from it here, below every caller, so none of them has to
+    remember. Only trusted collection and data-quality code, holding a
+    `registry.trusted_access` grant as `access`, sees them; a purpose
+    string is refused, not honoured.
 
     The returned frame carries a `.attrs` entry describing where the rows
     came from. It is deliberately not a column: every indicator and check in
     this codebase expects exactly six columns, and adding a seventh would
     put provenance one careless `df.iloc` away from being treated as price
     data.
+
+    `newest` changes which end `limit` takes from. By default the limit is
+    applied to the oldest rows, which is what a backtest wants — the window
+    starts where the history starts. A chart being panned backwards wants
+    the opposite: the newest rows *below* a cursor. Without this the only
+    way to get them is to load the whole archive and discard the front of
+    it, which is O(all history) per request and becomes the dominant cost
+    the moment a real backfill lands. The frame is still returned
+    oldest-first either way.
+
+    `sources` restricts the read to particular vendors. It defaults to None,
+    meaning all of them, which is correct while the archive holds one row
+    per bar: `uq_candle` is unique on (symbol, timeframe, timestamp), so no
+    two sources can currently describe the same bar and an unfiltered read
+    cannot double-count. The parameter exists for the day that changes —
+    `HistoricalFeed.__init__` raises on duplicate timestamps, so if the
+    unique key ever gains `source`, every caller here needs a way to pick
+    one vendor before a backtest can run at all.
     """
     stmt = (
         select(CandleRecord)
         .where(CandleRecord.symbol == symbol, CandleRecord.timeframe == timeframe)
-        .order_by(CandleRecord.timestamp)
+        .order_by(CandleRecord.timestamp.desc() if newest
+                  else CandleRecord.timestamp)
     )
+    if sources:
+        stmt = stmt.where(CandleRecord.source.in_(list(sources)))
     if start is not None:
         stmt = stmt.where(CandleRecord.timestamp >= _to_datetime(start))
     if end is not None:
@@ -228,6 +260,12 @@ def load_index_candles(
         stmt = stmt.limit(limit)
 
     rows = db.scalars(stmt).all()
+    if newest:
+        # Selected newest-first so the database could apply the limit; the
+        # contract is oldest-first, so it is restored here.
+        rows = list(reversed(rows))
+    from ..methodology import registry
+    registry.access_purpose(access)          # refuse a bad grant before reading
     if not rows:
         empty = pd.DataFrame(columns=CANDLE_COLUMNS)
         empty.attrs[PROVENANCE] = {"rows": 0, "sources": {}, "volume_is_synthetic": False}
@@ -253,7 +291,8 @@ def load_index_candles(
         "volume_is_synthetic": any(r.volume_is_synthetic for r in rows),
         "sessions": len({r.session_date for r in rows if r.session_date}),
     }
-    return df
+    from ..methodology import registry
+    return registry.withhold(db, df, access=access)
 
 
 def provenance_of(df: pd.DataFrame) -> dict:
@@ -310,3 +349,17 @@ def open_trades(db: Session) -> list[TradeRecord]:
     one day it matters most.
     """
     return list(db.scalars(select(TradeRecord).where(TradeRecord.status == "open")).all())
+
+
+def closed_trades(db: Session, day: date) -> list[TradeRecord]:
+    """Trades realised on this IST day, independent of their entry dates.
+
+    Legacy rows have no exit timestamp. For those alone retain the former
+    entry-day attribution; their actual realisation day cannot be recovered.
+    Use UTC bounds on both databases, whose stored timestamps are UTC.
+    """
+    start = datetime.combine(day, datetime.min.time(), tzinfo=IST).astimezone(UTC)
+    stamp = func.coalesce(TradeRecord.closed_at, TradeRecord.created_at)
+    return list(db.scalars(select(TradeRecord).where(
+        TradeRecord.status == "closed", stamp >= start,
+        stamp < start + timedelta(days=1)).order_by(stamp, TradeRecord.id)).all())

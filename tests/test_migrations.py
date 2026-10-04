@@ -9,6 +9,7 @@ than at deploy time.
 So the migrations are tested the way they will actually be used — against a
 database that already holds rows in the old shape.
 """
+import os
 import sys
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -146,6 +147,24 @@ def test_the_head_lookup_finds_a_real_revision():
     assertion below pass against a database that migrated nowhere."""
     head = head_revision()
     assert head and head.isdigit(), head
+
+
+def test_trade_exit_migration_preserves_unknown_close_times(url):
+    cfg = make_config(url)
+    command.upgrade(cfg, "0007")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO trades "
+                          "(symbol, side, quantity, entry, stop_loss, status, pnl) "
+                          "VALUES ('NIFTY', 'BUY', 65, 200, 150, 'closed', -6500)"))
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT pnl, closed_at FROM trades")).one() == (-6500, None)
+    assert "ix_trades_closed_at" in {
+        index["name"] for index in inspect(engine).get_indexes("trades")}
+    command.downgrade(cfg, "0007")
+    assert "closed_at" not in {c["name"] for c in inspect(engine).get_columns("trades")}
+    engine.dispose()
 
 
 def test_upgrade_survives_a_database_built_by_create_all(url):
@@ -305,3 +324,93 @@ def test_running_a_migration_does_not_silence_the_application(url):
         watchdog.log.removeHandler(handler)
 
     assert captured == ["the desk can still speak"]
+
+
+def test_the_research_event_log_migrates_round_trips_and_reverses(url):
+    """Pass 2D: 0010 creates an empty append-only log; nothing is seeded."""
+    from sqlalchemy.orm import Session
+
+    from app.methodology import events
+
+    cfg = make_config(url)
+    command.upgrade(cfg, "head")
+    engine = create_engine(url)
+    with Session(engine) as db:
+        assert events.available(db) and events.count(db) == 0
+        events.append(db, stream=events.TRIALS, event_type="study_registered",
+                      subject="s", payload={"study_id": "s", "primary_metric": "m"})
+        events.append(db, stream=events.REGISTRY, event_type="usage_registered",
+                      subject="s", payload={"sessions": ["2026-06-16"],
+                                            "category": "SEEN_DEVELOPMENT"})
+        db.commit()
+        assert events.verify(db) == 2
+    engine.dispose()
+    command.downgrade(cfg, "0009")
+    engine = create_engine(url)
+    assert "research_events" not in inspect(engine).get_table_names()
+    engine.dispose()
+
+
+# Pass 2D.2: the one-consumption-per-generation rule is part of migration
+# 0010's schema, so it is tested on the migrated table itself — SQLite
+# always, and PostgreSQL when TEST_MIGRATION_DATABASE_URL names a scratch
+# database the test may wipe.
+MIGRATION_BACKENDS = ["sqlite"] + (
+    ["postgresql"] if os.getenv("TEST_MIGRATION_DATABASE_URL") else [])
+
+
+@pytest.fixture(params=MIGRATION_BACKENDS)
+def any_url(request, tmp_path):
+    if request.param == "sqlite":
+        yield f"sqlite:///{tmp_path / 'migrate.db'}"
+        return
+    pg = os.environ["TEST_MIGRATION_DATABASE_URL"]
+
+    def wipe():
+        engine = create_engine(pg)
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+        engine.dispose()
+
+    wipe()
+    yield pg
+    wipe()
+
+
+def test_the_migrated_schema_admits_one_consumption_per_generation(any_url):
+    from sqlalchemy.exc import IntegrityError
+
+    command.upgrade(make_config(any_url), "head")
+    engine = create_engine(any_url)
+    seq = iter(range(1, 100))
+
+    def insert(conn, *, subject, consumed, event_type="holdout_consumed"):
+        n = next(seq)
+        conn.execute(text(
+            "INSERT INTO research_events (seq, stream, event_type, subject, payload, "
+            "created_at, prev_hash, event_hash, consumed_lock_id) VALUES (:seq, "
+            "'holdout', :type, :subject, '{}', :at, :prev, :hash, :consumed)"),
+            {"seq": n, "type": event_type, "subject": subject, "consumed": consumed,
+             "at": datetime.now(UTC), "prev": "0" * 64, "hash": f"{n:064x}"})
+
+    with engine.begin() as conn:
+        insert(conn, subject="L1", consumed="L1")                  # first: accepted
+    refused = [
+        dict(subject="L1", consumed="L1"),                         # same generation
+        dict(subject="L1", consumed=None),                         # NULL identity
+        dict(subject="L1", consumed="holdout_consumed:L1"),        # forged identity
+        dict(subject="L1", consumed="L9"),                         # another's identity
+        dict(subject="L1", consumed="L1", event_type="note"),      # id off a consumption
+    ]
+    for attempt in refused:
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            insert(conn, **attempt)
+    with engine.begin() as conn:
+        insert(conn, subject="L2", consumed="L2")                  # another generation
+        insert(conn, subject="s", consumed=None, event_type="note")  # ordinary event
+        rows = conn.execute(text(
+            "SELECT subject FROM research_events WHERE event_type = 'holdout_consumed' "
+            "ORDER BY seq")).scalars().all()
+    assert rows == ["L1", "L2"]
+    engine.dispose()

@@ -1,15 +1,23 @@
-:root {
-  --ink:        #10151c;
-  --ink-raised: #171e27;
-  --ink-line:   #232d3a;
-  --paper:      #dfe6ef;
-  --muted:      #7c8899;
-  --amber:      #e8a33d;
-  --bull:       #45b880;
-  --bear:       #d9614c;
+/* The older layer. `terminal.css` loads after this and owns the desk's
+   appearance; what remains here styles the components that predate it.
 
-  --mono: "IBM Plex Mono", ui-monospace, monospace;
-  --sans: "Archivo", system-ui, sans-serif;
+   These names are kept because a few hundred rules below still use them,
+   but they are no longer a second palette — each one is an alias onto the
+   single token set in terminal.css. Two independent palettes is how a
+   panel ends up a shade off from the one beside it and nobody can say
+   which of the two is correct. */
+:root {
+  --ink:        #0B0E11;
+  --ink-raised: #151A22;
+  --ink-line:   #232A34;
+  --paper:      #E4E9F0;
+  --muted:      #8A94A3;
+  --amber:      #D29922;
+  --bull:       #3FB950;
+  --bear:       #E5484D;
+
+  --mono: "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -262,8 +270,9 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
   width: 6px; height: 6px; border-radius: 50%;
   background: currentColor; flex: none;
 }
-.pill.link-live { color: var(--bull); border-color: currentColor; }
-.pill.link-live .dot { animation: pulse 2s ease-in-out infinite; }
+.pill.link-connected { color: var(--bull); border-color: currentColor; }
+.pill.link-connected .dot { animation: pulse 2s ease-in-out infinite; }
+.pill.link-reconnecting { color: var(--amber); border-color: currentColor; }
 .pill.link-polling { color: var(--amber); border-color: currentColor; }
 .pill.link-connecting { color: var(--muted); }
 
@@ -282,7 +291,7 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .pill.link-live .dot { animation: none; }
+  .pill.link-connected .dot { animation: none; }
 }
 
 /* ---- live price ticker ---- */
@@ -433,6 +442,19 @@ button:focus-visible { outline: 2px solid var(--paper); outline-offset: 2px; }
 }
 
 .chart-fallback { min-height: 300px; }
+
+/* A panel that failed. Visible on purpose: a blank space reads as
+   a quiet market, which is the one thing this desk must never
+   imply. See PanelBoundary.jsx. */
+.panel-failed { min-height: 300px; }
+.panel-failed-why {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  opacity: 0.7;
+  overflow-wrap: anywhere;
+  margin: 0.5rem 0;
+}
+
 /* The risk verdict on the trade plan. Loud on purpose: this is the line that
    says whether the desk's own rules allow the trade in front of you, and its
    absence was audit finding H-4. */

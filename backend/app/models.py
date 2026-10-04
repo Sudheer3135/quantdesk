@@ -4,6 +4,7 @@ from datetime import UTC, date, datetime
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -19,6 +20,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 class Base(DeclarativeBase):
     pass
+
+
+# Deferred-loading groups for columns added in migration 0009. See the note
+# on `SignalRecord` for why they are deferred.
+PROVENANCE_GROUP = "provenance_0009"
+CAPTURE_GROUP = "capture_clocks_0009"
 
 
 def utc_now() -> datetime:
@@ -85,6 +92,78 @@ class SignalRecord(Base):
         String(16), nullable=True, index=True)
     plan: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
+    # ---- deferred, on purpose ------------------------------------------
+    #
+    # Every column below is `deferred`: a plain `select(SignalRecord)` does
+    # not name it. Research reads frozen archives that predate these columns
+    # — the audit snapshot, and the frozen comparator that replays it with
+    # audit-time code — and a SELECT naming a column the archive lacks fails
+    # outright. Readers that want them ask through `data.schema.loadable`,
+    # which loads them in the same query when the database has them.
+    # ---- the decision clocks (TC-2) ------------------------------------
+    #
+    # Persisted as columns rather than reconstructed from `context.timing`.
+    # The JSON copy is kept for readers that already use it, but a clock that
+    # only exists inside a blob can be rebuilt by any later code with any
+    # later idea of what it should have said, and nothing would show it had
+    # been. A column written at decision time cannot.
+    #
+    #   bar_open_time           the source bar's own open
+    #   bar_close_time          when that bar completed
+    #   available_at            when the completed bar could first be read
+    #   received_at             when Quant Desk actually received it — never
+    #                           derived from exchange time; NULL if unknown
+    #   decision_at             when the decision was made
+    #   earliest_execution_time the first instant an order could be working
+    #
+    # All nullable, with no backfill. `clock_basis` is NULL on every row
+    # written before these existed; guessing their timestamps now and storing
+    # them as if observed would be a fabricated record, which is exactly
+    # what the columns exist to prevent.
+    bar_open_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    bar_close_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    available_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    decision_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    earliest_execution_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    # "persisted" on rows written with the columns above; NULL on legacy
+    # rows, whose timing can only be inferred from `context`.
+    clock_basis: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, index=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+
+    # ---- what produced it (RP-2) ---------------------------------------
+    #
+    # On the signal, not only on a backtest's metadata. One row has to be
+    # enough to say which strategy, which parameters, which inputs and which
+    # code made it — otherwise two signals from different configurations
+    # sit in the same table indistinguishable from each other.
+    strategy_version: Mapped[str | None] = mapped_column(String(32), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    parameter_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    input_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    data_source: Mapped[str | None] = mapped_column(String(64), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    code_id: Mapped[str | None] = mapped_column(String(96), nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+    provenance: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True,
+        deferred_group=PROVENANCE_GROUP)
+
 
 class TradeRecord(Base):
     """The trade journal. Fill the review fields after the close, not during."""
@@ -92,6 +171,10 @@ class TradeRecord(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # Entry and realisation can belong to different trading days. Older
+    # journal rows have no recorded close time; do not invent one on upgrade.
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True,
+                                                      index=True)
     symbol: Mapped[str] = mapped_column(String(48), index=True)
     side: Mapped[str] = mapped_column(String(8))
     quantity: Mapped[int] = mapped_column(Integer)
@@ -163,9 +246,93 @@ class CandleRecord(Base):
     volume_is_synthetic: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False)
 
-    # Bumped every time an upsert overwrites this bar. A bar that keeps
-    # being restated is a bar worth looking at.
+    # The version number of the values on this row. Bumped only when a
+    # re-import actually changes them; the superseded values are kept in
+    # `candle_revisions` rather than destroyed. It used to bump on every
+    # re-import whether anything changed or not, which is how 5,818 of
+    # 6,750 archived bars came to carry a revision with nothing to show for
+    # it.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class CandleRevision(Base):
+    """A superseded version of an archived candle (TC-6).
+
+    Append-only. When a source restates a bar, the values that were on the
+    row until then are copied here before the row is overwritten, with the
+    window during which they were the known truth. A replay of a decision
+    made at 10:02 can then ask for the bar as it was known at 10:02 — the
+    original 100 — instead of the 101 the source published at 10:07, which
+    the decision could not have seen.
+
+    Nothing is ever updated or deleted here. A revision history that can be
+    rewritten is not a history.
+    """
+    __tablename__ = "candle_revisions"
+    __table_args__ = (
+        Index("ix_candle_revision_bar", "symbol", "timeframe", "timestamp"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(32))
+    timeframe: Mapped[str] = mapped_column(String(8))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The version these values were. The live row carries a higher one.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    open: Mapped[float] = mapped_column(Float)
+    high: Mapped[float] = mapped_column(Float)
+    low: Mapped[float] = mapped_column(Float)
+    close: Mapped[float] = mapped_column(Float)
+    volume: Mapped[float] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    volume_is_synthetic: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False)
+    # When these values became known, and when they stopped being the latest.
+    # Together they bound the moments at which a replay should see them.
+    known_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
+    superseded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+# At most one consumption per holdout generation, as a table constraint:
+# with `consumed_lock_id` unique this is UNIQUE(lock_id) WHERE event_type =
+# 'holdout_consumed'. A consumption row without the id, or with one that is
+# not its own subject, is not insertable at all.
+CONSUMPTION_RULE = (
+    "(event_type = 'holdout_consumed' AND consumed_lock_id IS NOT NULL "
+    "AND consumed_lock_id = subject) OR "
+    "(event_type <> 'holdout_consumed' AND consumed_lock_id IS NULL)")
+
+
+class ResearchEvent(Base):
+    """One entry in the append-only research methodology log (Pass 2D).
+
+    Seen-data registrations, holdout locks and consumptions, exposures,
+    trial preregistrations, results and invalidations all live here as
+    events. Rows are never updated or deleted — `methodology.events`
+    refuses both at the ORM level — and each carries the hash of its
+    predecessor, so an out-of-band edit is detectable.
+    """
+    __tablename__ = "research_events"
+    __table_args__ = (
+        Index("ix_research_events_stream", "stream", "subject"),
+        CheckConstraint(CONSUMPTION_RULE, name="ck_research_events_consumption"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    stream: Mapped[str] = mapped_column(String(24), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    subject: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    prev_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    # The holdout generation a consumption spends: required on (and only on)
+    # `holdout_consumed` events, equal to their subject, and unique — so the
+    # schema admits one consumption per generation, not the application.
+    consumed_lock_id: Mapped[str | None] = mapped_column(String(128), nullable=True,
+                                                         unique=True)
 
 
 class OptionContract(Base):
@@ -231,6 +398,37 @@ class OptionCandle(Base):
     # quantity instead of an assumed one.
     bid: Mapped[float | None] = mapped_column(Float, nullable=True)
     ask: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Depth at the touch, where the source publishes it. NULL is
+    # "unavailable", never zero.
+    bid_size: Mapped[float | None] = mapped_column(Float, nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    ask_size: Mapped[float | None] = mapped_column(Float, nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+
+    # ---- three clocks, never one (OC-1) --------------------------------
+    #
+    #   exchange_time  the source's own timestamp for the quote, if it
+    #                  publishes one. NULL when it does not.
+    #   capture_time   when Quant Desk received the latest poll folded into
+    #                  this bar — the moment the stored close became known.
+    #   first_seen     when this bar was first recorded. Immutable: written
+    #                  on insert and never in an upsert's update set, so a
+    #                  re-import cannot make an old observation look newer
+    #                  or older than it was.
+    #
+    # `timestamp` above is the bucket start and is a grouping key only. It
+    # used to double as availability, which let a quote captured at 10:04
+    # count as known at 10:00. NULL on legacy rows, which are read under the
+    # old bucket-close rule and labelled as such.
+    exchange_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    capture_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
+    first_seen: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, deferred=True,
+        deferred_group=CAPTURE_GROUP)
 
     # The index level at this same bar. Stored alongside the premium because
     # without it, greeks and implied volatility cannot be recomputed later:
@@ -325,3 +523,98 @@ class MarketRegime(Base):
     engine_version: Mapped[str] = mapped_column(String(16), nullable=False)
     computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now)
+
+
+class VixDaily(Base):
+    """India VIX, one row per session.
+
+    Its own table rather than rows in `candles`: a daily bar is stamped at
+    midnight, which the candle validator correctly rejects as outside the
+    session, and a volatility index is not a price anything is traded at.
+    Strategy v2 ranks the live VIX against this history before buying
+    premium, so the table has to exist before the gate can say anything.
+    """
+    __tablename__ = "vix_daily"
+    __table_args__ = (UniqueConstraint("session_date", name="uq_vix_daily"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_date: Mapped[date] = mapped_column(Date, nullable=False)
+    open: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now)
+
+
+class PaperPosition(Base):
+    """One simulated option position opened by strategy v2.
+
+    Paper, and labelled so in the table name: nothing here ever reached a
+    broker. Every level the position was opened against is stored at entry,
+    so a restart resumes monitoring the same stop and target rather than
+    recomputing them from a later price.
+    """
+    __tablename__ = "paper_positions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(8), index=True)   # open | closed
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    direction: Mapped[str] = mapped_column(String(8))            # BUY | SELL on the index
+    contract: Mapped[str] = mapped_column(String(48))
+    token: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    option_type: Mapped[str] = mapped_column(String(2))
+    strike: Mapped[float] = mapped_column(Float)
+    expiry: Mapped[date] = mapped_column(Date)
+    lot_size: Mapped[int] = mapped_column(Integer)
+    lots: Mapped[int] = mapped_column(Integer)
+    quantity: Mapped[int] = mapped_column(Integer)
+
+    index_entry: Mapped[float] = mapped_column(Float)
+    index_stop: Mapped[float] = mapped_column(Float)
+    index_target: Mapped[float] = mapped_column(Float)
+    premium_entry: Mapped[float] = mapped_column(Float)
+    premium_stop: Mapped[float] = mapped_column(Float)
+    premium_target: Mapped[float] = mapped_column(Float)
+    risk_amount: Mapped[float] = mapped_column(Float)
+
+    last_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+    worst_premium: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    premium_exit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    index_exit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    gross_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    costs: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    r_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # The selection, the gates, the risk verdict and the signal it came
+    # from — everything needed to argue with the trade later.
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class PaperDecision(Base):
+    """Every signal strategy v2 looked at, and what it did about it.
+
+    Rejections are stored, not just entries. A paper record that only kept
+    the trades it took would report the win rate of whatever it happened to
+    accept, with nothing showing how much it refused or why.
+    """
+    __tablename__ = "paper_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(16), index=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    signal_time: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    action: Mapped[str] = mapped_column(String(8))
+    outcome: Mapped[str] = mapped_column(String(8), index=True)    # entered | rejected
+    code: Mapped[str] = mapped_column(String(40), index=True)
+    detail: Mapped[dict] = mapped_column(JSON, default=dict)

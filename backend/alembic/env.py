@@ -20,8 +20,8 @@ if config.config_file_name is not None:
     # silent afterwards: no agent tick, no collector failure, and no
     # scheduler-starvation alarm, all while the desk keeps running.
     #
-    # Today's compose command runs `alembic upgrade head` as a separate
-    # process from uvicorn, so production is not affected. The suite is: it
+    # Migrations run from `app.migrate` (scripts/migrate.sh, the Compose
+    # `migrate` service), never inside the API process. The suite is: it
     # runs migrations in-process, and the tests proving the starvation alarm
     # actually logs were failing purely because alembic had muted the logger
     # several files earlier.
@@ -49,24 +49,36 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+def _run_on(connection) -> None:
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        compare_type=True,
+        # SQLite cannot ALTER most things in place. Batch mode rebuilds
+        # the table instead, which is the only way these migrations run
+        # against the test database as well as against Postgres.
+        render_as_batch=connection.dialect.name == "sqlite",
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
 def run_migrations_online() -> None:
+    # `app.migrate` hands over the connection that owns the exclusive schema
+    # lock, and the migration runs on exactly that connection — no second
+    # engine, no second connection. If it dies, the lock and the migration
+    # die together (Pass 2E-A.2).
+    supplied = config.attributes.get("connection")
+    if supplied is not None:
+        _run_on(supplied)
+        return
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            compare_type=True,
-            # SQLite cannot ALTER most things in place. Batch mode rebuilds
-            # the table instead, which is the only way these migrations run
-            # against the test database as well as against Postgres.
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_on(connection)
 
 
 if context.is_offline_mode():

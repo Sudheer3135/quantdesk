@@ -95,12 +95,17 @@ def test_kill_switch_blocks_everything():
     assert not d.approved
 
 
-def test_constant_volume_is_not_treated_as_information(candles):
+def test_substituted_volume_is_not_treated_as_information(candles):
     """Yahoo reports zero volume for ^NSEI, so the free broker substitutes a
-    constant. A constant must disable the volume check, not read as neutral
-    participation — otherwise every signal carries a score based on nothing.
+    constant and declares the substitution. Substituted volume must disable
+    the volume check, not read as neutral participation — otherwise every
+    signal carries a score based on nothing.
+
+    What makes it unusable is the declaration, not the shape of the
+    numbers: the mock feed's own volume is trusted because it says it is
+    traded volume, and this frame is not because it says it is filler.
     """
-    flat = candles.copy()
+    flat = indicators.declare_volume(candles.copy(), indicators.SYNTHETIC)
     flat["volume"] = 1.0
     assert not indicators.has_real_volume(flat)
     assert indicators.has_real_volume(candles)
@@ -114,7 +119,7 @@ def test_constant_volume_is_not_treated_as_information(candles):
 def test_disabled_checks_renormalise_the_weights(candles):
     """With checks switched off the survivors must still be able to reach
     full confidence, or the threshold silently gets stricter."""
-    flat = candles.copy()
+    flat = indicators.declare_volume(candles.copy(), indicators.SYNTHETIC)
     flat["volume"] = 1.0
 
     sig = signal_engine.generate(flat)          # no chain, no volume

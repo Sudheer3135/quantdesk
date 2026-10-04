@@ -12,16 +12,17 @@ question you actually have when a number looks wrong three weeks later.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
 import pandas as pd
-from sqlalchemy import case, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from ..market_hours import is_open as market_is_open
 from ..market_hours import is_trading_date
-from ..models import CandleRecord, OptionCandle, OptionContract
+from ..models import CandleRecord, CandleRevision, OptionCandle, OptionContract
 from .upsert import UpsertResult, upsert
 from .validation import RejectionReport, clean_candles
 
@@ -44,6 +45,11 @@ class ImportReport:
     write: UpsertResult = field(default_factory=UpsertResult)
     first_ts: str | None = None
     last_ts: str | None = None
+    # What the re-import found against the archive. `revised` bars had
+    # their previous values moved to `candle_revisions`; `unchanged` bars
+    # were not rewritten at all, so their availability time stands.
+    revised: int = 0
+    unchanged: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -54,8 +60,86 @@ class ImportReport:
             "last_ts": self.last_ts,
             "validation": self.rejection.to_dict(),
             "write": self.write.to_dict(),
+            "revised": self.revised,
+            "unchanged": self.unchanged,
             "warnings": self.rejection.warnings(),
         }
+
+
+# The fields whose change makes a re-imported bar a different fact. The
+# vendor label is deliberately absent: a second source reporting the same
+# numbers confirms the bar, it does not restate it, and rewriting the row
+# for it would move the bar's availability time for no new information.
+REVISED_FIELDS = ("open", "high", "low", "close", "volume")
+
+
+def _same(stored: CandleRecord, incoming: dict) -> bool:
+    for name in REVISED_FIELDS:
+        if not math.isclose(float(getattr(stored, name)), float(incoming[name]),
+                            rel_tol=0.0, abs_tol=1e-9):
+            return False
+    return bool(stored.volume_is_synthetic) == bool(incoming["volume_is_synthetic"])
+
+
+def _classify_against_archive(db: Session, rows: list[dict], symbol: str,
+                              timeframe: str, now: datetime
+                              ) -> tuple[list[dict], int, int]:
+    """Split incoming rows into what must be written, and count the rest.
+
+    New bars are written at revision 0. A bar whose values changed has its
+    stored values appended to `candle_revisions` first — with the window in
+    which they were the latest known truth — and is then written at the next
+    revision. A bar whose values did not change is not written at all.
+
+    This used to be one blind upsert. Every re-import overwrote the values,
+    reset `ingested_at` to the moment of the re-import and bumped the
+    revision, so a restated bar left no trace of what it had said before,
+    and an untouched bar looked as though it had only just been learnt. A
+    replay of a 10:02 decision would then read the 10:07 correction.
+
+    Read-then-write, which is safe here for the same reason `upsert`'s
+    counting is: the importer is the table's single writer.
+    """
+    if not rows:
+        return [], 0, 0
+    stamps = [r["timestamp"] for r in rows]
+    stored = {
+        _utc(row.timestamp): row
+        for row in db.scalars(
+            select(CandleRecord).where(
+                CandleRecord.symbol == symbol,
+                CandleRecord.timeframe == timeframe,
+                CandleRecord.timestamp >= min(stamps),
+                CandleRecord.timestamp <= max(stamps)))
+    }
+
+    write: list[dict] = []
+    revised = unchanged = 0
+    for row in rows:
+        existing = stored.get(_utc(row["timestamp"]))
+        if existing is None:
+            write.append(row)
+            continue
+        if _same(existing, row):
+            unchanged += 1
+            continue
+        db.add(CandleRevision(
+            symbol=symbol, timeframe=timeframe,
+            timestamp=existing.timestamp, revision=existing.revision,
+            open=existing.open, high=existing.high, low=existing.low,
+            close=existing.close, volume=existing.volume,
+            source=existing.source,
+            volume_is_synthetic=bool(existing.volume_is_synthetic),
+            known_from=existing.ingested_at, superseded_at=now))
+        write.append(row | {"revision": int(existing.revision) + 1})
+        revised += 1
+    db.commit()
+    return write, revised, unchanged
+
+
+def _utc(moment: datetime) -> datetime:
+    """SQLite hands timestamps back naive; the archive stores UTC."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
 
 
 def import_index_candles(
@@ -117,15 +201,19 @@ def import_index_candles(
         )
     ]
 
+    rows, report.revised, report.unchanged = _classify_against_archive(
+        db, rows, symbol, timeframe, ingested_at)
+
+    # Only new and genuinely revised bars reach the write. `revision` is set
+    # per row above — the stored version plus one for a restatement, zero
+    # for a new bar — rather than bumped blindly by the statement, so the
+    # number counts restatements and nothing else.
     report.write = upsert(
         db, CandleRecord, rows,
         conflict_columns=("symbol", "timeframe", "timestamp"),
         update_columns=("open", "high", "low", "close", "volume", "source",
-                        "session_date", "ingested_at", "volume_is_synthetic"),
-        # Referencing the table column (not `excluded`) reads the row that is
-        # already there, so a restated bar is counted rather than silently
-        # replaced.
-        extra_set={"revision": CandleRecord.revision + 1},
+                        "session_date", "ingested_at", "volume_is_synthetic",
+                        "revision"),
     )
 
     report.first_ts = clean["timestamp"].min().isoformat()
@@ -200,9 +288,54 @@ def _clean_iv(raw: float | None) -> float | None:
     if raw is None:
         return None
     value = float(raw)
-    if value <= 0 or value > 300:
+    if math.isnan(value) or value <= 0 or value > 300:
         return None
     return value / 100.0
+
+
+def _recorded(record, column: str) -> float | None:
+    """A numeric field as the source sent it: a float, or None if absent.
+
+    None means unavailable and is stored as NULL. A genuine zero stays 0.0.
+    `or 0` used to collapse the two, which is how missing open interest
+    reached the archive as a recorded zero (OC-5).
+    """
+    value = getattr(record, column, None)
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(value) else value
+
+
+def _later_capture_wins(column: str):
+    """An upsert expression: take the incoming value only from a newer poll."""
+    def expression(excluded):
+        stored = getattr(OptionCandle, column)
+        return case(
+            (OptionCandle.capture_time.is_(None), getattr(excluded, column)),
+            (excluded.capture_time >= OptionCandle.capture_time,
+             getattr(excluded, column)),
+            else_=stored)
+    return expression
+
+
+def _touch(record, side: str) -> tuple[float | None, float | None,
+                                       float | None, float | None]:
+    """Bid, ask and their sizes for one side, or None for what is absent.
+
+    A quote is kept only as a coherent pair: both sides positive and the bid
+    not above the ask. A crossed or half-empty book is not a spread to trade
+    against, and storing it would let a fill be priced off it later.
+    """
+    bid = _recorded(record, f"{side}_bid")
+    ask = _recorded(record, f"{side}_ask")
+    if bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask:
+        bid = ask = None
+    return (bid, ask, _recorded(record, f"{side}_bid_qty"),
+            _recorded(record, f"{side}_ask_qty"))
 
 
 def _chain_source_time(chain: pd.DataFrame) -> datetime | None:
@@ -355,7 +488,11 @@ def import_option_snapshot(
         conflict_columns=("underlying", "expiry_date", "strike", "option_type"),
         # `first_seen` is deliberately absent: it records when this contract
         # entered the archive and must not be overwritten by a later poll.
-        update_columns=("last_seen", "lot_size", "tradingsymbol"),
+        # `lot_size` is merged, not copied: a poll from a source that does not
+        # publish lot sizes must not erase one a better source recorded.
+        update_columns=("last_seen", "tradingsymbol"),
+        extra_set={"lot_size": lambda ex: func.coalesce(
+            ex.lot_size, OptionContract.lot_size)},
     )
 
     # ---- map contracts to ids ------------------------------------------
@@ -375,12 +512,12 @@ def import_option_snapshot(
         strike = float(getattr(record, "strike", 0) or 0)
         if strike <= 0:
             continue
-        for kind, ltp_col, oi_col, oi_chg_col, vol_col, iv_col in (
-            ("CE", "call_ltp", "call_oi", "call_oi_change", "call_volume", "call_iv"),
-            ("PE", "put_ltp", "put_oi", "put_oi_change", "put_volume", "put_iv"),
+        for kind, side, ltp_col, oi_col, oi_chg_col, vol_col, iv_col in (
+            ("CE", "call", "call_ltp", "call_oi", "call_oi_change", "call_volume", "call_iv"),
+            ("PE", "put", "put_ltp", "put_oi", "put_oi_change", "put_volume", "put_iv"),
         ):
-            price = getattr(record, ltp_col, None)
-            if price is None or float(price) <= 0:
+            price = _recorded(record, ltp_col)
+            if price is None or price <= 0:
                 # An untraded strike has no last price. Storing zero would
                 # put a fictional premium in the archive, and a backtest
                 # would happily "buy" it.
@@ -391,22 +528,28 @@ def import_option_snapshot(
             if contract_id is None:
                 continue
 
-            price = float(price)
+            bid, ask, bid_size, ask_size = _touch(record, side)
             candle_rows.append({
                 "contract_id": contract_id,
                 "timeframe": timeframe,
                 "timestamp": bar_ts,
                 "open": price, "high": price, "low": price, "close": price,
-                "volume": float(getattr(record, vol_col, 0) or 0),
-                "open_interest": float(getattr(record, oi_col, 0) or 0),
-                "oi_change": float(getattr(record, oi_chg_col, 0) or 0),
-                "iv": _clean_iv(getattr(record, iv_col, None)),
-                "bid": None, "ask": None,
+                # Absent is NULL, a recorded zero is 0.0 (OC-5).
+                "volume": _recorded(record, vol_col),
+                "open_interest": _recorded(record, oi_col),
+                "oi_change": _recorded(record, oi_chg_col),
+                "iv": _clean_iv(_recorded(record, iv_col)),
+                "bid": bid, "ask": ask,
+                "bid_size": bid_size, "ask_size": ask_size,
                 "underlying_close": float(spot) if spot else None,
                 "bar_kind": "snapshot",
                 "source": source,
                 "session_date": session_date,
                 "ingested_at": now,
+                # Three clocks (OC-1). `timestamp` is only the bucket key.
+                "exchange_time": chain_time,
+                "capture_time": captured_at,
+                "first_seen": captured_at,
                 "revision": 0,
                 "samples": 1,
             })
@@ -423,9 +566,22 @@ def import_option_snapshot(
     report.candles = upsert(
         db, OptionCandle, candle_rows,
         conflict_columns=("contract_id", "timeframe", "timestamp"),
-        update_columns=("close", "volume", "open_interest", "oi_change", "iv",
-                        "underlying_close", "source", "ingested_at"),
+        # `first_seen` is deliberately absent: it is written once, when the
+        # bar is first recorded, and a later poll or a re-import must never
+        # move it. `capture_time` and `exchange_time` do move — they date
+        # the close, which each poll replaces.
+        update_columns=("source", "ingested_at"),
         extra_set={
+            # Latest capture wins, and only a later one. A re-import of an
+            # older poll used to overwrite the close and — once capture
+            # times existed — move `capture_time` backwards, making the bar
+            # look as though it had been known earlier than its newest
+            # price was (OC-1). Legacy rows with no capture time accept the
+            # first capture they are given.
+            **{column: _later_capture_wins(column) for column in (
+                "close", "volume", "open_interest", "oi_change", "iv",
+                "bid", "ask", "bid_size", "ask_size", "underlying_close",
+                "exchange_time", "capture_time")},
             "high": lambda ex: case(
                 (OptionCandle.high > ex.high, OptionCandle.high), else_=ex.high),
             "low": lambda ex: case(

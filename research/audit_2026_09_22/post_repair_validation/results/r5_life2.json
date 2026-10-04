@@ -1,0 +1,28 @@
+{
+ "time_exit_day2_morning": [
+  [
+   "time",
+   "06-02 09:45",
+   "06-02 11:50"
+  ]
+ ],
+ "signal_last_bar_day1": [],
+ "signal_1520_day1": [],
+ "signal_1455_day1": [
+  [
+   "session end",
+   "06-01 15:00",
+   "06-01 15:15"
+  ]
+ ],
+ "gapped_entry": {
+  "proposed": [
+   100,
+   99,
+   102
+  ],
+  "filled_entry": 101.5,
+  "stop_used": 100.5,
+  "target_used": 103.5
+ }
+}

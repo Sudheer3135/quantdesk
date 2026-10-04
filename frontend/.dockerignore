@@ -1,0 +1,9 @@
+# The image installs its own dependencies for Linux with `npm ci`. Without
+# this file `COPY . .` sent the host's node_modules — 87MB, built for macOS —
+# into the build context on every build and merged it over the Linux install,
+# which is why the image carried both darwin-arm64 and linux-arm64 esbuild.
+# It worked because the two happened to coexist, not because it was right.
+node_modules
+dist
+coverage
+*.log

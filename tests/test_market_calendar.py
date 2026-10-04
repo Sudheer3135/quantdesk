@@ -74,6 +74,57 @@ def test_the_gap_between_them_is_otherwise_intact():
         day += timedelta(days=1)
 
 
+# ---- the 14-Sep-2026 correction ----------------------------------------
+
+@pytest.mark.parametrize("day,name", [
+    (date(2026, 1, 15), "Maharashtra municipal elections"),
+    (date(2026, 3, 3), "Holi"),
+    (date(2026, 3, 31), "Shri Mahavir Jayanti"),
+    (date(2026, 9, 14), "Ganesh Chaturthi"),
+    (date(2026, 10, 20), "Dussehra"),
+    (date(2026, 11, 24), "Prakash Gurpurb Sri Guru Nanak Dev"),
+])
+def test_the_holidays_missing_until_14_sep_2026_are_recognised(day, name):
+    """Each was absent from the transcription.
+
+    14-Sep is the one that was felt: the desk reported the market OPEN on a
+    closed exchange, the agent wrote signals from Friday's frozen candles,
+    and a correctly silent Angel feed was reported stale all afternoon.
+    Dussehra and Prakash Gurpurb would have done the same thing again."""
+    assert is_holiday(day) is True, f"{name} on {day} should be a holiday"
+    assert is_session(day) is False
+
+
+def test_holi_2026_is_the_third_not_the_fourth():
+    """The transcription had Holi a day late. That is both failures at once:
+    a real holiday reported as a missing session, and a real session on the
+    4th rejected by validation on every import."""
+    assert is_holiday(date(2026, 3, 3)) is True
+    assert is_holiday(date(2026, 3, 4)) is False
+    assert is_session(date(2026, 3, 4)) is True
+
+
+@pytest.mark.parametrize("day", [
+    date(2026, 9, 11),   # Fri before Ganesh Chaturthi
+    date(2026, 9, 15),   # Tue after — the market reopens
+    date(2026, 10, 19),  # Mon before Dussehra
+    date(2026, 10, 21),  # Wed after
+    date(2026, 11, 23),  # Mon before Prakash Gurpurb
+    date(2026, 11, 25),  # Wed after
+])
+def test_the_sessions_around_the_new_holidays_survive(day):
+    """A careless fix widens a holiday until it swallows a real session."""
+    assert is_session(day) is True, f"{day} is a real trading session"
+
+
+def test_2026_has_the_full_published_count():
+    """Fifteen weekday closures from the annual circular, one added by a
+    later notice, plus Independence Day on a Saturday."""
+    days = HOLIDAYS[2026]
+    assert len([d for d in days if d.weekday() < 5]) == 16
+    assert len(days) == 17
+
+
 # ---- guards against a bad calendar ------------------------------------
 
 def test_weekend_dated_holidays_are_rare_and_change_nothing():

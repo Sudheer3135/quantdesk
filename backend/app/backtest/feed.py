@@ -36,7 +36,14 @@ from ..analytics import indicators
 
 log = logging.getLogger(__name__)
 
-DEFAULT_ANALYSIS_WINDOW = 300
+# The declared history every decision sees, live and in replay. Defined in
+# `analytics.warmup` so the live path and this one cannot drift apart.
+from ..analytics.warmup import ANALYSIS_HISTORY_BARS as DEFAULT_ANALYSIS_WINDOW  # noqa: E402
+
+# The three outcomes of a causality run. UNVERIFIED is not a soft PASS.
+PASS = "PASS"
+FAIL = "FAIL"
+UNVERIFIED = "UNVERIFIED"
 
 
 class LookaheadError(RuntimeError):
@@ -61,16 +68,50 @@ class CausalityReport:
     checked: int = 0
     columns: tuple[str, ...] = ()
     leaks: tuple[str, ...] = ()
+    # Columns the check could not recompute from a prefix, and therefore
+    # never compared. Reported rather than counted as clean.
+    unverifiable: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        """PASS, FAIL or UNVERIFIED — three outcomes, never two.
+
+        A check that did not run is not a check that passed. Collapsing
+        UNVERIFIED into PASS is how "we never looked at that column" gets
+        reported as "no look-ahead", which is the failure this whole class
+        exists to make impossible.
+        """
+        if self.leaks:
+            return FAIL
+        if self.unverifiable or self.checked == 0:
+            return UNVERIFIED
+        return PASS
 
     @property
     def causal(self) -> bool:
-        return not self.leaks
+        """True only on a PASS: something was checked, and all of it held."""
+        return self.status == PASS
 
     def to_dict(self) -> dict:
         return {"checked_cut_points": self.checked,
                 "columns": list(self.columns),
+                "status": self.status,
                 "causal": self.causal,
-                "leaks": list(self.leaks)}
+                "leaks": list(self.leaks),
+                "unverifiable": list(self.unverifiable)}
+
+
+def _same_value(a, b) -> bool:
+    """Equality that survives whatever column the check is handed.
+
+    The causality check discovers its columns, so it can be pointed at a
+    label or a timestamp as easily as at a float. Numbers compare within a
+    tolerance; anything else compares as itself rather than raising and
+    taking the whole check down with it.
+    """
+    if isinstance(a, (int, float, np.number)) and isinstance(b, (int, float, np.number)):
+        return bool(np.isclose(a, b, rtol=1e-9, atol=1e-9))
+    return bool(a == b)
 
 
 class HistoricalFeed:
@@ -167,7 +208,24 @@ class HistoricalFeed:
         """
         self._guard(index, "view")
         start = max(0, index + 1 - self.analysis_window)
-        return self._frame.iloc[start : index + 1]
+        window = self._frame.iloc[start : index + 1].copy()
+        window.attrs["decision_time"] = self.close_time(index).isoformat()
+        return window
+
+    def close_time(self, index: int) -> pd.Timestamp:
+        self._guard(index, "close_time")
+        return self._frame["timestamp"].iloc[index] + pd.Timedelta(minutes=5)
+
+    def can_enter(self, index: int, session_exit_minutes: int = 15 * 60 + 15) -> bool:
+        self._guard(index, "can_enter")
+        if index >= len(self) - 1:
+            return False
+        current = self.close_time(index)
+        nxt = self._frame.timestamp.iloc[index + 1]
+        # A missing bucket is not an executable next open. No overnight entry.
+        local = current.tz_convert("Asia/Kolkata")
+        return (nxt == current and local.hour * 60 + local.minute < session_exit_minutes
+                and local.hour * 60 + local.minute >= 9 * 60 + 15)
 
     def timestamp(self, index: int) -> pd.Timestamp:
         self._guard(index, "timestamp")
@@ -201,6 +259,52 @@ class HistoricalFeed:
         self._guard(index, "next_timestamp")
         return self._frame["timestamp"].iloc[index + 1]
 
+    def execution_timestamp(self, index: int, execution_index: int) -> pd.Timestamp:
+        """*When* a decision made on bar `index` would fill — no price.
+
+        Split out of `execution_open` so eligibility can be decided before
+        any price is touched. The order matters: a candidate bar that fails
+        the execution clock must be refused without its open ever being
+        read, because reading it is the causal violation. Raising afterwards
+        stops a bad number reaching the result but not the look-ahead from
+        having happened, and a test cannot tell the two apart if the only
+        accessor returns both at once.
+        """
+        self._guard(index, "execution_timestamp")
+        if execution_index <= index:
+            raise ValueError(
+                f"execution bar {execution_index} does not follow decision "
+                f"bar {index}; a fill cannot precede its own signal")
+        if execution_index >= len(self._frame):
+            raise IndexError(f"no bar at {execution_index} to execute on")
+        return self._frame["timestamp"].iloc[execution_index]
+
+    def execution_open(self, index: int, execution_index: int) -> tuple[pd.Timestamp, float]:
+        """When and at what price a decision made on bar `index` fills.
+
+        The same single number `next_open` hands over, but for a bar chosen
+        by the clock rather than by position — which is what an execution
+        latency does. With no latency `execution_index` is `index + 1` and
+        this is `next_timestamp`/`next_open` together; with latency it is
+        the first bar opening at or after the deadline, possibly several
+        bars later if the market was closed in between.
+
+        The forward reach is still exactly one open. Bars strictly between
+        the decision and the fill are skipped, not read: they existed before
+        the order did, and a fill priced from them would be a fill at a
+        price the order could never have reached.
+        """
+        stamp = self.execution_timestamp(index, execution_index)
+        return stamp, float(self._frame["open"].iloc[execution_index])
+
+    def stamps(self) -> pd.Series:
+        """The bar-open clock, for deciding which bar an order may reach.
+
+        A clock reading only — no prices — so handing it to the execution
+        layer cannot leak a bar the walk has not arrived at.
+        """
+        return self._frame["timestamp"]
+
     # ---- self-checking -------------------------------------------------
 
     def verify_causality(self, samples: int = 8, seed: int = 0) -> CausalityReport:
@@ -212,6 +316,11 @@ class HistoricalFeed:
         on bars after `i` is one that cannot be computed in real time, and a
         backtest using it is measuring hindsight.
         """
+        # Every column the enrichment added, discovered rather than listed.
+        # A fixed list checks the indicators somebody thought of on the day
+        # it was written, which is exactly the set already known to be
+        # causal — the leak this is here to catch arrives in the column
+        # nobody has added yet.
         columns = tuple(c for c in self._frame.columns
                         if c not in ("timestamp", "open", "high", "low", "close", "volume"))
         report = CausalityReport(columns=columns)
@@ -223,18 +332,31 @@ class HistoricalFeed:
         cuts = sorted(set(rng.integers(50, len(self._frame), size=samples).tolist()))
 
         leaks: set[str] = set()
+        unverifiable: set[str] = set()
         for cut in cuts:
             prefix = indicators.enrich(raw.iloc[: cut + 1])
             full_row, prefix_row = self._frame.iloc[cut], prefix.iloc[-1]
             for column in columns:
+                if column not in prefix_row.index:
+                    # Attached to the frame by something other than the
+                    # enrichment, so recomputing it from the prefix is not
+                    # possible here. Say so rather than reporting a column
+                    # as clean when it was never compared.
+                    unverifiable.add(column)
+                    continue
                 a, b = full_row[column], prefix_row[column]
                 if pd.isna(a) and pd.isna(b):
                     continue
-                if pd.isna(a) != pd.isna(b) or not np.isclose(a, b, rtol=1e-9, atol=1e-9):
+                if pd.isna(a) != pd.isna(b) or not _same_value(a, b):
                     leaks.add(column)
             report.checked += 1
 
         report.leaks = tuple(sorted(leaks))
+        report.unverifiable = tuple(sorted(unverifiable))
+        if unverifiable:
+            log.warning(
+                "columns not produced by the enrichment, so their causality "
+                "was not checked: %s", ", ".join(sorted(unverifiable)))
         if leaks:
             log.error(
                 "non-causal indicators detected: %s. Every backtest using "

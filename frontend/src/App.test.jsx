@@ -12,7 +12,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import App, { classifyAge, formatAge } from "./App.jsx";
+import App, { classifyAge, formatAge, freshnessReading, freshnessText } from "./App.jsx";
 
 /* A WebSocket the test drives by hand. */
 class FakeSocket {
@@ -251,8 +251,11 @@ describe("clock handling", () => {
 
     const serverNow = new Date(realNow).toISOString();
     await act(async () => {
+      // The connect snapshot: the server's clock rides on `market`, which is
+      // the only clock sample — a price's `at` is when it was published.
       FakeSocket.last.deliver({
-        type: "price",
+        type: "snapshot",
+        market: { open: true, session: "open", server_time: serverNow },
         price: {
           symbol: "NIFTY", price: 24_223.35, previous: 24_222, change: 1.35,
           direction: "up", source: "yahoo",
@@ -1142,5 +1145,448 @@ describe("bias and entry layers", () => {
 
     const enter = screen.getAllByText("Enter now")[0];
     expect(enter.className).toContain("entry-ENTER_NOW");
+  });
+});
+
+describe("the streamed option chain falls back when delivery stops", () => {
+  const chainFrame = (atm) => ({
+    type: "chain",
+    chain: {
+      symbol: "NIFTY", transport: "stream", live: true,
+      summary: { atm_strike: atm, pcr_oi: 0.8, max_pain: atm },
+      strikes: [{ strike: atm, call_oi: 1, put_oi: 1 }],
+      fetched_at: iso(0),
+    },
+  });
+
+  /* How many times the chain endpoint has been asked for. */
+  const chainCalls = () =>
+    fetchMock.mock.calls.filter(([u]) => String(u).includes("/market/option-chain"))
+      .length;
+
+  it("stands the poll down while chains are being pushed", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+
+    const before = chainCalls();
+    for (let i = 0; i < 18; i++) {
+      await tick(10_000);
+      await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+    }
+    expect(chainCalls()).toBe(before);
+  });
+
+  it("uses HTTP after an option-only outage and resumes push when it recovers", async () => {
+    const polled = { ...chainFrame(24_350).chain, transport: "poll" };
+    fetchMock.mockImplementation((url) => Promise.resolve({
+      ok: true, json: () => Promise.resolve(
+        String(url).includes("/market/option-chain") ? polled : {}),
+    }));
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+    const before = chainCalls();
+    await tick(10_000);
+    await act(async () => {
+      FakeSocket.last.deliver(priceFrame(24_210, 0));
+      FakeSocket.last.deliver({ type: "heartbeat", market: {
+        open: true, session: "open", server_time: iso(0),
+      } });
+    });
+    await tick(6_000);
+    expect(FakeSocket.last.readyState).toBe(1);
+    expect(chainCalls()).toBeGreaterThan(before);
+    expect(document.querySelector(".chain-ladder").textContent).toContain("24,350");
+    expect(document.querySelector(".chain-ladder").textContent).not.toContain("24,200");
+
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_400)); });
+    expect(document.querySelector(".chain-ladder").textContent).toContain("24,400");
+    const recovered = chainCalls();
+    await tick(10_000);
+    expect(chainCalls()).toBe(recovered);
+  });
+
+  it("restarts the poll when the socket degrades, instead of freezing", async () => {
+    /* The regression: nothing cleared the pushed chain, so the poll stayed
+       stood down for the life of the tab. The ladder froze at the last
+       pushed value while still rendering as live. */
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(chainFrame(24_200)); });
+
+    // Two closes: the dashboard degrades to polling on the second.
+    await act(async () => { FakeSocket.last.close(); });
+    await tick(2_000);
+    await act(async () => { FakeSocket.last?.close(); });
+    await tick(2_000);
+
+    const before = chainCalls();
+    await tick(180_000);
+    expect(chainCalls()).toBeGreaterThan(before);
+  });
+});
+
+describe("a source clock coarser than the reading drawn from it", () => {
+  /* The regression, measured live on 15-Sep-2026.
+
+     Angel rounds `exchange_timestamp` to a whole second — across 167
+     consecutive index ticks not one carried a sub-second digit. The pill
+     aged the price against that stamp and repainted once a second, which
+     beats two 1-second grids against each other: the reading sawtoothed
+     through a full second of phantom age and the badge alternated
+     "just now" / "1s ago" / "just now" on consecutive seconds.
+
+     Nothing was wrong with the feed. It was 97ms between ticks, zero
+     reconnects, zero fallbacks, zero forced reconnects, for the whole
+     window. The flicker was arithmetic, and the desk owner read it as a
+     latency fault three separate times.
+
+     The age now comes from `received_at`, which this process stamps
+     itself at microsecond resolution. These two tests hold that line from
+     both sides: the reading must not move on a steady feed, and it must
+     still break when the feed is genuinely bad. */
+
+  /* What a vendor that rounds to the second does to a fine instant. */
+  const toWholeSecond = (ms) =>
+    new Date(Math.floor(ms / 1000) * 1000).toISOString();
+
+  const frame = (receivedMs, { sourceMs = receivedMs } = {}) => ({
+    type: "price",
+    price: {
+      symbol: "NIFTY", price: 23_220.7, previous: 23_220.6, change: 0.1,
+      direction: "up", source: "angel", transport: "stream",
+      source_time: toWholeSecond(sourceMs),
+      received_at: new Date(receivedMs).toISOString(),
+      at: new Date(receivedMs).toISOString(),
+      source_time_quantum_ms: 1000,
+      market_open: true,
+    },
+  });
+
+  async function mountOpen(startMs) {
+    vi.setSystemTime(new Date(startMs));
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver({
+        type: "heartbeat",
+        market: {
+          open: true, session: "open",
+          server_time: new Date(startMs).toISOString(),
+        },
+      });
+    });
+  }
+
+  it("holds one steady reading while the rounding sweeps a whole second", async () => {
+    /* Deliberately started off a second boundary and delivered on a
+       cadence that does not divide a second, so the repaint drifts
+       through every phase of the vendor's rounding rather than sitting
+       at one convenient offset — which is what the live desk does and
+       what makes the old arithmetic flicker. */
+    await mountOpen(Date.parse("2026-09-15T14:38:36.400+05:30"));
+
+    const read = () =>
+      document.querySelector(".data-age-value").textContent;
+    const seen = new Set();
+
+    /* Twenty seconds of a feed that never misses a beat: a tick every
+       300ms, each one landing while still young. The transit time sweeps
+       the full second so no single phase can flatter the result. */
+    const transit = [60, 310, 520, 780, 940];
+    for (let step = 0; step < 66; step += 1) {
+      await tick(300);
+      await act(async () => {
+        FakeSocket.last.deliver(
+          frame(Date.now() - transit[step % transit.length]));
+      });
+      seen.add(read());
+    }
+
+    expect([...seen]).toEqual(["just now"]);
+  });
+
+  it("still goes stale when the feed pushes but the prints are old", async () => {
+    /* The failure the coarse stamp was guarding against, and the reason
+       the alarm is not simply moved onto `received_at`. Angel keeps the
+       socket busy and keeps handing us ticks, so "time since anything
+       arrived" stays at zero — but every print is a minute and a half
+       behind the market. Reading only `received_at` would call that live.
+       The classification takes the worse of the two readings, so it does
+       not. */
+    const start = Date.parse("2026-09-15T14:38:36.400+05:30");
+    await mountOpen(start);
+
+    for (let step = 0; step < 4; step += 1) {
+      await tick(1_000);
+      const now = Date.now();
+      await act(async () => {
+        // Arrived just now; printed 90 seconds ago.
+        FakeSocket.last.deliver(frame(now - 80, { sourceMs: now - 90_000 }));
+      });
+    }
+
+    expect(document.querySelector(".data-age").className)
+      .toContain("age-stale");
+  });
+});
+
+describe("layout density", () => {
+  /* The split-pane system exists so related readings stay comparable and
+     the desk fits more on one screen. A system that is defined in CSS
+     and never applied is just dead weight, so this pins that at least
+     the session panel uses it and that both halves survive. */
+  it("splits the session panel into two panes rather than stacking", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver(priceFrame(24_231.85, 1));
+    });
+
+    const panel = document.querySelector(".session-panel");
+    expect(panel.classList.contains("split")).toBe(true);
+    expect(panel.querySelectorAll(".pane").length).toBe(2);
+
+    // and both readings are still present, not lost in the reflow
+    expect(panel.querySelector(".data-age")).toBeTruthy();
+    expect(panel.textContent).toMatch(/current price/i);
+  });
+});
+
+
+/* Two separate questions, two separate pills. The transport pill answers "is
+   this browser connected to the desk?"; the freshness pill answers "how old is
+   the latest NIFTY tick?". A socket can be perfectly connected while the feed
+   behind it has gone quiet, and the freshness pill must say so on its own
+   evidence. The 15s / 60s lines are the backend's LIVE_SECONDS /
+   DELAYED_SECONDS, mirrored here and pinned by tests/test_freshness_contract.py. */
+describe("connection status and data freshness are separate readings", () => {
+  /* A tick as the Angel stream publishes it: received by the desk just now,
+     printed by the exchange `lagSeconds` earlier. */
+  const streamTick = (price, lagSeconds = 0.5) => ({
+    type: "price",
+    price: {
+      symbol: "NIFTY", price, previous: price - 1, change: 1,
+      direction: "up", source: "angel", transport: "stream",
+      source_time: iso(lagSeconds), received_at: iso(0), at: iso(0),
+      age_seconds: lagSeconds, freshness: "live", market_open: true,
+    },
+    market: { open: true, session: "open", server_time: iso(0) },
+  });
+  const freshnessPill = () => screen.getByTitle(/age of the latest nifty tick/i);
+  const transportPill = () => screen.getByTitle(/connection to the quantdesk backend/i);
+
+  async function connectedWithTick() {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(streamTick(24_223.35)); });
+  }
+
+  it("a fresh tick reads live on both pills, which do not share a word", async () => {
+    await connectedWithTick();
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+    expect(transportPill().textContent).toMatch(/^connected$/i);
+    expect(transportPill().textContent).not.toMatch(/live/i);
+  });
+
+  it("the age climbs with time when no tick arrives, and crosses the existing lines", async () => {
+    await connectedWithTick();
+    await tick(7_000);
+    expect(freshnessPill().textContent).toMatch(/^live 7s ago$/i);
+    await tick(10_000);
+    expect(freshnessPill().textContent).toMatch(/^delayed 17s ago$/i);
+    await tick(50_000);
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 07s ago$/i);
+  });
+
+  it("a new tick resets the age and clears the alarm by itself", async () => {
+    await connectedWithTick();
+    await tick(70_000);
+    expect(freshnessPill().textContent).toMatch(/^stale/i);
+    await act(async () => { FakeSocket.last.deliver(streamTick(24_230.1)); });
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+  });
+
+  it("connected but stale: the socket being up does not make the data fresh", async () => {
+    await connectedWithTick();
+    await tick(90_000);
+    for (let i = 0; i < 3; i += 1) {
+      await act(async () => {
+        FakeSocket.last.deliver({ type: "heartbeat",
+          market: { open: true, session: "open", server_time: iso(0) } });
+      });
+    }
+    expect(transportPill().textContent).toMatch(/^connected$/i);
+    expect(freshnessPill().textContent).toMatch(/^stale/i);
+  });
+
+  it("a fresh delivery of an old print is shown with the print's age, not 'just now'", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    // Received this instant, but the exchange printed it 70s ago.
+    await act(async () => { FakeSocket.last.deliver(streamTick(24_223.35, 70)); });
+    expect(freshnessPill().textContent).toMatch(/^stale print 1m 10s ago$/i);
+    expect(freshnessPill().textContent).not.toMatch(/just now/i);
+  });
+
+  it("a dropped socket reads as reconnecting at once, and the age keeps counting", async () => {
+    await connectedWithTick();
+    const first = FakeSocket.last;
+    await tick(3_000);
+    await act(async () => { first.close(); });
+    expect(transportPill().textContent).toMatch(/^reconnecting$/i);
+    expect(freshnessPill().textContent).toMatch(/^live 3s ago$/i);   // not reset, not hidden
+  });
+
+  it("reconnecting and then a new tick recovers both readings", async () => {
+    await connectedWithTick();
+    const first = FakeSocket.last;
+    await act(async () => { first.close(); });
+    await tick(1_000);                                       // the first back-off
+    const second = FakeSocket.last;
+    expect(second).not.toBe(first);
+    await act(async () => { second.open(); });
+    expect(transportPill().textContent).toMatch(/^connected$/i);
+    await act(async () => { second.deliver(streamTick(24_240.0)); });
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+  });
+
+  /* The connect snapshot as the server sends it: its own clock now, and the
+     cached price exactly as it was published `ageSeconds` ago — `at` and
+     `received_at` are that old, not current. */
+  const staleSnapshot = (ageSeconds = 70) => ({
+    type: "snapshot",
+    price: {
+      symbol: "NIFTY", price: 24_223.35, previous: 24_222.35, change: 1,
+      direction: "up", source: "angel", transport: "stream",
+      source_time: iso(ageSeconds + 0.5), received_at: iso(ageSeconds),
+      at: iso(ageSeconds), age_seconds: ageSeconds + 0.5, freshness: "stale",
+      market_open: true,
+    },
+    market: { open: true, session: "open", server_time: iso(0) },
+  });
+
+  it("a stale cached price on first connect stays stale, never 'live just now'", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(staleSnapshot(70)); });
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 10s ago$/i);
+    expect(freshnessPill().textContent).not.toMatch(/just now/i);
+    await tick(5_000);                                    // no new tick arrives
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 15s ago$/i);
+  });
+
+  it("reconnecting to the same stale cached price does not make it younger", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(staleSnapshot(70)); });
+    const first = FakeSocket.last;
+    await act(async () => { first.close(); });
+    expect(transportPill().textContent).toMatch(/^reconnecting$/i);
+    await tick(1_000);                                    // the first back-off
+    const second = FakeSocket.last;
+    expect(second).not.toBe(first);
+    await act(async () => { second.open(); });
+    // The server's clock now, and the very same cached price — now 71s old.
+    await act(async () => { second.deliver(staleSnapshot(71)); });
+    expect(transportPill().textContent).toMatch(/^connected$/i);
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 11s ago$/i);
+    expect(freshnessPill().textContent).not.toMatch(/live|just now/i);
+
+    // Only a genuinely newer tick makes the data younger.
+    await act(async () => { second.deliver(streamTick(24_240.0)); });
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+  });
+
+  /* A heartbeat the server stamped `lateSeconds` before it reached us — a
+     stalled tab, a congested link. Its delay is not clock skew. */
+  const heartbeat = (stamp) => ({
+    type: "heartbeat",
+    market: { open: true, session: "open", server_time: stamp },
+  });
+
+  it("a heartbeat that arrives 70s late does not make an unchanged price younger", async () => {
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => { FakeSocket.last.deliver(staleSnapshot(10)); });
+    expect(freshnessPill().textContent).toMatch(/^live 10s ago$/i);
+    await tick(70_000);                                   // no tick: now 80s old
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 20s ago$/i);
+
+    await act(async () => { FakeSocket.last.deliver(heartbeat(iso(70))); });
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 20s ago$/i);
+    expect(freshnessPill().textContent).not.toMatch(/live|10s ago/i);
+
+    // An on-time heartbeat changes nothing either.
+    await act(async () => { FakeSocket.last.deliver(heartbeat(iso(0))); });
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 20s ago$/i);
+
+    // A genuinely newer price does.
+    await act(async () => { FakeSocket.last.deliver(streamTick(24_240.0)); });
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+  });
+
+  it("a browser 4 minutes fast still reads correctly, and a late heartbeat still cannot rejuvenate", async () => {
+    vi.setSystemTime(new Date(Date.now() + 4 * 60 * 1000));
+    // Server-clock instants: the browser is 240s ahead of the server.
+    const server = (secondsAgo) => iso(240 + secondsAgo);
+    const price = (secondsAgo) => ({
+      symbol: "NIFTY", price: 24_223.35, previous: 24_222.35, change: 1,
+      direction: "up", source: "angel", transport: "stream",
+      source_time: server(secondsAgo + 0.5), received_at: server(secondsAgo),
+      at: server(secondsAgo), age_seconds: secondsAgo + 0.5, market_open: true,
+    });
+
+    render(<App />);
+    await act(async () => { FakeSocket.last.open(); });
+    await act(async () => {
+      FakeSocket.last.deliver({ type: "snapshot", price: price(10),
+        market: { open: true, session: "open", server_time: server(0) } });
+    });
+    expect(freshnessPill().textContent).toMatch(/^live 10s ago$/i);  // not "stale 4m"
+
+    await tick(70_000);
+    await act(async () => { FakeSocket.last.deliver(heartbeat(server(70))); });
+    expect(freshnessPill().textContent).toMatch(/^stale 1m 20s ago$/i);
+
+    await act(async () => { FakeSocket.last.deliver({ type: "price", price: price(0) }); });
+    expect(freshnessPill().textContent).toMatch(/^live just now$/i);
+  });
+
+  it("a socket that keeps failing falls back to polling and says so", async () => {
+    await connectedWithTick();
+    await act(async () => { FakeSocket.last.close(); });
+    await tick(1_000);
+    await act(async () => { FakeSocket.last.close(); });       // the retry fails too
+    expect(transportPill().textContent).toMatch(/^polling$/i);
+  });
+});
+
+
+describe("freshnessReading", () => {
+  it("shows the received age while it is the one deciding", () => {
+    expect(freshnessReading(3, 4.5)).toEqual(
+      { state: "live", alarmSeconds: 4.5, seconds: 3, basis: "received" });
+  });
+  it("shows the print's age when the print made the state worse", () => {
+    expect(freshnessReading(0.2, 70)).toEqual(
+      { state: "stale", alarmSeconds: 70, seconds: 70, basis: "print" });
+    expect(freshnessText(freshnessReading(0.2, 70), { source_time: "x" }))
+      .toBe("print 1m 10s ago");
+  });
+  it("keeps the received age when both ages land in the same state", () => {
+    expect(freshnessReading(20, 40).basis).toBe("received");
+    expect(freshnessReading(20, 40).state).toBe("delayed");
+  });
+  it("falls back to the print's age when no received time exists", () => {
+    expect(freshnessReading(null, 5)).toMatchObject({ state: "live", seconds: 5,
+                                                      basis: "print" });
+  });
+  it("reads closed out of session whatever the ages", () => {
+    expect(freshnessReading(600, 900, false).state).toBe("closed");
+  });
+  it("reads unknown when neither age exists", () => {
+    expect(freshnessReading(null, null).state).toBe("unknown");
   });
 });

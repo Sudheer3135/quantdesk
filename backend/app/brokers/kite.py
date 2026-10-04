@@ -138,15 +138,21 @@ class KiteBroker(Broker):
             strike = float(row.strike)
             entry = rows.setdefault(strike, {"strike": strike})
             side = "call" if row.instrument_type == "CE" else "put"
-            entry[f"{side}_oi"] = float(q.get("oi", 0))
-            entry[f"{side}_oi_change"] = float(
-                q.get("oi", 0) - q.get("oi_day_high", q.get("oi", 0)))
-            entry[f"{side}_volume"] = float(q.get("volume", 0))
-            entry[f"{side}_ltp"] = float(q.get("last_price", 0))
-            entry[f"{side}_iv"] = 0.0        # Kite does not publish IV; compute if you need it
+            # Absent stays absent (OC-5): NaN, not 0. A strike quoted on one
+            # side only has no OI on the other, and a zero there reads as a
+            # position nobody holds.
+            oi = q.get("oi")
+            entry[f"{side}_oi"] = float(oi) if oi is not None else float("nan")
+            entry[f"{side}_oi_change"] = (
+                float(oi - q.get("oi_day_high", oi)) if oi is not None else float("nan"))
+            volume = q.get("volume")
+            entry[f"{side}_volume"] = float(volume) if volume is not None else float("nan")
+            price = q.get("last_price")
+            entry[f"{side}_ltp"] = float(price) if price is not None else float("nan")
+            # Kite does not publish IV. Unavailable, not zero.
+            entry[f"{side}_iv"] = float("nan")
 
-        chain = pd.DataFrame(rows.values()).sort_values("strike").reset_index(drop=True)
-        return chain.fillna(0.0)
+        return pd.DataFrame(rows.values()).sort_values("strike").reset_index(drop=True)
 
     # ---- execution ------------------------------------------------------
     def place_order(self, **kwargs) -> dict:

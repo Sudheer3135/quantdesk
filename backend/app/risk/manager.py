@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from datetime import date
-from math import floor
+from datetime import UTC, date, datetime
+from math import floor, isfinite
 
 
 @dataclass
@@ -67,7 +67,8 @@ class RiskDecision:
         return asdict(self)
 
 
-def day_state_from_trades(trading_day: date, todays: Sequence, open_now: Sequence) -> DayState:
+def day_state_from_trades(trading_day: date, todays: Sequence, open_now: Sequence,
+                         *, closed_today: Sequence | None = None) -> DayState:
     """Rebuild today's risk state from the trade journal.
 
     The live API used to construct a blank DayState on every request, so
@@ -83,9 +84,19 @@ def day_state_from_trades(trading_day: date, todays: Sequence, open_now: Sequenc
     overnight occupies a slot today, and counting only today's would let it
     be ignored the morning it matters.
     """
+    # Entries drive the trade cap; exits drive realised loss and the loss
+    # streak. Callers with a persistent journal supply these independently.
+    # The fallback preserves compatibility with legacy intraday-only callers.
+    def close_time(trade):
+        stamp = getattr(trade, "closed_at", None) or getattr(trade, "created_at", None)
+        if stamp is None:
+            stamp = datetime.combine(trading_day, datetime.min.time())
+        return stamp.replace(tzinfo=UTC) if stamp.tzinfo is None else stamp
+
     closed = sorted(
-        (t for t in todays if getattr(t, "status", None) == "closed"),
-        key=lambda t: getattr(t, "created_at", None) or trading_day,
+        (t for t in (todays if closed_today is None else closed_today)
+         if getattr(t, "status", None) == "closed"),
+        key=close_time,
     )
 
     realised = sum((getattr(t, "pnl", None) or 0.0) for t in closed)
@@ -120,6 +131,13 @@ def evaluate(
 ) -> RiskDecision:
     """Decide whether this trade may be taken, and for how many units."""
     reasons: list[str] = []
+    if not all(isfinite(v) for v in (entry, stop_loss, target, config.capital,
+                                    config.risk_per_trade_pct)):
+        return RiskDecision(False, ["Non-finite price or risk configuration."])
+    if config.capital <= 0 or config.risk_per_trade_pct <= 0 or config.lot_size <= 0:
+        return RiskDecision(False, ["Capital, risk budget and lot size must be positive."])
+    if entry <= 0 or stop_loss < 0 or target < 0 or (entry-stop_loss)*(target-entry) <= 0:
+        return RiskDecision(False, ["Stop and target must bracket a positive entry."])
 
     if config.kill_switch:
         return RiskDecision(False, ["Kill switch is on — no new entries."])
@@ -145,12 +163,27 @@ def evaluate(
         return RiskDecision(False, reasons)
 
     rr = reward_per_unit / risk_per_unit
-    # Compare with a tolerance. Entry, stop and target are rounded to two
-    # decimals upstream, so an intended 1:2 often lands at 1.9999999 and a
-    # bare `<` would reject a trade that meets the rule exactly.
-    if rr < config.min_risk_reward - 1e-6:
+    # Compare with a tolerance sized to the rounding that actually happens.
+    #
+    # The signal engine rounds the stop and the target to two decimals but
+    # leaves the entry at the raw price, so a trade built as exactly 1:2
+    # lands a little either side of it. The tolerance here used to be 1e-6,
+    # on the belief that all three levels were rounded and the error was
+    # float noise. It is not: each rounded level can move by up to 0.005,
+    # which on a 25-point stop is an RR error near 0.0006 — six hundred times
+    # the old tolerance. Measured across the signal table on 14-Sep-2026, 37
+    # of 630 trade signals were refused as "1:2.00, below the 1:2.0 floor",
+    # every one between 1.99936 and 1.99996.
+    #
+    # So the allowance is the most that rounding can move this trade's RR,
+    # doubled for margin — and no more. It shrinks as the stop widens, so a
+    # trade genuinely short of the floor is still refused.
+    rounding = 0.01 * (1 + rr) / risk_per_unit
+    if rr < config.min_risk_reward - max(rounding, 1e-6):
         reasons.append(
-            f"Reward:risk is 1:{rr:.2f}, below the "
+            # Three decimals: at two, a refused 1.999 prints as "1:2.00" and
+            # the reason contradicts itself.
+            f"Reward:risk is 1:{rr:.3f}, below the "
             f"1:{config.min_risk_reward:.1f} floor."
         )
 
@@ -201,7 +234,10 @@ def evaluate(
                     f"Size cut to {quantity} so premium outlay stays under "
                     f"{config.max_capital_deployed_pct}% of capital."
                 )
-                risk_amount = risk_per_unit * quantity
+
+    # Lot rounding and the deployment cap both change the actual stop risk.
+    # Keep the budget for sizing above, but report the sized position here.
+    risk_amount = risk_per_unit * quantity
 
     if reasons:
         return RiskDecision(False, reasons, quantity, lots,
@@ -210,7 +246,7 @@ def evaluate(
     return RiskDecision(
         approved=True,
         reasons=[
-            f"Risking {config.risk_per_trade_pct}% ({risk_amount:.0f}) at "
+            f"Risking {risk_amount / config.capital * 100:.2f}% ({risk_amount:.0f}) at "
             f"{risk_per_unit:.2f} per unit.",
             f"Reward:risk 1:{rr:.2f}.",
             f"Trade {state.trades_taken + 1} of {config.max_trades_per_day} today.",

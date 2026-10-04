@@ -134,7 +134,12 @@ def _trend_reading(frame: pd.DataFrame, label: str) -> Reading:
                        available=False)
     enriched = indicators.enrich(frame)
     check = signal_engine.check_trend(enriched.iloc[-1])
-    return Reading(f"trend_{label}", check.score, f"{label}: {check.reason}")
+    # A check that could not run is left out of the bias, not counted as a
+    # zero. An hourly frame built from the declared 300 five-minute bars
+    # holds about 25 bars — short of the 50 an EMA50 needs — and its EMA50
+    # used to be a number seeded from the first close and read as a trend.
+    return Reading(f"trend_{label}", check.score, f"{label}: {check.reason}",
+                   available=not check.disabled)
 
 
 def _vwap_reading(frame: pd.DataFrame, label: str) -> Reading:
@@ -156,9 +161,16 @@ def _option_reading(summary: options.ChainSummary | None) -> Reading:
         return Reading("options", 0.0,
                        "No option chain available, so positioning is not part "
                        "of this bias.", available=False)
+    if not summary.oi_available:
+        return Reading("options", 0.0,
+                       "Option-chain open interest is unavailable, so "
+                       "positioning is not part of this bias.", available=False)
+    pcr = (f"PCR {summary.pcr_oi:.2f}" if summary.pcr_oi is not None
+           else "PCR unavailable")
+    pain = (f"max pain {summary.max_pain:.0f}" if summary.max_pain is not None
+            else "max pain unavailable")
     return Reading("options", _direction(summary.bias),
-                   f"Chain reads {summary.bias} "
-                   f"(PCR {summary.pcr_oi:.2f}, max pain {summary.max_pain:.0f}).")
+                   f"Chain reads {summary.bias} ({pcr}, {pain}).")
 
 
 def read_bias(candles: pd.DataFrame,
@@ -515,7 +527,16 @@ def build(candles: pd.DataFrame, symbol: str = "NIFTY", timeframe: str = "5m",
     prefix of the archive therefore reproduces exactly what the desk would
     have said at that bar, which is what makes replaying the old signals
     against it legitimate.
+
+    The bar still forming is dropped here rather than trusted to the
+    caller. The folds held back an incomplete *fold*, but the base frame's
+    own last bar went straight into the bias and entry readings: injecting
+    one changed 17 of 25 sampled plans while leaving the signal untouched.
+    `decision_time` on the frame says when the plan is being made; without
+    it the plan is being made now.
     """
+    decision_time = candles.attrs.get("decision_time", pd.Timestamp.now(tz="UTC"))
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
     frame = indicators.validate(candles)
     if frame.empty:
         raise ValueError("cannot build a plan from an empty candle frame")
@@ -525,7 +546,9 @@ def build(candles: pd.DataFrame, symbol: str = "NIFTY", timeframe: str = "5m",
         chain_summary = options.summarise(chain, price)
 
     bias = read_bias(frame, chain_summary)
-    verdict = regime.classify_latest(frame)
+    # Already filtered above; the clock is passed anyway so the regime
+    # reading is bound to the same decision instant rather than to now.
+    verdict = regime.classify_latest(frame, as_of=decision_time, timeframe=timeframe)
     entry = read_entry(frame, bias, verdict)
 
     return Plan(symbol=symbol, timeframe=timeframe,

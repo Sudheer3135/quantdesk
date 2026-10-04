@@ -126,7 +126,7 @@ def test_a_stored_spread_is_used_and_labelled_as_measured():
     model = SlippageModel(spread_fraction=0.5)
     fill = buy_fill(100.0, model, bid=99.0, ask=101.0)
     assert fill.slippage == pytest.approx(1.0)
-    assert fill.basis == "measured_spread"
+    assert fill.basis == "quoted_touch_estimated_impact"
 
 
 def test_a_missing_spread_falls_back_to_ticks_and_says_so():
@@ -134,14 +134,14 @@ def test_a_missing_spread_falls_back_to_ticks_and_says_so():
     and it must not be mistaken for a measurement."""
     fill = buy_fill(100.0, SlippageModel(ticks=2, tick_size=0.05))
     assert fill.slippage == pytest.approx(0.10)
-    assert fill.basis == "assumed_ticks"
+    assert fill.basis == "estimated_ltp_slippage"
 
 
 def test_a_crossed_or_absurd_quote_falls_back_rather_than_trusting_it():
     """A bid above the ask is a stale or broken quote. Using it would
     produce negative slippage — a fill better than the market."""
     fill = buy_fill(100.0, SlippageModel(), bid=105.0, ask=95.0)
-    assert fill.basis == "assumed_ticks"
+    assert fill.basis == "estimated_ltp_slippage"
     assert fill.slippage > 0
 
 
