@@ -1,0 +1,26 @@
+# QuantDesk's PostgreSQL 16 — the user-owned cluster scripts/native/env.sh
+# names on Linux (~/.quantdesk/postgresql@16, :5433, loopback only), run in
+# the foreground under systemd. The distribution's own cluster (16/main on
+# :5432) is a different cluster and stays disabled.
+# Paths are the Azure host's: user azureuser, repo /home/azureuser/quantdesk.
+[Unit]
+Description=QuantDesk PostgreSQL 16 (user cluster on :5433)
+After=network.target
+
+[Service]
+Type=notify
+User=azureuser
+Group=azureuser
+Environment=LC_ALL=en_US.UTF-8
+ExecStart=/usr/lib/postgresql/16/bin/postgres -D /home/azureuser/.quantdesk/postgresql@16
+ExecReload=/bin/kill -HUP $MAINPID
+# SIGINT is PostgreSQL's "fast" shutdown: open transactions roll back,
+# everything committed is on disk.
+KillMode=mixed
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

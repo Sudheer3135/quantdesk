@@ -1,0 +1,15 @@
+# /etc/logrotate.d/quantdesk on the Azure host. copytruncate because the
+# services write through systemd's append: file handles, which are opened
+# O_APPEND and so carry on at the start of the truncated file.
+/home/azureuser/quantdesk/logs/native/backend.log
+/home/azureuser/quantdesk/logs/native/frontend.log {
+    su azureuser azureuser
+    daily
+    maxsize 50M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -12,6 +12,7 @@
 # between those two steps (see env.sh).
 set -uo pipefail
 source "$(dirname "$0")/native/env.sh"
+refuse_if_systemd_managed
 lifecycle_lock ./scripts/stop.sh || exit 1
 
 stop_server() {  # name, port, pidfile

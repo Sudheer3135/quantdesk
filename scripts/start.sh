@@ -3,6 +3,7 @@
 # Safe to run twice — anything already running is left alone.
 set -euo pipefail
 source "$(dirname "$0")/native/env.sh"
+refuse_if_systemd_managed
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 # Held until this script exits; stop.sh holds the same lock (see env.sh).
 lifecycle_lock ./scripts/start.sh || exit 1

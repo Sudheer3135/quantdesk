@@ -4,8 +4,21 @@
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-PG_BIN="/opt/homebrew/opt/postgresql@16/bin"
-PG_DATA="/opt/homebrew/var/postgresql@16"
+# The scripts own one PostgreSQL 16 cluster with pg_ctl, as the user who runs
+# them. On the Mac that is Homebrew's. On Linux it is a cluster this user
+# created with initdb under ~/.quantdesk — never the distribution's own
+# cluster, which belongs to the `postgres` user and its service manager and
+# is left alone. QUANTDESK_PG_BIN / QUANTDESK_PG_DATA name another location.
+case "$(uname -s)" in
+  Linux)
+    PG_BIN="${QUANTDESK_PG_BIN:-/usr/lib/postgresql/16/bin}"
+    PG_DATA="${QUANTDESK_PG_DATA:-$HOME/.quantdesk/postgresql@16}"
+    ;;
+  *)
+    PG_BIN="${QUANTDESK_PG_BIN:-/opt/homebrew/opt/postgresql@16/bin}"
+    PG_DATA="${QUANTDESK_PG_DATA:-/opt/homebrew/var/postgresql@16}"
+    ;;
+esac
 PG_PORT=5433            # 5432 belongs to the separately installed PostgreSQL 17
 
 REDIS_PORT=6379
@@ -33,7 +46,34 @@ API_STOP_FALLBACK=300
 export DATABASE_URL="postgresql+psycopg://quant:quant@localhost:${PG_PORT}/quantdesk"
 export REDIS_URL="redis://localhost:${REDIS_PORT}/0"
 
+# A deliberate other target — a scratch database for a test VM or a trial
+# migration — is named with QUANTDESK_DATABASE_URL / QUANTDESK_REDIS_URL and
+# then wins over the two lines above. A plain DATABASE_URL or REDIS_URL in the
+# calling shell never does: these scripts always replace those, so a scratch
+# run cannot quietly fall back to the desk's database by a typo in a name.
+# NATIVE_DATABASE_URL keeps the desk's own target, so migrate.sh can refuse
+# an "override" that is really the desk's database.
+NATIVE_DATABASE_URL="$DATABASE_URL"
+if [ -n "${QUANTDESK_DATABASE_URL:-}" ]; then export DATABASE_URL="$QUANTDESK_DATABASE_URL"; fi
+if [ -n "${QUANTDESK_REDIS_URL:-}" ]; then export REDIS_URL="$QUANTDESK_REDIS_URL"; fi
+
 port_busy() { nc -z 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+# On a host where systemd supervises QuantDesk (scripts/native/systemd, the
+# Azure VM), start.sh would launch a second, unsupervised API beside the
+# supervised one, and stop.sh would stop services systemd then restarts.
+# Both refuse there; systemctl is that host's interface. Never true on the Mac.
+systemd_managed() {
+  command -v systemctl >/dev/null 2>&1 &&
+    systemctl is-enabled --quiet quantdesk-api.service 2>/dev/null
+}
+refuse_if_systemd_managed() {
+  if systemd_managed; then
+    echo "QuantDesk is supervised by systemd on this host — use:"
+    echo "  sudo systemctl start|stop|restart quantdesk-api   (status: systemctl status 'quantdesk-*')"
+    exit 1
+  fi
+}
 
 # The process listening on a port — the server itself, not whatever shell
 # launched it. Recording the launcher's pid was a real bug: stop.sh reported

@@ -1,0 +1,18 @@
+# The dashboard (Vite on 127.0.0.1:5173), reached only through an SSH tunnel.
+[Unit]
+Description=QuantDesk dashboard (Vite, loopback only)
+After=quantdesk-api.service
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/quantdesk
+ExecStart=/home/azureuser/quantdesk/scripts/native/run_web.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/azureuser/quantdesk/logs/native/frontend.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

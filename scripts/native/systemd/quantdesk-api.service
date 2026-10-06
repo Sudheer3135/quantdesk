@@ -1,0 +1,34 @@
+# The QuantDesk API: ONE process holding the scheduler, the Angel feed, the
+# option stream and the paper engine. Never more than one — no uvicorn
+# --workers, and run_api.sh refuses if any QuantDesk API is already alive.
+# start.sh/stop.sh refuse on a host where this unit is enabled.
+[Unit]
+Description=QuantDesk API (scheduler, Angel feed, paper engine)
+Requires=quantdesk-postgres.service quantdesk-redis.service
+After=quantdesk-postgres.service quantdesk-redis.service network-online.target time-sync.target
+Wants=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/quantdesk
+Environment=TZ=Asia/Kolkata
+# Must be >= app.shutdown_policy's deadline (145 s by default); run_api.sh
+# refuses to start if the policy would not fit.
+Environment=QUANTDESK_SUPERVISOR_STOP_SECONDS=300
+ExecStart=/home/azureuser/quantdesk/scripts/native/run_api.sh
+# SIGTERM once, to uvicorn only, then the whole drain deadline. Never
+# SIGINT: it makes uvicorn skip the lifespan shutdown (the writer drain).
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/home/azureuser/quantdesk/logs/native/backend.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
