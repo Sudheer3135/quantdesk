@@ -721,6 +721,12 @@ def test_the_vendor_socket_is_built_with_a_bound_on_silence(monkeypatch):
     assert recorded["default_timeout"] == SOCKET_TIMEOUT_SECONDS
     # websocket-client refuses a ping_timeout at or above the interval.
     assert PING_TIMEOUT_SECONDS < FakeSmartSocket.HEART_BEAT_INTERVAL
+    # The handshake carries the JWT, API key and feed token. The vendor's
+    # connect() passes CERT_NONE; this one must verify chain and hostname.
+    import certifi
+    assert recorded["sslopt"] == {"cert_reqs": _ssl.CERT_REQUIRED,
+                                  "ca_certs": certifi.where(),
+                                  "check_hostname": True}
 
 
 def test_a_stalled_socket_is_never_kicked_outside_market_hours(monkeypatch):

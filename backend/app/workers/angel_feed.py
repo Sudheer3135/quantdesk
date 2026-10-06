@@ -984,6 +984,7 @@ def _build_socket(session):
     try:
         import ssl
 
+        import certifi
         import websocket
         from SmartApi.smartWebSocketV2 import SmartWebSocketV2
     except ImportError as exc:            # pragma: no cover - packaging
@@ -1010,9 +1011,16 @@ def _build_socket(session):
                 on_open=self._on_open, on_error=self._on_error,
                 on_close=self._on_close, on_data=self._on_data,
                 on_ping=self._on_ping, on_pong=self._on_pong)
-            # The vendor call, plus the one argument it omits.
+            # The vendor call, plus the one argument it omits — and minus its
+            # CERT_NONE. The handshake carries the session's JWT, API key and
+            # feed token, so the server is verified as the REST login's is:
+            # against certifi's bundle (requests' own), hostname checked.
+            # certifi rather than the system store, which the python.org Mac
+            # build leaves empty.
             self.wsapp.run_forever(
-                sslopt={"cert_reqs": ssl.CERT_NONE},
+                sslopt={"cert_reqs": ssl.CERT_REQUIRED,
+                        "ca_certs": certifi.where(),
+                        "check_hostname": True},
                 ping_interval=self.HEART_BEAT_INTERVAL,
                 ping_timeout=PING_TIMEOUT_SECONDS)
 
