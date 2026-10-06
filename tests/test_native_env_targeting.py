@@ -295,3 +295,14 @@ def test_the_units_keep_the_ports_and_loopback_env_sh_names(tmp_path):
     assert (pg, api, web) == ("5433", "8000", "5173")
     assert "--host 127.0.0.1" in RUN_API.read_text()
     assert "--host 127.0.0.1" in (ROOT / "scripts" / "native" / "run_web.sh").read_text()
+
+
+@pytest.mark.parametrize("unit", ["quantdesk-api.service", "quantdesk-web.service"])
+def test_each_unit_hands_its_log_to_the_user_logrotate_runs_as(unit):
+    """systemd creates an append: log as root; logrotate's `su azureuser`
+    could then never truncate it, and the log would grow without bound."""
+    text = _unit(unit)
+    log = text.split("StandardOutput=append:")[1].split()[0]
+    assert f"ExecStartPre=+/usr/bin/chown azureuser:azureuser {log}" in text
+    rotated = (ROOT / "scripts" / "native" / "logrotate" / "quantdesk").read_text()
+    assert log in rotated and "su azureuser azureuser" in rotated

@@ -19,6 +19,9 @@ Environment=TZ=Asia/Kolkata
 # Must be >= app.shutdown_policy's deadline (145 s by default); run_api.sh
 # refuses to start if the policy would not fit.
 Environment=QUANTDESK_SUPERVISOR_STOP_SECONDS=300
+# systemd opens the append: log as root and would create it root-owned,
+# which logrotate (running as azureuser) then cannot truncate.
+ExecStartPre=+/usr/bin/chown azureuser:azureuser /home/azureuser/quantdesk/logs/native/backend.log
 ExecStart=/home/azureuser/quantdesk/scripts/native/run_api.sh
 # SIGTERM once, to uvicorn only, then the whole drain deadline. Never
 # SIGINT: it makes uvicorn skip the lifespan shutdown (the writer drain).
