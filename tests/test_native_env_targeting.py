@@ -306,3 +306,11 @@ def test_each_unit_hands_its_log_to_the_user_logrotate_runs_as(unit):
     assert f"ExecStartPre=+/usr/bin/chown azureuser:azureuser {log}" in text
     rotated = (ROOT / "scripts" / "native" / "logrotate" / "quantdesk").read_text()
     assert log in rotated and "su azureuser azureuser" in rotated
+
+
+def test_logind_keeps_the_database_users_shared_memory():
+    """PostgreSQL runs as a login user; logind's RemoveIPC=yes deletes its
+    shared memory when that user's last session ends."""
+    conf = (ROOT / "scripts" / "native" / "logind" / "quantdesk-removeipc.conf").read_text()
+    assert "[Login]" in conf and "\nRemoveIPC=no\n" in conf
+    assert "User=azureuser" in _unit("quantdesk-postgres.service")
