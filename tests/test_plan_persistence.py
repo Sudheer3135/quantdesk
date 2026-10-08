@@ -201,6 +201,53 @@ def test_the_signal_and_the_plan_describe_the_same_bar(monkeypatch):
     assert analysis.plan.timestamp == analysis.signal.timestamp
 
 
+def analysis_with_chain_aged(monkeypatch, age: timedelta):
+    """`build_analysis` given an NSE chain stamped the way NSE stamps it now,
+    with seconds, `age` before this moment."""
+    from app.brokers.nse import parse_option_chain
+
+    stamp = (datetime.now(IST) - age).strftime("%d-%b-%Y %H:%M:%S")
+    chain, _ = parse_option_chain({"records": {
+        "timestamp": stamp, "underlyingValue": 24_000.0,
+        "expiryDates": ["02-Jul-2026"],
+        "data": [{"strikePrice": strike, "expiryDate": "02-Jul-2026",
+                  "CE": {"lastPrice": 100.0, "openInterest": 1000},
+                  "PE": {"lastPrice": 100.0, "openInterest": 1500}}
+                 for strike in range(23_800, 24_250, 50)],
+    }})
+    frame = candles()
+
+    class Broker:
+        def candles(self, *a, **k):
+            return frame
+
+        def option_chain(self, *a, **k):
+            return chain
+
+        def india_vix(self):
+            return None
+
+    monkeypatch.setattr(signals_api, "get_broker", lambda: Broker())
+    return signals_api.build_analysis("NIFTY", "5m")
+
+
+def test_a_fresh_seconds_stamped_chain_reaches_the_engine(monkeypatch):
+    """NSE's chain stamp carries seconds. Read as minutes only it parsed to
+    None, the freshness rule discarded every chain as undated, and the
+    option-chain check ran disabled on every signal."""
+    context = analysis_with_chain_aged(monkeypatch, timedelta(seconds=90)).signal.context
+
+    assert context["option_chain"] is not None
+    assert "option_chain" not in context["disabled_checks"]
+
+
+def test_a_stale_seconds_stamped_chain_is_still_discarded(monkeypatch):
+    context = analysis_with_chain_aged(monkeypatch, timedelta(minutes=10)).signal.context
+
+    assert context["option_chain"] is None
+    assert "option_chain" in context["disabled_checks"]
+
+
 def test_build_signal_still_returns_just_the_signal(monkeypatch):
     """Plenty of callers only want the verdict."""
     monkeypatch.setattr(signals_api, "build_analysis",

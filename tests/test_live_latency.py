@@ -238,7 +238,17 @@ def test_age_is_computed_from_absolute_instants_across_timezones():
     assert (as_utc - datetime(2026, 8, 20, 5, 4, tzinfo=UTC)).total_seconds() == 0
 
 
-@pytest.mark.parametrize("raw", [None, "", "not a date", "20-Foo-2026 10:34"])
+def test_a_seconds_stamp_is_read_with_its_seconds():
+    """NSE's option chain is stamped `08-Oct-2026 15:40:00`. Read as minutes
+    only it parsed to None, and every chain was discarded as undated."""
+    from app.brokers.nse import parse_nse_timestamp
+
+    assert parse_nse_timestamp("08-Oct-2026 15:40:27") == "2026-10-08T10:10:27+00:00"
+    assert parse_nse_timestamp(" 08-Oct-2026 15:40:00 ") == "2026-10-08T10:10:00+00:00"
+
+
+@pytest.mark.parametrize("raw", [None, "", "not a date", "20-Foo-2026 10:34",
+                                 "08-Oct-2026 15:40:61"])
 def test_unparseable_source_timestamps_degrade_to_unknown(raw):
     """A malformed stamp must not crash the ticker or be silently coerced
     into `now`, which would mark unusable data as perfectly fresh."""

@@ -186,6 +186,46 @@ def test_a_payload_with_no_timestamp_parses_to_none():
     assert parsed.attrs["source_time"] is None
 
 
+def seconds_stamped(timestamp: str) -> pd.DataFrame:
+    """A chain parsed from NSE's current shape, whose stamp carries seconds.
+
+    Read as minutes only, that stamp parsed to None: the archive filed every
+    snapshot without an exchange time and the replay check below never ran.
+    """
+    parsed, _ = parse_option_chain({"records": {
+        "timestamp": timestamp, "underlyingValue": 24_050.0,
+        "expiryDates": ["02-Jul-2026"],
+        "data": [{"strikePrice": 24_000, "expiryDate": "02-Jul-2026",
+                  "CE": {"lastPrice": 180.0, "openInterest": 1000},
+                  "PE": {"lastPrice": 90.0, "openInterest": 1500}}],
+    }})
+    return parsed
+
+
+def test_a_seconds_stamped_chain_is_archived_with_its_exchange_time(db):
+    captured = ist(PREVIOUS_SESSION, 11, 1)
+    report = import_option_snapshot(
+        db, seconds_stamped("25-Jun-2026 11:00:27"), underlying="NIFTY",
+        expiry=EXPIRY, spot=24_050.0, source="nse", captured_at=captured,
+        timeframe="5m", lot_size=75)
+
+    assert report.refused is None, report.refused
+    stamps = {t if t.tzinfo else t.replace(tzinfo=UTC)
+              for (t,) in db.query(OptionCandle.exchange_time)}
+    assert stamps == {datetime(2026, 6, 25, 5, 30, 27, tzinfo=UTC)}
+
+
+def test_a_seconds_stamped_replay_on_a_holiday_is_refused(db):
+    report = import_option_snapshot(
+        db, seconds_stamped("25-Jun-2026 15:30:00"), underlying="NIFTY",
+        expiry=EXPIRY, spot=24_050.0, source="nse",
+        captured_at=ist(HOLIDAY, 11, 0), timeframe="5m", lot_size=75)
+
+    assert report.refused, "the replay was stored"
+    assert "2026-06-25" in report.refused
+    assert stored_bars(db) == 0
+
+
 # ---- what is already in the archive ------------------------------------
 
 def seed_bar(db, session_date: date) -> None:

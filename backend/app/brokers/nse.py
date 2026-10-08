@@ -463,27 +463,33 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
 
 
 def parse_nse_timestamp(raw: str | None) -> str | None:
-    """Turn NSE's `"20-Aug-2026 10:34"` into an absolute UTC instant.
+    """Turn NSE's `"20-Aug-2026 10:34"` or `"08-Oct-2026 15:40:00"` into an
+    absolute UTC instant.
 
-    NSE stamps its payloads in IST with minute resolution and no offset, so
-    the string alone is ambiguous the moment it crosses a timezone. Parsing
-    it here — once, next to the payload it came from — means everything
-    downstream compares absolute instants instead of re-deriving a timezone
-    from a display string.
+    NSE stamps its payloads in IST with no offset, so the string alone is
+    ambiguous the moment it crosses a timezone. Parsing it here — once, next
+    to the payload it came from — means everything downstream compares
+    absolute instants instead of re-deriving a timezone from a display
+    string.
 
-    Minute resolution is the honest limit: a price stamped 10:34 was printed
-    somewhere in that minute, so an age derived from it can be up to 60s
-    optimistic. That is a reason to prefer a source with a finer timestamp,
-    not a reason to invent precision here.
+    Both shapes are NSE's: the option chain has carried seconds since late
+    September 2026. Read as minutes only, every such chain parsed to None and
+    the signal engine discarded it as undated. A minute stamp keeps its
+    honest limit: a price stamped 10:34 was printed somewhere in that minute,
+    so an age derived from it can be up to 60s optimistic. That is a reason
+    to prefer a source with a finer timestamp, not a reason to invent
+    precision here.
     """
     if not raw:
         return None
-    try:
-        naive = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M")
-    except (ValueError, TypeError):
-        log.debug("could not parse NSE timestamp %r", raw)
-        return None
-    return naive.replace(tzinfo=IST).astimezone(UTC).isoformat()
+    for shape in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
+        try:
+            naive = datetime.strptime(raw.strip(), shape)
+        except (ValueError, TypeError):
+            continue
+        return naive.replace(tzinfo=IST).astimezone(UTC).isoformat()
+    log.debug("could not parse NSE timestamp %r", raw)
+    return None
 
 
 def parse_index_value(payload: dict, name: str) -> float | None:
