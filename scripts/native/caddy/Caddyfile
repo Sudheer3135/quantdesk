@@ -1,0 +1,165 @@
+# QuantDesk's public front door, for the Azure VM: one HTTPS site that asks
+# the owner to sign in, serves the compiled dashboard, and forwards the few
+# GET requests the dashboard makes to the API already running on
+# 127.0.0.1:8000. Installed as /etc/caddy/Caddyfile (see README.md here).
+# Written for, and tested against, the Caddy release named in CADDY_VERSION.
+#
+# Nothing else is reachable through it. PostgreSQL, Redis, the API port and
+# every route that writes, imports, migrates or runs research stay where they
+# are: on loopback, behind SSH.
+#
+# Every value that differs between hosts, and every secret, comes from the
+# environment (/etc/quantdesk/caddy.env, root-only; caddy.env.example lists
+# them). `{$NAME}` is read when the file is loaded; `{env.NAME}` is read per
+# request and so never becomes part of the loaded configuration.
+
+# Where certificates come from and where they are kept: two fixed pairs, and
+# QUANTDESK_CERTIFICATES picks one (production unless it says `staging`). Each
+# pair is one Let's Encrypt directory and one storage directory of its own, so
+# the trial's account and certificate are never in the directory production
+# reads, and clearing the trial is removing one directory that holds nothing
+# else (clear_staging_trial.sh). Naming a CA replaces Caddy's default pair
+# (Let's Encrypt, then ZeroSSL): there is no second authority to fall back to,
+# and in staging no production directory behind it. Any other value of the
+# setting names a pair that does not exist, and Caddy refuses to load.
+# certificate_authority.sh reads the result from the adapted configuration.
+(certificates-production) {
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+	storage file_system {$QUANTDESK_STORAGE_ROOT:/var/lib/caddy/quantdesk}/production
+}
+
+(certificates-staging) {
+	acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+	storage file_system {$QUANTDESK_STORAGE_ROOT:/var/lib/caddy/quantdesk}/staging-trial
+}
+
+{
+	# 80 and 443 on the VM. Overridable so the tests can run this exact file
+	# on unprivileged ports.
+	http_port {$QUANTDESK_HTTP_PORT:80}
+	https_port {$QUANTDESK_HTTPS_PORT:443}
+	# Certificates here come from a public CA; Caddy's own local CA is never
+	# a root this machine needs to trust.
+	skip_install_trust
+	import certificates-{$QUANTDESK_CERTIFICATES:production}
+	# No `debug` here, ever: it makes the reverse proxy log the address of
+	# each request it forwards, and the stream's carries the API key.
+	# README.md, "Logging", has the rule and what to do if it is broken.
+}
+
+# A hostname alone means HTTPS with an automatically obtained and renewed
+# certificate, and a redirect to it from plain HTTP.
+{$QUANTDESK_HOSTNAME} {
+	# Sign-in comes first and covers everything below: the dashboard's
+	# files, the API routes and the websocket handshake. One owner, one
+	# password, stored only as a bcrypt hash (README.md has the command).
+	basic_auth {
+		{$QUANTDESK_BASIC_USER} {$QUANTDESK_BASIC_HASH}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Caddy writes the request as the browser sent it and replaces the
+	# Authorization header's value with REDACTED, so neither the owner's
+	# password nor the API key added below reaches this file.
+	log {
+		output file {$QUANTDESK_ACCESS_LOG:/var/log/caddy/quantdesk-access.log} {
+			roll_size 20MiB
+			roll_keep 10
+		}
+	}
+
+	handle /api/* {
+		# The live stream. A browser always names the page a websocket was
+		# opened from, so a handshake from any other origin — another site
+		# riding the owner's saved sign-in — is refused, as is one that
+		# names no origin at all.
+		@stream path /api/ws/signals
+		handle @stream {
+			@foreign not header Origin https://{$QUANTDESK_HOSTNAME}
+			respond @foreign "websocket refused: not this site" 403
+
+			# The API wants its key on this socket and a browser cannot
+			# hold one safely. It is added here, to the copy of the request
+			# that goes upstream; the browser's own URL never carries it.
+			reverse_proxy {$QUANTDESK_UPSTREAM:127.0.0.1:8000} {
+				rewrite /ws/signals?key={env.QUANTDESK_API_KEY}
+				header_up -Authorization
+				header_up -X-API-Key
+			}
+		}
+
+		# `persist=true` makes the live-signal request store a signal row.
+		# A `handle` of its own, ahead of the routes: Caddy runs every
+		# `handle` before a bare `respond`, so written as one this refusal
+		# came second and the request was forwarded.
+		@persist query persist=*
+		handle @persist {
+			respond "not available here" 403
+		}
+
+		# That matcher reads the query as Caddy parses it, and a query Caddy
+		# cannot parse (`%zz=1&persist=true`) matched nothing and went through
+		# for the API to parse its own way. So the one route that has the
+		# parameter takes only a query written in plain letters, digits and
+		# `_ = & . -` — what the dashboard sends, with nothing encoded and so
+		# nothing to read two ways — and never the word itself.
+		@livequery {
+			path /api/signals/live
+			expression `{http.request.uri.query}.matches("(?i)persist|[^A-Za-z0-9_=&.-]")`
+		}
+		handle @livequery {
+			respond "not available here" 403
+		}
+
+		# What the dashboard asks for, and nothing else: each path below is
+		# a getJSON() call in frontend/src (tests/test_public_proxy.py keeps
+		# the two lists equal). GET only — which is not the same as read-only:
+		# /signals/live computes the current signal from market and broker
+		# data and, when the session is protected holdout data, the API
+		# records that it has now been shown (README.md, "What is reachable").
+		@dashboard {
+			method GET
+			path /api/signals/live /api/signals/history /api/signals/outcomes
+			path /api/market/status /api/market/price /api/market/regime
+			path /api/market/candles /api/market/candles/history
+			path /api/market/option-chain /api/market/vix
+			path /api/v2/status
+			path /api/data/quality /api/data/coverage
+			path /api/health/scheduler /api/health/feed
+			path /api/news
+		}
+		handle @dashboard {
+			uri strip_prefix /api
+			# Neither the owner's sign-in nor any key a caller supplies is
+			# forwarded: the API's write routes are not reachable from here
+			# and must not become so by a header.
+			reverse_proxy {$QUANTDESK_UPSTREAM:127.0.0.1:8000} {
+				header_up -Authorization
+				header_up -X-API-Key
+			}
+		}
+
+		# Everything else under /api — journal, backtests, imports, regime
+		# backfill, the paper close, the API's docs — does not exist here.
+		handle {
+			respond "not found" 404
+		}
+	}
+
+	# The compiled dashboard (scripts/native/build_web.sh). One page, so any
+	# other path falls back to it.
+	handle {
+		root * {$QUANTDESK_WEB_ROOT:/srv/quantdesk/web}
+		@page path / /index.html
+		header @page Cache-Control no-cache
+		try_files {path} /index.html
+		file_server
+	}
+}
