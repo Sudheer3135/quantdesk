@@ -2066,8 +2066,14 @@ def test_the_gate_drop_in_covers_every_workload_unit_and_status_shows_the_gate(t
     path.write_text(json.dumps(w.cfg))
     out = power_cli("gate", "--config", str(path), "--unit", UNITS["api"])
     assert out.returncode != 0 and "REFUSED" in out.stderr     # no state yet: fail closed
+    state = Path(w.cfg["state_root"])
+    assert not state.exists()
     shown = json.loads(power_cli("status", "--config", str(path), "--json").stdout)
     assert shown["workload_start"]["allowed"] is False
+    # Reading the status creates nothing: a missing state directory stays
+    # missing, so the gate keeps refusing for that reason on every platform.
+    assert not state.exists()
+    assert shown["transactions"] == [] and shown["unresolved"] == []
 
 
 # -- 3. package updates ----------------------------------------------------------------------------

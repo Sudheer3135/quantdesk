@@ -3121,10 +3121,22 @@ def test_medium_f_redirects_are_refused_and_responses_are_bounded(local_api):
 
 
 def test_real_probe_reads_the_checkout_without_importing_the_app():
-    probe = probes.Probe({"quantdesk_repo": str(OBSERVER.parents[2])})
-    assert re.fullmatch(r"[0-9a-f]{40}", probe.revision())
-    assert isinstance(probe.worktree_changes(), list)
-    assert "app.main" not in sys.modules
+    # In a fresh interpreter: in a full test run other tests have already
+    # imported the app into this process, which would say nothing about
+    # what the probe itself imports.
+    script = textwrap.dedent(f"""
+        import re, sys
+        sys.path.insert(0, {str(OBSERVER)!r})
+        from quantdesk_observer import probes
+        probe = probes.Probe({{"quantdesk_repo": {str(OBSERVER.parents[2])!r}}})
+        assert re.fullmatch(r"[0-9a-f]{{40}}", probe.revision())
+        assert isinstance(probe.worktree_changes(), list)
+        print(sorted(m for m in sys.modules if m == "app" or m.startswith("app.")))
+    """)
+    out = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True, text=True,
+                         timeout=60, check=False)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "[]"
 
 
 def test_probe_refuses_a_session_date_that_is_not_a_date():

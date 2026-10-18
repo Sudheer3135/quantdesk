@@ -372,6 +372,21 @@ def real_deployment_paths() -> dict:
     return found
 
 
+SYSTEM_PATH = "/usr/bin:/bin"
+
+
+def without_caddy(into: Path) -> str:
+    """The system's programs with no `caddy` among them. A machine that has
+    Caddy installed (CI installs it for the real-binary tests) would
+    otherwise lend it to a test of a machine that has none."""
+    into.mkdir()
+    for directory in SYSTEM_PATH.split(":"):
+        for entry in os.scandir(directory):
+            if entry.name != "caddy" and not (into / entry.name).exists():
+                (into / entry.name).symlink_to(entry.path)
+    return str(into)
+
+
 class Machine:
     """A stand-in for the VM, in a temporary directory: a copy of the
     repository's layout to run the installers from, and a root of its own
@@ -449,13 +464,16 @@ class Machine:
                                      "# settings\n" + "".join(f"{k}={v}\n"
                                                               for k, v in settings.items()))
         (tmp_path / "stage").mkdir()
-        self.env = {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(tmp_path),
+        system = SYSTEM_PATH if caddy is not None else without_caddy(tmp_path / "system-bin")
+        self.env = {"PATH": f"{self.bin}:{system}", "HOME": str(tmp_path),
                     "TMPDIR": str(tmp_path / "stage"), "QUANTDESK_INSTALL_ROOT": str(self.root)}
         # Every command that could reach the real machine resolves to a stand-in.
         self.systemctl_says(3, "inactive")
         for name in ("sudo", "systemctl", "pgrep", "curl", "chown", "id", "install", "mv",
                      *(["caddy"] if caddy is not None else [])):
             assert shutil.which(name, path=self.env["PATH"]) == str(self.bin / name), name
+        if caddy is None:
+            assert shutil.which("caddy", path=self.env["PATH"]) is None
 
     def state(self) -> dict:
         """Every file, directory and link under the machine's root."""
@@ -1522,6 +1540,12 @@ class Upstream:
         return [r["target"] for r in self.seen]
 
     def close(self):
+        # Linux keeps a listening socket accepting while a thread is blocked
+        # in accept() on it, even after close(); shutting it down first ends
+        # the accept. macOS refuses shutdown on a listening socket, and its
+        # close() alone is enough.
+        with contextlib.suppress(OSError):
+            self.sock.shutdown(socket.SHUT_RDWR)
         self.sock.close()
 
 

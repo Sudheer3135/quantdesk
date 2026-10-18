@@ -30,6 +30,7 @@ from quantdesk_power import config as config_module  # noqa: E402
 from quantdesk_power import (  # noqa: E402
     controller,
     facts,
+    fsafe,
     gate,
     journal,
     locks,
@@ -51,28 +52,44 @@ def real_env(cfg: dict) -> controller.Env:
         observer_lock=locks.ObserverLock, sleep=time.sleep)
 
 
-def status(cfg: dict, as_json: bool) -> int:
-    allowed, why = gate.decide(cfg, facts.boot_id)
-    state_dir = controller.open_state(cfg)
+def _recorded_transactions(cfg: dict) -> list[journal.Transaction]:
+    """The journal as it is, for reading. Never creates the state directory
+    or the journal: a missing one is missing evidence, and the gate must go
+    on refusing for that reason rather than find a fresh, empty journal."""
     try:
-        jrnl = journal.Journal(state_dir, owner=os.geteuid())
-        txns = jrnl.all()
-        now = datetime.now(UTC)
-        holds, hold_fact = facts.read_holds(cfg, now)
-        out = {
-            "workload_start": {"allowed": allowed, "reason": why},
-            "now_utc": now.isoformat(),
-            "transactions": [{"txn_id": t.txn_id, "state": t.state,
-                              "started_at_utc": t.first["at_utc"],
-                              "last_at_utc": t.records[-1]["at_utc"], "terminal": t.terminal}
-                             for t in sorted(txns, key=lambda t: t.first["at_utc"])][-20:],
-            "unresolved": [t.txn_id for t in txns if not t.terminal],
-            "holds": hold_fact.as_dict(),
-            "active_holds": [h["hold_id"] for h in holds if h["active"]],
-            "attempt_window": facts.in_window(now, cfg).as_dict(),
-        }
+        state_dir = fsafe.open_dir(cfg["state_root"], owner=os.geteuid(), private=True)
+    except FileNotFoundError:
+        return []
+    try:
+        try:
+            jrnl = journal.Journal(state_dir, owner=os.geteuid(), create=False)
+        except FileNotFoundError:
+            return []
+        try:
+            return jrnl.all()
+        finally:
+            jrnl.close()
     finally:
         state_dir.close()
+
+
+def status(cfg: dict, as_json: bool) -> int:
+    txns = _recorded_transactions(cfg)
+    now = datetime.now(UTC)
+    holds, hold_fact = facts.read_holds(cfg, now)
+    allowed, why = gate.decide(cfg, facts.boot_id)
+    out = {
+        "workload_start": {"allowed": allowed, "reason": why},
+        "now_utc": now.isoformat(),
+        "transactions": [{"txn_id": t.txn_id, "state": t.state,
+                          "started_at_utc": t.first["at_utc"],
+                          "last_at_utc": t.records[-1]["at_utc"], "terminal": t.terminal}
+                         for t in sorted(txns, key=lambda t: t.first["at_utc"])][-20:],
+        "unresolved": [t.txn_id for t in txns if not t.terminal],
+        "holds": hold_fact.as_dict(),
+        "active_holds": [h["hold_id"] for h in holds if h["active"]],
+        "attempt_window": facts.in_window(now, cfg).as_dict(),
+    }
     if as_json:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:

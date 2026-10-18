@@ -53,6 +53,19 @@ def native_url(tmp_path, env_sh=ENV_SH):
     return out.stdout
 
 
+def link_venv(tree):
+    """The project's .venv, as the scripts expect it. CI installs into the
+    runner's Python and has no .venv: there a stand-in runs the interpreter
+    running these tests."""
+    if (ROOT / ".venv" / "bin" / "python").exists():
+        (tree / ".venv").symlink_to(ROOT / ".venv")
+        return
+    (tree / ".venv" / "bin").mkdir(parents=True)
+    python = tree / ".venv" / "bin" / "python"
+    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+
+
 def scripts_tree(tmp_path):
     """migrate.sh and env.sh copied into a scratch tree whose "desk" database
     is on port 1, where nothing listens.
@@ -71,7 +84,7 @@ def scripts_tree(tmp_path):
         lines.append(line)
     (tree / "scripts" / "native" / "env.sh").write_text("".join(lines))
     (tree / "scripts" / "migrate.sh").write_text(MIGRATE_SH.read_text())
-    (tree / ".venv").symlink_to(ROOT / ".venv")
+    link_venv(tree)
     (tree / "backend").symlink_to(ROOT / "backend")
     return tree
 
@@ -250,7 +263,7 @@ def test_run_api_refuses_a_second_api_before_starting_anything(tmp_path):
     assert f"API_PORT={port}" in env_sh and env_sh.count(":1/") == 2
     (tree / "scripts" / "native" / "env.sh").write_text(env_sh)
     (tree / "scripts" / "native" / "run_api.sh").write_text(RUN_API.read_text())
-    (tree / ".venv").symlink_to(ROOT / ".venv")
+    link_venv(tree)
     (tree / "backend").symlink_to(ROOT / "backend")
     try:
         out = shell(f"HOME='{tmp_path}' bash '{tree}/scripts/native/run_api.sh'", tmp=tmp_path)
