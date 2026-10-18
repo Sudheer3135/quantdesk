@@ -1,0 +1,21 @@
+# The dashboard (Vite on 127.0.0.1:5173), reached only through an SSH tunnel.
+[Unit]
+Description=QuantDesk dashboard (Vite, loopback only)
+After=quantdesk-api.service
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/quantdesk
+# systemd opens the append: log as root and would create it root-owned,
+# which logrotate (running as azureuser) then cannot truncate.
+ExecStartPre=+/usr/bin/chown azureuser:azureuser /home/azureuser/quantdesk/logs/native/frontend.log
+ExecStart=/home/azureuser/quantdesk/scripts/native/run_web.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/azureuser/quantdesk/logs/native/frontend.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target

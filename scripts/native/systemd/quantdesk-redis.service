@@ -1,0 +1,17 @@
+# QuantDesk's Redis — the same flags start.sh uses: loopback only, no
+# persistence (caches and pub/sub only; nothing authoritative lives here).
+[Unit]
+Description=QuantDesk Redis (:6379, loopback, no persistence)
+After=network.target
+
+[Service]
+Type=notify
+User=azureuser
+Group=azureuser
+ExecStart=/usr/bin/redis-server --port 6379 --bind 127.0.0.1 --daemonize no \
+  --supervised systemd --dir /home/azureuser/.quantdesk/run --save "" --appendonly no
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

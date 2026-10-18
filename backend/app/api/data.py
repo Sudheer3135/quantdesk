@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from ..brokers.base import UnknownSymbol
 from ..config import get_settings
 from ..data import dataset as dataset_module
-from ..data import importer, quality, regime_store, repository
+from ..data import importer, quality, readiness, regime_store, repository
 from ..db import get_db
 from ..deps import get_broker
 from ..security import require_api_key
@@ -144,6 +144,34 @@ def data_quality(symbol: str = "NIFTY", timeframe: str = "5m",
     data.
     """
     return quality.report(db, symbol, timeframe, include_options=include_options)
+
+
+@router.get("/readiness")
+def research_readiness(symbol: str = "NIFTY", timeframe: str = "5m",
+                       db: Session = Depends(get_db)):
+    """Per-session research readiness: the exchange grid, restatements, and
+    option quote, bid/ask, OI, capture-clock and contract-metadata coverage.
+    Diagnostic only; nothing here reads or judges a strategy."""
+    return readiness.report(db, symbol, timeframe, underlying=symbol)
+
+
+@router.get("/methodology")
+def methodology_readiness(symbol: str = "NIFTY", timeframe: str = "5m",
+                          db: Session = Depends(get_db)):
+    """Research methodology readiness (Pass 2D): how the archive is classified,
+    whether a prospective holdout exists, the trial registry, benchmarks and
+    the MTM ledger — one status per question. Reads no strategy output."""
+    from ..data import research
+    from ..methodology import readiness as methodology
+    from ..methodology import registry
+
+    # A trusted data-quality read: the summary counts sessions and their
+    # categories, and returns no bar of any of them.
+    archive = research.load_research_candles(
+        db, symbol, timeframe, access=registry.trusted_access(registry.DATA_QUALITY))
+    option = readiness.report(db, symbol, timeframe, underlying=symbol)
+    return methodology.summary(db, archive,
+                               option_execution=option["verdicts"]["option_execution"])
 
 
 @router.get("/datasets")

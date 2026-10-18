@@ -27,11 +27,14 @@ import numpy as np
 import pandas as pd
 
 from ..analytics.indicators import (
+    GENUINE,
+    UNKNOWN,
     drop_future,
     drop_outside_session,
     drop_unclosed,
-    has_real_volume,
+    looks_like_placeholder,
     validate,
+    volume_provenance,
 )
 from ..market_calendar import is_holiday
 
@@ -165,7 +168,15 @@ def clean_candles(df: pd.DataFrame, timeframe: str) -> tuple[pd.DataFrame, Rejec
 
     out = validate(df)
     report.rows_in = len(out)
-    report.volume_is_synthetic = not has_real_volume(out)
+    # The stored flag records what is known or suspected about these rows:
+    # a source that declared a substitute, or a column that looks like one.
+    # It is a demotion only — looking plausible never clears the flag, and
+    # clearing it would not make the volume usable anyway, because that is
+    # decided by the declared provenance.
+    declared = volume_provenance(out)
+    report.volume_is_synthetic = (declared != GENUINE
+                                  if declared != UNKNOWN
+                                  else looks_like_placeholder(out))
 
     # 1-3: the existing guards, measured rather than reimplemented.
     before = len(out)

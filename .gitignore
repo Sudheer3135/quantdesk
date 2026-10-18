@@ -7,3 +7,5 @@ dist/
 *.db
 .DS_Store
 .pytest_cache/
+logs/
+var/

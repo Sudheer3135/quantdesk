@@ -1,0 +1,55 @@
+{
+  "schema": "quantdesk_healthchecks/2",
+  "note": "The four original identities, preserved. Proposed hosted configuration only: no check is created and no ping is sent by this repository. Delivery and email receipt are acceptance gates.",
+  "timezone": "Asia/Kolkata",
+  "checks": [
+    {
+      "name": "liveness",
+      "schedule_type": "oncalendar",
+      "schedule": "Mon..Fri 07:45/5\nMon..Fri 08..16:00/5",
+      "grace_seconds": 600,
+      "meaning": "the observer ran and reached out; nothing about QuantDesk",
+      "contract": {
+        "first_expected": "07:45",
+        "alert_if_first_missing_by": "07:55",
+        "last_expected": "16:55",
+        "overnight": "no expected ping after 16:55 until 07:45 the next weekday, so a deallocated VM raises no alert"
+      }
+    },
+    {
+      "name": "premarket",
+      "schedule_type": "cron",
+      "schedule": "35 8 * * 1-5",
+      "grace_seconds": 600,
+      "meaning": "readiness passed by 08:45"
+    },
+    {
+      "name": "midsession",
+      "schedule_type": "cron",
+      "schedule": "30 12 * * 1-5",
+      "grace_seconds": 900,
+      "meaning": "the 12:30 check passed by 12:45"
+    },
+    {
+      "name": "afterclose",
+      "schedule_type": "cron",
+      "schedule": "0 16 * * 1-5",
+      "grace_seconds": 1800,
+      "meaning": "completed by 16:30, no unacknowledged checkpoint, no open fault"
+    }
+  ],
+  "integrations": {
+    "email": {
+      "notify_on": [
+        "down",
+        "up"
+      ]
+    }
+  },
+  "incident_semantics": {
+    "persistence": "A delivered /fail leaves its hosted check down until a later success; it stays down overnight while the VM is deallocated.",
+    "recovery": "Only the observer's next legitimate success on the same check recovers it; no success is ever sent late or to force a recovery.",
+    "undelivered": "An undelivered current /fail blocks every shutdown (observer evidence BLOCKED), so the VM stays up and the observer keeps retrying (5-minute rounds, then hourly); the 21:30 Azure monitor reports the VM still running.",
+    "reminders": "Hosted re-notification while down: use the plan's repeat setting if available (verify at acceptance). Independently, the Azure monitor's failing runs repeat at each scheduled time while the VM is in the wrong state."
+  }
+}

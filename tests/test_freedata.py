@@ -8,6 +8,7 @@ each holding optional CE and PE blocks, with several expiries mixed in.
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -58,12 +59,22 @@ def test_parses_spot_and_nearest_expiry_only(nse_payload):
     assert list(chain["strike"]) == sorted(chain["strike"])
 
 
-def test_missing_leg_becomes_zero_not_a_crash(nse_payload):
+def test_missing_leg_is_unavailable_not_zero_and_not_a_crash(nse_payload):
+    """Rewritten in Pass 2C (OC-5). This used to assert the missing PE leg
+    became `put_oi == 0` — the zero-fill that let a one-sided chain read as
+    a put/call ratio of 0.0, a bearish vote on no data. A leg NSE did not
+    send is NaN: parsed without crashing, and not mistaken for a recorded
+    zero."""
     chain, _ = parse_option_chain(nse_payload)
     row = chain[chain["strike"] == 24_800].iloc[0]
     assert row["call_oi"] == 120_000
-    assert row["put_oi"] == 0
-    assert row["put_ltp"] == 0
+    assert pd.isna(row["put_oi"])
+    # The missing leg's price is missing too — not a zero premium. Restored
+    # in 2C.1: the 2C rewrite dropped this assertion instead of inverting it.
+    assert pd.isna(row["put_ltp"])
+    assert row["put_ltp"] != 0
+    for column in ("put_bid", "put_ask", "put_volume", "put_iv"):
+        assert pd.isna(row[column]), column
 
 
 def test_can_select_a_later_expiry(nse_payload):
@@ -328,15 +339,25 @@ def test_market_hours_has_one_definition():
     """Open and close times lived in three modules at once — the agent, the
     ticker and the stream. Three copies is three chances to disagree, and
     the first symptom would be the dashboard calling the market open while
-    the agent had already stopped for the day."""
+    the agent had already stopped for the day.
+
+    The regex also catches a bare (9, 15) / (15, 30) tuple, not only a
+    `time(9, 15)` constructor call. Both `indicators.py` and
+    `optionbuy/contracts.py` restated the session boundary as one of these
+    and slipped past a version of this guard that only looked for the
+    constructor form — an escape route this closes rather than a
+    hypothetical one."""
     import re
 
     backend = Path(__file__).resolve().parents[1] / "backend"
     offenders = []
+    pattern = re.compile(
+        r"time\(\s*9,\s*15\s*\)|time\(\s*15,\s*30\s*\)"
+        r"|[=(]\s*\(\s*9,\s*15\s*\)|[=(]\s*\(\s*15,\s*30\s*\)")
     for path in (backend / "app").rglob("*.py"):
         if path.name == "market_hours.py":
             continue
-        if re.search(r"time\(9,\s*15\)|time\(15,\s*30\)", path.read_text()):
+        if pattern.search(path.read_text()):
             offenders.append(path.name)
     assert not offenders, f"market hours redefined in: {offenders}"
 

@@ -1,0 +1,45 @@
+# One short-lived, read-only observer run: premarket, midsession, afterclose
+# or liveness.
+# It writes a report under /var/lib/quantdesk-observer and exits. It never
+# starts, stops or restarts anything; there is deliberately no Restart=.
+#
+# NOT INSTALLED. The account below, its read access to the QuantDesk checkout
+# and its database login are provisioning decisions that need their own
+# review — see README.md, "Before installation".
+[Unit]
+Description=QuantDesk operational observer (%i, read-only)
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+User=quantdesk-observer
+Group=quantdesk-observer
+SupplementaryGroups=adm
+Environment=TZ=Asia/Kolkata
+# libpq connection settings only (PGSERVICE, PGSERVICEFILE, PGPASSFILE).
+EnvironmentFile=-/etc/quantdesk-observer/observer.env
+# The service reads its configuration, the operator records (approvals,
+# acknowledgments, maintenance) and the ping credentials under
+# /etc/quantdesk-observer. ProtectSystem=strict leaves all of /etc read-only
+# to it, and the operator directories are not owned by this account, so the
+# service can read an operator record and cannot write one.
+ReadOnlyPaths=/etc/quantdesk-observer
+ExecStart=/usr/bin/python3 -I /opt/quantdesk-observer/observer.py %i --config /etc/quantdesk-observer/observer.json
+# The longest run is after-close, limited by its own 16:30 deadline. Each run
+# also limits itself and holds one lock, so runs cannot overlap or linger.
+TimeoutStartSec=1860
+StateDirectory=quantdesk-observer
+StateDirectoryMode=0750
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/quantdesk-observer
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+CPUWeight=20
+Nice=10

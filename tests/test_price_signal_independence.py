@@ -21,7 +21,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from app.workers import ticker
+from app.workers import prices, ticker
 from test_live_latency import FakeRedis, StubBroker
 
 
@@ -30,9 +30,12 @@ def rig(monkeypatch):
     broker = StubBroker()
     redis = FakeRedis()
     monkeypatch.setattr(ticker, "get_broker", lambda: broker)
-    monkeypatch.setattr(ticker, "publish", redis.publish)
+    # The publish seam lives in `workers.prices` now: the Angel feed
+    # and the poller share one publisher so their payloads cannot
+    # drift apart.
+    monkeypatch.setattr(prices, "publish", redis.publish)
     monkeypatch.setattr(ticker, "market_is_open", lambda: True)
-    ticker._previous.clear()
+    prices.reset_previous()
     return broker, redis
 
 

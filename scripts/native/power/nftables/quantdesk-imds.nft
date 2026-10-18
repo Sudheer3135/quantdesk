@@ -1,0 +1,15 @@
+#!/usr/sbin/nft -f
+# Only root may reach the instance metadata service (169.254.169.254), where
+# the VM's managed-identity token is issued. Root covers the power controller,
+# the Azure VM agent and cloud-init. Every other user - the observer, the
+# unprivileged requester, the QuantDesk application (azureuser) - is refused.
+# The Azure wire server (168.63.129.16) is not touched.
+#
+# Limit: root itself, and anyone who can become root (azureuser has sudo), is
+# not restricted by this rule.
+table inet quantdesk_imds {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        ip daddr 169.254.169.254 meta skuid != 0 counter drop comment "qd-imds-nonroot-drop"
+    }
+}

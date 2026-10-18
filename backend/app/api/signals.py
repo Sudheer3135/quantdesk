@@ -1,13 +1,14 @@
 import logging
 from dataclasses import dataclass
 
+import pandas as pd
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..analytics import decision_provenance, indicators, signal_engine, warmup
 from ..analytics import options as option_analytics
 from ..analytics import plan as plan_builder
-from ..analytics import signal_engine
 from ..brokers.base import UnknownSymbol
 from ..db import get_db
 from ..deps import get_broker
@@ -48,14 +49,44 @@ def build_analysis(symbol: str, timeframe: str, days: int = 5) -> Analysis:
     symbol = validate_symbol(symbol)
     broker = get_broker()
     candles = broker.candles(symbol, timeframe, days)
+    # When Quant Desk actually received the candles — the moment the bars
+    # became available to it, never inferred from the exchange's clock. A
+    # bar is complete in *this copy* only if it had closed before the copy
+    # was taken, so completeness is judged at receipt: judging it at the
+    # later decision instant would admit a bar that was fetched while still
+    # forming and closed only afterwards.
+    received_at = pd.Timestamp.now(tz="UTC")
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=received_at)
+    candles.attrs["received_at"] = received_at.isoformat()
+    decision_time = pd.Timestamp.now(tz="UTC")
+    candles.attrs["decision_time"] = decision_time.isoformat()
     try:
         chain = broker.option_chain(symbol)
     except Exception:
         chain = None
 
+    vix = broker.india_vix()
+    decision_time = pd.Timestamp.now(tz="UTC")
+    candles = indicators.drop_unclosed(candles, timeframe, as_of=decision_time)
+    # The same declared history a replay of this bar sees (TC-5). Five days
+    # of candles is ~375 bars; the backtest reads 300; the EMA200 of the two
+    # differ, so the live signal used to be computed on different inputs
+    # from any replay of it.
+    candles = warmup.declared_history(candles)
+    candles.attrs["decision_time"] = decision_time.isoformat()
+    if chain is not None:
+        source_time = chain.attrs.get("source_time")
+        try:
+            source_time = pd.Timestamp(source_time) if source_time else None
+            if (source_time is None or source_time.tzinfo is None
+                    or source_time > decision_time
+                    or decision_time - source_time > pd.Timedelta(minutes=5)):
+                chain = None
+        except (ValueError, TypeError):
+            chain = None
     signal = signal_engine.generate(
         candles, symbol=symbol, timeframe=timeframe,
-        chain=chain, india_vix=broker.india_vix(),
+        chain=chain, india_vix=vix,
     )
 
     plan = None
@@ -95,6 +126,73 @@ def plan_columns(built: plan_builder.Plan | None) -> dict:
             "plan": built.to_dict()}
 
 
+def provenance_columns(sig: signal_engine.Signal) -> dict:
+    """The signal row's clock and provenance columns (TC-2, RP-2).
+
+    One definition for both writers, like `plan_columns` above and for the
+    same reason. The code identifier is read here — once per stored signal,
+    not per bar inside the engine — and names a dirty tree as dirty.
+    """
+    from ..backtest import measurement
+    from ..config import get_settings
+
+    return decision_provenance.columns(
+        sig, data_source=get_settings().broker, code_id=measurement.code_id())
+
+
+# /2 adds `api_init_provenance`. /1 observations stay as they were written.
+OBSERVATION_SCHEMA = "signal_observation/2"
+
+
+def new_observation(columns: dict) -> dict:
+    """An identity for one stored signal observation (Phase 3B).
+
+    Names this reading of the market by this engine at this moment — not an
+    opportunity and not a thesis: two readings of the same move get two ids.
+    Written into the row's provenance when the row has provenance (a legacy
+    row without it stays a legacy row), and returned for the published
+    payload, where the caller adds the row id once it exists. Whoever
+    consumes the payload can then say exactly which stored row it acted on
+    instead of matching timestamps.
+
+    Also stamped with the producer's API-initialization provenance — the
+    repository state this application started on, held for the run. It is
+    the producing process's, attached here and nowhere later, so an
+    observation read back after a restart keeps its own producer's record.
+    """
+    import copy
+    import uuid
+
+    from .. import runtime_provenance
+    observation_id = f"obs-{uuid.uuid4().hex}"
+    producer = runtime_provenance.current()
+    if columns.get("provenance") is not None:
+        columns["provenance"] = {**columns["provenance"], "observation_id": observation_id,
+                                 "api_init_provenance": producer}
+    return {"schema": OBSERVATION_SCHEMA, "observation_id": observation_id,
+            "signal_id": None,
+            "row_provenance": "persisted" if columns else "legacy",
+            "code_id": columns.get("code_id"),
+            "code_id_basis": "git state on disk when the row was written",
+            "data_source": columns.get("data_source"),
+            # The same snapshot as the row's, as its own copy.
+            "api_init_provenance": copy.deepcopy(producer)}
+
+
+def note_exposure(db: Session, sig, channel: str) -> None:
+    """Serving or storing a live signal shows the strategy that session. If
+    the session is protected prospective holdout data, it is seen from now
+    on (Pass 2D, `methodology.registry`)."""
+    from ..methodology import registry
+
+    timing = (sig.context or {}).get("timing") or {}
+    moment = timing.get("decision_at") or timing.get("signal_time")
+    moment = pd.Timestamp(moment).to_pydatetime() if moment else \
+        pd.Timestamp.now(tz="UTC").to_pydatetime()
+    registry.note_strategy_output(db, moment=moment, channel=channel,
+                                  detail=f"{sig.symbol} {sig.timeframe} {sig.action}")
+
+
 @router.get("/live")
 def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
                 persist: bool = False, db: Session = Depends(get_db),
@@ -124,8 +222,11 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
     # dashboard actually reads — ended up publishing signals with no risk
     # block at all. See audit finding H-4.
     risk_live.attach(db, payload, sig)
+    note_exposure(db, sig, "strategy_signal:/signals/live")
 
     if persist:
+        columns = provenance_columns(sig)
+        observation = new_observation(columns)
         record = SignalRecord(
             symbol=sig.symbol, timeframe=sig.timeframe, action=sig.action,
             confidence=sig.confidence, price=sig.price, entry=sig.entry,
@@ -136,23 +237,48 @@ def live_signal(symbol: str = "NIFTY", timeframe: str = "5m",
             # whatever was on screen at the time.
             risk=payload["risk"],
             **plan_columns(analysis.plan),
+            **columns,
         )
         db.add(record)
         db.commit()
         payload["id"] = record.id
+        # Not published: this route answers its caller only, so nothing
+        # downstream consumes this observation (the agent's is the one v2 reads).
+        payload["observation"] = {**observation, "signal_id": record.id}
 
     return payload
 
 
 @router.get("/history")
 def signal_history(limit: int = 50, db: Session = Depends(get_db)):
+    """The signal journal, as the desk recorded it.
+
+    The two-layer read and the risk verdict are included because a feed row
+    without them cannot be read: an action alone does not say which direction
+    the higher timeframe pointed, whether this was the moment, or whether the
+    desk would have been allowed to take it. All four already live on the row
+    — this only stops discarding them on the way out.
+
+    Additive: every field the previous response carried is still here and
+    still spelled the same, so an existing caller sees no change.
+    """
     rows = db.scalars(
         select(SignalRecord).order_by(SignalRecord.created_at.desc()).limit(limit)
     ).all()
     return [
         {"id": r.id, "created_at": r.created_at, "symbol": r.symbol, "action": r.action,
          "confidence": r.confidence, "price": r.price, "entry": r.entry,
-         "stop_loss": r.stop_loss, "target": r.target}
+         "stop_loss": r.stop_loss, "target": r.target,
+         "bias": r.bias, "entry_state": r.entry_state,
+         # The regime the plan was formed in, if the plan recorded one. Read
+         # from the stored plan rather than re-derived, so the row says what
+         # the desk actually saw and never a reconstruction of it.
+         "regime_day": ((r.plan or {}).get("entry") or {}).get("regime_day"),
+         "regime_hour": ((r.plan or {}).get("entry") or {}).get("regime_hour"),
+         # The verdict only. The reasons are long and belong to the detail
+         # view; a feed needs to show approved-or-not at a glance.
+         "risk_state": (r.risk or {}).get("state"),
+         }
         for r in rows
     ]
 
@@ -177,9 +303,14 @@ def signal_outcomes(symbol: str = "NIFTY", timeframe: str = "5m",
     is not a result.
     """
     symbol = validate_symbol(symbol)
-    report = outcome_study.evaluate(
-        db, symbol, timeframe, include_outcomes=include_signals)
-    return report.to_dict()
+    # Kept until a signal or a candle lands. A pure replay of stored rows
+    # against stored rows, recomputed every minute by an open dashboard —
+    # see `report_cache` for why that is safe and what bounds it.
+    from ..data import report_cache
+    return report_cache.memoise(
+        ("outcomes", symbol, timeframe, include_signals), db,
+        lambda: outcome_study.evaluate(
+            db, symbol, timeframe, include_outcomes=include_signals).to_dict())
 
 
 @router.get("/outcomes/by-regime")

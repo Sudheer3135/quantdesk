@@ -338,6 +338,21 @@ class NSEClient:
 # parsing — kept separate from the network so it can be tested with fixtures
 # --------------------------------------------------------------------------
 
+def _field(block: dict | None, key: str) -> float:
+    """One numeric field from a CE/PE block, NaN when it is not there.
+
+    NaN rather than 0 because the two mean different things downstream: a
+    zero is a recorded fact about the contract, a NaN is the absence of one.
+    Unparseable values ("-", "", None) are absences too.
+    """
+    if not block or key not in block:
+        return float("nan")
+    try:
+        return float(block[key])
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.DataFrame, float]:
     """Turn NSE's nested JSON into the platform's flat chain shape.
 
@@ -389,16 +404,31 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
             continue
         rows.append({
             "strike": float(record["strikePrice"]),
-            "call_oi": float((ce or {}).get("openInterest", 0)),
-            "put_oi": float((pe or {}).get("openInterest", 0)),
-            "call_oi_change": float((ce or {}).get("changeinOpenInterest", 0)),
-            "put_oi_change": float((pe or {}).get("changeinOpenInterest", 0)),
-            "call_volume": float((ce or {}).get("totalTradedVolume", 0)),
-            "put_volume": float((pe or {}).get("totalTradedVolume", 0)),
-            "call_iv": float((ce or {}).get("impliedVolatility", 0)),
-            "put_iv": float((pe or {}).get("impliedVolatility", 0)),
-            "call_ltp": float((ce or {}).get("lastPrice", 0)),
-            "put_ltp": float((pe or {}).get("lastPrice", 0)),
+            # Absent is NaN, never 0 (OC-5). A strike NSE lists without a CE
+            # block has no call OI to report; writing 0 there made a
+            # one-sided chain read as a put/call ratio of zero. A 0 that NSE
+            # actually sent is kept as the genuine zero it is.
+            "call_oi": _field(ce, "openInterest"),
+            "put_oi": _field(pe, "openInterest"),
+            "call_oi_change": _field(ce, "changeinOpenInterest"),
+            "put_oi_change": _field(pe, "changeinOpenInterest"),
+            "call_volume": _field(ce, "totalTradedVolume"),
+            "put_volume": _field(pe, "totalTradedVolume"),
+            "call_iv": _field(ce, "impliedVolatility"),
+            "put_iv": _field(pe, "impliedVolatility"),
+            "call_ltp": _field(ce, "lastPrice"),
+            "put_ltp": _field(pe, "lastPrice"),
+            # The touch and its depth, where the payload carries them. The
+            # archive held no bid/ask at all because they were never read
+            # out of a payload that had them.
+            "call_bid": _field(ce, "bidprice"),
+            "call_ask": _field(ce, "askPrice"),
+            "call_bid_qty": _field(ce, "bidQty"),
+            "call_ask_qty": _field(ce, "askQty"),
+            "put_bid": _field(pe, "bidprice"),
+            "put_ask": _field(pe, "askPrice"),
+            "put_bid_qty": _field(pe, "bidQty"),
+            "put_ask_qty": _field(pe, "askQty"),
         })
 
     if not rows:
@@ -433,27 +463,33 @@ def parse_option_chain(payload: dict, expiry: str | None = None) -> tuple[pd.Dat
 
 
 def parse_nse_timestamp(raw: str | None) -> str | None:
-    """Turn NSE's `"20-Aug-2026 10:34"` into an absolute UTC instant.
+    """Turn NSE's `"20-Aug-2026 10:34"` or `"08-Oct-2026 15:40:00"` into an
+    absolute UTC instant.
 
-    NSE stamps its payloads in IST with minute resolution and no offset, so
-    the string alone is ambiguous the moment it crosses a timezone. Parsing
-    it here — once, next to the payload it came from — means everything
-    downstream compares absolute instants instead of re-deriving a timezone
-    from a display string.
+    NSE stamps its payloads in IST with no offset, so the string alone is
+    ambiguous the moment it crosses a timezone. Parsing it here — once, next
+    to the payload it came from — means everything downstream compares
+    absolute instants instead of re-deriving a timezone from a display
+    string.
 
-    Minute resolution is the honest limit: a price stamped 10:34 was printed
-    somewhere in that minute, so an age derived from it can be up to 60s
-    optimistic. That is a reason to prefer a source with a finer timestamp,
-    not a reason to invent precision here.
+    Both shapes are NSE's: the option chain has carried seconds since late
+    September 2026. Read as minutes only, every such chain parsed to None and
+    the signal engine discarded it as undated. A minute stamp keeps its
+    honest limit: a price stamped 10:34 was printed somewhere in that minute,
+    so an age derived from it can be up to 60s optimistic. That is a reason
+    to prefer a source with a finer timestamp, not a reason to invent
+    precision here.
     """
     if not raw:
         return None
-    try:
-        naive = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M")
-    except (ValueError, TypeError):
-        log.debug("could not parse NSE timestamp %r", raw)
-        return None
-    return naive.replace(tzinfo=IST).astimezone(UTC).isoformat()
+    for shape in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M"):
+        try:
+            naive = datetime.strptime(raw.strip(), shape)
+        except (ValueError, TypeError):
+            continue
+        return naive.replace(tzinfo=IST).astimezone(UTC).isoformat()
+    log.debug("could not parse NSE timestamp %r", raw)
+    return None
 
 
 def parse_index_value(payload: dict, name: str) -> float | None:

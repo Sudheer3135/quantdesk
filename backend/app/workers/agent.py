@@ -10,11 +10,18 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from .. import net
-from ..api.signals import build_analysis, plan_columns
+from ..api.signals import (
+    build_analysis,
+    new_observation,
+    note_exposure,
+    plan_columns,
+    provenance_columns,
+)
 from ..cache import publish
 from ..config import get_settings
 from ..data import importer, regime_store
@@ -128,16 +135,25 @@ def _analyse(s) -> None:
         # published one carry the same verdict rather than two evaluations
         # taken a moment apart.
         risk_live.attach(db, payload, sig)
+        note_exposure(db, sig, "strategy_signal:agent")
 
-        db.add(SignalRecord(
+        columns = provenance_columns(sig)
+        observation = new_observation(columns)
+        record = SignalRecord(
             symbol=sig.symbol, timeframe=sig.timeframe, action=sig.action,
             confidence=sig.confidence, price=sig.price, entry=sig.entry,
             stop_loss=sig.stop_loss, target=sig.target,
             checks=[c.to_dict() for c in sig.checks], context=sig.context,
             risk=payload["risk"],
             **plan_columns(analysis.plan),
-        ))
+            **columns,
+        )
+        db.add(record)
         db.commit()
+        # The published payload names the row it came from, so strategy v2
+        # records which observation it consumed rather than matching clocks.
+        payload["observation"] = {**observation, "signal_id": record.id,
+                                  "published_at": datetime.now(UTC).isoformat()}
 
     publish_signal(payload)
 

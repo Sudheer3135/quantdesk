@@ -102,6 +102,7 @@ def _decide(db: Session, action: str | None, entry, stop_loss, target) -> dict:
         trading_day=day,
         todays=repository.todays_trades(db, day),
         open_now=repository.open_trades(db),
+        closed_today=repository.closed_trades(db, day),
     )
     decision = evaluate(
         config=risk_config(),

@@ -51,6 +51,15 @@ def isolated_settings(monkeypatch):
     """
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setenv("ENVIRONMENT", "dev")
+    # The v2 paper trader is a background thread. A test that boots the app
+    # must not start one against the developer's database.
+    monkeypatch.setenv("V2_PAPER_ENABLED", "false")
+    # A developer with a live Angel account has ANGEL_ENABLED=true in their
+    # .env, which reaches every test that touches the ticker: the poller
+    # then debounces before falling back, and a test asserting "one tick,
+    # one publish" fails for reasons that have nothing to do with it. Tests
+    # that want the feed on set this themselves and win.
+    monkeypatch.setenv("ANGEL_ENABLED", "false")
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
@@ -96,3 +105,13 @@ def engine(request):
 def db(engine):
     with Session(engine, expire_on_commit=False) as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def _fresh_report_cache():
+    """Test databases are created and destroyed per test and routinely hold
+    identical row counts, so a kept report must never cross between them."""
+    from app.data import report_cache
+    report_cache.clear()
+    yield
+    report_cache.clear()

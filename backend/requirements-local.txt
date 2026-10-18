@@ -22,3 +22,9 @@ httpx>=0.28
 curl_cffi>=0.16.0
 python-dotenv>=1.2.3
 pytest>=9.0.3
+
+# Angel One SmartAPI — the live price websocket.
+smartapi-python>=1.5.5
+pyotp>=2.10
+websocket-client>=1.9
+logzero>=1.7

@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.analytics import indicators
 from app.backtest import engine, option_engine
-from app.backtest.feed import HistoricalFeed, LookaheadError
+from app.backtest.feed import UNVERIFIED, HistoricalFeed, LookaheadError
 from app.brokers.mock import MockBroker
 from app.risk.manager import RiskConfig
 
@@ -291,10 +291,16 @@ def test_feed_rejects_a_negative_or_out_of_range_index(candles):
 
 def test_verify_causality_is_a_no_op_on_a_tiny_frame():
     """Too little data to check is reported as nothing checked, not as a
-    clean bill of health derived from two bars."""
+    clean bill of health derived from two bars.
+
+    And the public verdict says so: a run that checked nothing is
+    UNVERIFIED, never a quiet PASS.
+    """
     small = MockBroker(seed=1).candles(days=1, interval="1d")
     report = HistoricalFeed(small).verify_causality()
     assert report.checked == 0
+    assert report.status == UNVERIFIED
+    assert not report.causal
 
 
 def test_walk_cursor_advances_monotonically(candles):

@@ -1,0 +1,18 @@
+# Loads the metadata-endpoint isolation table before the network comes up and
+# keeps it loaded. The controller refuses to act if the table is absent.
+#
+# NOT INSTALLED. Disabled template.
+[Unit]
+Description=QuantDesk power: restrict the instance metadata service to root
+DefaultDependencies=no
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /opt/quantdesk-power/nftables/quantdesk-imds.nft
+ExecStop=/usr/sbin/nft delete table inet quantdesk_imds
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+# Lightweight operational and collection-progress check.
+[Unit]
+Description=QuantDesk observer: midsession check at 12:30 IST on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 12:30:00 Asia/Kolkata
+# A run missed while the VM was off happens at the next boot, and the report
+# records how late it was; it is never counted as a timely check.
+Persistent=true
+AccuracySec=1s
+Unit=quantdesk-observer@midsession.service
+
+[Install]
+WantedBy=timers.target

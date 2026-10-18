@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
+from ..analytics import indicators
 from .base import Broker
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -67,11 +68,14 @@ class MockBroker(Broker):
             if count % per_day == 0:
                 cursor = (cursor + timedelta(days=1)).replace(hour=9, minute=15)
 
-        return pd.DataFrame({
+        frame = pd.DataFrame({
             "timestamp": pd.to_datetime(stamps, utc=True),
             "open": open_.round(2), "high": high.round(2),
             "low": low.round(2), "close": close.round(2), "volume": volume,
         })
+        # This feed simulates an exchange that reports traded volume, so it
+        # says so. Nothing infers that from the numbers themselves.
+        return indicators.declare_volume(frame, indicators.GENUINE)
 
     def quote(self, symbol: str = "NIFTY") -> dict:
         last = self.candles(symbol).iloc[-1]

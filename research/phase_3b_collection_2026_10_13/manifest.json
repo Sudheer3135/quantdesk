@@ -1,0 +1,57 @@
+{
+  "milestone": "Phase 3B post-fix collection",
+  "status": "ACCEPTED",
+  "accepted_by": "Astra",
+  "scope": "frozen evidence manifest; acceptance applies to the submitted three-session collection evidence only",
+  "recorded_at_utc": "2026-10-13T11:12:30+00:00",
+  "production_revision": "2d1d25a71394455588ba1398f47735fac8a9fdcd",
+  "sessions": [
+    {"session": 1, "date": "2026-10-09", "signal_ids": [1970, 2044], "observations": 75},
+    {"session": 2, "date": "2026-10-12", "signal_ids": [2045, 2119], "observations": 75},
+    {"session": 3, "date": "2026-10-13", "signal_ids": [2120, 2194], "observations": 75}
+  ],
+  "total_observations": 225,
+  "missing_observations": 0,
+  "duplicate_observations": 0,
+  "gates": {
+    "producer_revision_consistency": "PASS",
+    "observation_decision_linkage": "PASS",
+    "nse_timestamp_restoration": "PASS",
+    "option_chain_restoration": "PASS",
+    "score_accounting": "PASS",
+    "feed_continuity": "PASS",
+    "live_trading_false": "PASS"
+  },
+  "manufactured_or_backfilled_observations": "NONE",
+  "session_3_operational_exception": {
+    "readiness_0845_ist": "FAIL",
+    "vm_startup_ist": "2026-10-13 09:03:07",
+    "service_recovery_ist": "approximately 2026-10-13 09:03:27",
+    "first_scheduled_observation_ist": "2026-10-13 09:18:32",
+    "session_3_qualification": "ACCEPTED UNDER RECORDED OPERATIONAL EXCEPTION"
+  },
+  "unresolved_limitations": [
+    "Angel bid-parser reliability at the natural selector boundary: INCONCLUSIVE.",
+    "No natural contract-selection attempt occurred in any of the three sessions.",
+    "No positions, fills or round trips occurred.",
+    "The dataset describes observations and rejection decisions, not executed trades.",
+    "The 225 observations must not be described as 225 independent trading opportunities.",
+    "Exact option-chain source age is not persisted directly per signal.",
+    "Archive timestamps must not be presented as exact signal-input timestamps unless linkage proves that relationship.",
+    "The first morning observation can combine a previous-session completed bar with the current morning option chain under existing behavior.",
+    "NSE input restoration and natural score contribution do not establish predictive value or profitability."
+  ],
+  "not_established": [
+    "profitability",
+    "predictive value",
+    "independent trading opportunities",
+    "contract-selection validity",
+    "execution validity",
+    "Angel bid-parser validity at the selector boundary"
+  ],
+  "row_fingerprints": {
+    "basis": "sha256 over row_to_json(row)::text joined by newline in id order, read in a read-only transaction on PostgreSQL 16.15 on 2026-10-13 at about 16:41 IST; reproducible only on a server that renders JSON identically",
+    "signals_1970_2194": {"rows": 225, "sha256": "6ba77f5737e3c9c9f80549f1848e442818f5fad16beaa1a5fa83c2fd37726448"},
+    "paper_decisions_922_1146": {"rows": 225, "sha256": "bfa2c1b96747c264b290f6403f32b9b700b2e7f150332714ddadba66fc6114e3"}
+  }
+}

@@ -34,9 +34,16 @@ jobs:
         run: pip install -r backend/requirements.txt ruff
       - name: Lint
         run: ruff check backend/app
+      # The public site's proxy (scripts/native/caddy) is tested by running
+      # it. The release is the one named in CADDY_VERSION, installed the way
+      # the VM installs it; QUANTDESK_REQUIRE_CADDY makes a missing binary a
+      # failure of tests/test_public_proxy.py and not a skip.
+      - name: Install Caddy
+        run: ./scripts/native/caddy/install_caddy.sh
       - name: Test
         run: pytest tests -q
         env:
+          QUANTDESK_REQUIRE_CADDY: "1"
           BROKER: mock
           DATABASE_URL: sqlite:///./test.db
           TEST_DATABASE_URL: postgresql+psycopg://quant:quant@localhost:5432/quantdesk_test

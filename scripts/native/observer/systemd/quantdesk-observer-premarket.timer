@@ -1,0 +1,14 @@
+# Pre-market readiness, with bounded retries that end before 08:45 IST.
+[Unit]
+Description=QuantDesk observer: premarket check at 08:35 IST on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:35:00 Asia/Kolkata
+# A run missed while the VM was off happens at the next boot, and the report
+# records how late it was; it is never counted as a timely check.
+Persistent=true
+AccuracySec=1s
+Unit=quantdesk-observer@premarket.service
+
+[Install]
+WantedBy=timers.target

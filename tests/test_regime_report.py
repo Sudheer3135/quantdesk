@@ -59,8 +59,15 @@ def archive_frame(n=400, seed=2):
 
 def add_signal(db, frame, bar_index, action="BUY", confidence=0.6):
     """A signal computed on `bar_index`, stamped a moment after that bar
-    closed — which is when the agent would actually have filed it."""
-    stamp = pd.Timestamp(frame["timestamp"].iloc[bar_index]).to_pydatetime()
+    closed — which is when the agent would actually have filed it.
+
+    `timestamp` is the bar's *open*, so the close is one bar-width later.
+    Stamping 30 seconds after the open instead described a decision taken
+    while the bar was still forming, and the evaluator now correctly reads
+    that as a decision made on the previous bar.
+    """
+    stamp = (pd.Timestamp(frame["timestamp"].iloc[bar_index])
+             + timedelta(minutes=5)).to_pydatetime()
     price = float(frame["close"].iloc[bar_index])
     risk = 20.0 if action == "BUY" else -20.0
     record = SignalRecord(
@@ -147,14 +154,34 @@ def test_signals_are_matched_on_their_own_bar_not_the_exit_bar(db, desk):
 
 
 def test_the_signal_bar_is_the_last_bar_that_had_closed(db, desk):
-    """`signal_bar_time` must be the bar before the fill, every time."""
+    """Both clocks around the decision, stated as the rule rather than as a
+    fixed gap.
+
+    The bar the signal was computed on is the last one that had *closed*
+    when the row was filed, and the fill is the first bar that starts at or
+    after that instant. Those are two different bars whenever the decision
+    lands mid-bar, which is the normal case: a signal filed 30 seconds
+    after a bar closes cannot be filled at the open of the bar already
+    running, so the fill is the bar after that one. Asserting a gap of
+    exactly one bar was asserting that no time passes between a bar closing
+    and a decision being made.
+    """
     frame = regime_store.load(db, "NIFTY", "5m")
     stamps = list(frame["timestamp"])
+    width = pd.Timedelta(minutes=5)
 
     for row in study.collect(db, "NIFTY", "5m").outcomes:
+        decision = pd.Timestamp(row.signal_time)
         signal_bar = pd.Timestamp(row.signal_bar_time)
         entry_bar = pd.Timestamp(row.entry_time)
-        assert stamps.index(entry_bar) == stamps.index(signal_bar) + 1
+
+        # The signal bar had closed; the bar after it had not.
+        assert signal_bar + width <= decision
+        assert stamps[stamps.index(signal_bar) + 1] + width > decision
+        # The fill is the first bar that had not started yet.
+        assert entry_bar >= decision
+        assert stamps[stamps.index(entry_bar) - 1] < decision
+        assert stamps.index(entry_bar) > stamps.index(signal_bar)
 
 
 # ---- honest about gaps -------------------------------------------------

@@ -903,6 +903,39 @@ def _domain_verdict(errors: int, warnings: int) -> str:
     return "unusable" if errors else "usable with caveats" if warnings else "clean"
 
 
+def _stored_findings(db: Session, symbol: str, timeframe: str,
+                     include_options: bool) -> dict:
+    """Every check that is a pure reading of the stored data.
+
+    Separated from `report` so it can be kept between requests; see
+    `report_cache`. Collector liveness is deliberately absent — it compares
+    the newest snapshot against the clock, and must be asked every time.
+    """
+    index: list[Finding] = []
+    for finding in (missing_candles(db, symbol, timeframe)
+                    + duplicate_candles(db, symbol, timeframe)
+                    + impossible_prices(db, symbol, timeframe)
+                    + price_jumps(db, symbol, timeframe)
+                    + synthetic_volume(db, symbol, timeframe)
+                    + source_mix(db, symbol, timeframe)):
+        finding.domain = INDEX
+        index.append(finding)
+
+    options: list[Finding] = []
+    if include_options:
+        for finding in (option_coverage(db, symbol)
+                        + option_snapshot_coverage(db, symbol)
+                        + option_bars_on_non_sessions(db, symbol)
+                        + missing_option_strikes(db, symbol)
+                        + abnormal_iv(db, symbol)
+                        + oi_discontinuities(db, symbol)):
+            finding.domain = OPTIONS
+            options.append(finding)
+
+    return {"index": index, "options": options,
+            "index_coverage": index_coverage_pct(db, symbol, timeframe)}
+
+
 def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
            include_options: bool = True,
            index_min_backtest_pct: float | None = None,
@@ -923,26 +956,23 @@ def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
     option_min = (option_min_backtest_pct if option_min_backtest_pct is not None
                   else settings.option_coverage_min_backtest_pct)
 
-    findings: list[Finding] = []
-    for finding in (missing_candles(db, symbol, timeframe)
-                    + duplicate_candles(db, symbol, timeframe)
-                    + impossible_prices(db, symbol, timeframe)
-                    + price_jumps(db, symbol, timeframe)
-                    + synthetic_volume(db, symbol, timeframe)
-                    + source_mix(db, symbol, timeframe)):
-        finding.domain = INDEX
-        findings.append(finding)
+    from . import report_cache
 
+    stored = report_cache.memoise(
+        ("quality", symbol, timeframe, include_options), db,
+        lambda: _stored_findings(db, symbol, timeframe, include_options))
+
+    # Reassembled in the original order, so a tie in the sort below still
+    # breaks the way it always did: index findings, then collector liveness,
+    # then the rest of the option findings.
+    findings: list[Finding] = list(stored["index"])
     if include_options:
-        for finding in (option_collector_liveness(db, symbol)
-                        + option_coverage(db, symbol)
-                        + option_snapshot_coverage(db, symbol)
-                        + option_bars_on_non_sessions(db, symbol)
-                        + missing_option_strikes(db, symbol)
-                        + abnormal_iv(db, symbol)
-                        + oi_discontinuities(db, symbol)):
+        # Never cached. It reads the clock against the newest snapshot, and
+        # a kept copy of "the collector is fine" is an alarm switched off.
+        for finding in option_collector_liveness(db, symbol):
             finding.domain = OPTIONS
             findings.append(finding)
+        findings.extend(stored["options"])
 
     rank = {"error": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: (rank.get(f.severity, 3), -f.count))
@@ -965,7 +995,7 @@ def report(db: Session, symbol: str = "NIFTY", timeframe: str = "5m",
             "findings": [f.to_dict() for f in mine],
         }
 
-    index_pct, index_observed, index_expected = index_coverage_pct(db, symbol, timeframe)
+    index_pct, index_observed, index_expected = stored["index_coverage"]
     index_block = block(INDEX, index_pct, index_min)
     index_block["observed_bars"] = index_observed
     index_block["expected_bars"] = index_expected

@@ -1,0 +1,15 @@
+# Liveness ping to Healthchecks.io, every five minutes, around the clock.
+# It shows that the observer ran and could reach out. It reads nothing from
+# QuantDesk and proves nothing about QuantDesk's health. A missing heartbeat
+# means "heartbeat missing, cause unknown": it does not show the VM is off.
+# Nothing here pauses the hosted check for nights, weekends or holidays.
+[Unit]
+Description=QuantDesk observer: liveness ping every five minutes, every day
+
+[Timer]
+OnCalendar=*-*-* *:00/5:00 Asia/Kolkata
+AccuracySec=1s
+Unit=quantdesk-observer@liveness.service
+
+[Install]
+WantedBy=timers.target

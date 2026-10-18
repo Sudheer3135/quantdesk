@@ -225,7 +225,10 @@ def load(db: Session, symbol: str = "NIFTY", timeframe: str = "5m") -> pd.DataFr
          "engine_version": r.engine_version}
         for r in rows])
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    return frame
+    # Regime labels are derived features. A protected holdout session's are
+    # withheld here, below every caller (Pass 2D.1).
+    from ..methodology import registry
+    return registry.withhold(db, frame)
 
 
 def latest(db: Session, symbol: str = "NIFTY", timeframe: str = "5m") -> dict | None:
@@ -236,6 +239,17 @@ def latest(db: Session, symbol: str = "NIFTY", timeframe: str = "5m") -> dict | 
         .order_by(MarketRegime.timestamp.desc()).limit(1)).first()
     if row is None:
         return None
+    # The API route and the stream both read the regime through here. A bar
+    # from a protected holdout session is refused: no label, confidence or
+    # feature leaves, only the fact that it was withheld (Pass 2D.1).
+    from ..methodology import registry
+    stamp = repository.as_utc(row.timestamp)
+    if registry.session_key(stamp) in registry.protected_sessions(db, [stamp]):
+        return {"withheld": True, "timestamp": None, "engine_version": None,
+                "day": None, "hour": None,
+                "session_date": registry.session_key(stamp),
+                "reason": "protected prospective holdout session; regime features "
+                          "are not served for it"}
     features = row.features or {}
     return {
         "timestamp": repository.as_utc(row.timestamp).isoformat(),

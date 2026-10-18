@@ -1,0 +1,186 @@
+{
+  "schema": "quantdesk_automation_schedules/1",
+  "note": "Proposed Azure Automation schedules (not created). Time zone naming must be verified against the Automation account at creation.",
+  "schedules": [
+    {
+      "name": "qd-start-weekdays-0730",
+      "runbook": "qd-start",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "07:30",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "start the VM, holidays included"
+    },
+    {
+      "name": "qd-monitor-weekdays-0100",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "01:00",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "overnight: expect deallocated (also bounds the gap the missing-monitor alert measures)"
+    },
+    {
+      "name": "qd-monitor-weekdays-0715",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "07:15",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "before the start: expect deallocated"
+    },
+    {
+      "name": "qd-monitor-weekdays-0755",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "07:55",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "startup: expect running (first heartbeat due 07:45)"
+    },
+    {
+      "name": "qd-monitor-weekdays-1030",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "10:30",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "daytime: unexpected stop"
+    },
+    {
+      "name": "qd-monitor-weekdays-1330",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "13:30",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "daytime: unexpected stop"
+    },
+    {
+      "name": "qd-monitor-weekdays-1550",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "15:50",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "daytime: unexpected stop"
+    },
+    {
+      "name": "qd-monitor-weekdays-2130",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday"
+      ],
+      "time": "21:30",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "after the shutdown window: expect deallocated"
+    },
+    {
+      "name": "qd-monitor-weekend-0000",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Saturday",
+        "Sunday"
+      ],
+      "time": "00:00",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "weekend: expect deallocated unless a special session"
+    },
+    {
+      "name": "qd-monitor-weekend-0600",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Saturday",
+        "Sunday"
+      ],
+      "time": "06:00",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "weekend: expect deallocated unless a special session"
+    },
+    {
+      "name": "qd-monitor-weekend-1200",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Saturday",
+        "Sunday"
+      ],
+      "time": "12:00",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "weekend: expect deallocated unless a special session"
+    },
+    {
+      "name": "qd-monitor-weekend-1800",
+      "runbook": "qd-monitor",
+      "frequency": "Week",
+      "interval": 1,
+      "weekDays": [
+        "Saturday",
+        "Sunday"
+      ],
+      "time": "18:00",
+      "timeZone": "Asia/Kolkata",
+      "purpose": "weekend: expect deallocated unless a special session"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+# Files one shutdown-evaluation request. Unprivileged: it can create a request
+# file and nothing else. It reads only its own non-secret configuration
+# (/etc/quantdesk-power-request/request.json: the request directory and the
+# attempt window). It has no Azure credential, no network, and no access to
+# the controller's configuration (database service and password files), the
+# controller's state, or the observer's configuration and state: those paths
+# are made inaccessible in its namespace, in addition to their own modes.
+#
+# NOT INSTALLED. Disabled template; see ../README.md, "Installation".
+[Unit]
+Description=QuantDesk power: file a shutdown-evaluation request (unprivileged)
+ConditionPathIsDirectory=/run/quantdesk-power/requests
+
+[Service]
+Type=oneshot
+User=quantdesk-power
+Group=quantdesk-power
+ExecStart=/usr/bin/python3 -I /opt/quantdesk-power/power.py request --config /etc/quantdesk-power-request/request.json
+TimeoutStartSec=60
+IPAddressDeny=any
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/quantdesk-power/requests
+InaccessiblePaths=-/etc/quantdesk-power -/var/lib/quantdesk-power -/etc/quantdesk-observer -/var/lib/quantdesk-observer
+PrivateTmp=yes
+PrivateDevices=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+LockPersonality=yes

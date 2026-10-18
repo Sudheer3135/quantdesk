@@ -26,3 +26,11 @@ httpx==0.28.1
 curl_cffi==0.16.0
 python-dotenv==1.2.3
 pytest==9.1.1
+
+# Angel One SmartAPI, for the live price websocket. `smartapi-python` pulls
+# in logzero and websocket-client; both are pinned here so the image build
+# cannot drift onto a version the socket behaves differently on.
+smartapi-python==1.5.5
+pyotp==2.10.0
+websocket-client==1.9.0
+logzero==1.7.0

@@ -1,0 +1,19 @@
+{
+  "synthetic_reproductions": {
+    "aligned_forming_bar_retained": true,
+    "future_volume_changes_past_rvol_availability": true,
+    "buy_with_bid100_ask102_ltp95": {
+      "requested": 95.0,
+      "filled": 96.0,
+      "slippage": 1.0,
+      "basis": "measured_spread"
+    },
+    "sell_with_bid100_ask102_ltp110": {
+      "requested": 110.0,
+      "filled": 109.0,
+      "slippage": 1.0,
+      "basis": "measured_spread"
+    },
+    "final_bar_entry_missing_from_trade_results": true
+  }
+}

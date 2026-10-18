@@ -1,0 +1,23 @@
+{
+ "snapshot_1530_rows": 12,
+ "1530_rows_after_session_filter": 12,
+ "sessions_not_75": 18,
+ "daily_limit_and_reset": [
+  [
+   "stop",
+   "06-01 14:20"
+  ],
+  [
+   "stop",
+   "06-01 14:30"
+  ],
+  [
+   "stop",
+   "06-02 09:20"
+  ],
+  [
+   "stop",
+   "06-02 09:45"
+  ]
+ ]
+}

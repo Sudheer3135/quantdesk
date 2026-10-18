@@ -1,0 +1,26 @@
+{
+ "forming_bar_retained_default_call": false,
+ "rvol_prefix_vs_full": {
+  "prefix": null,
+  "full": null,
+  "bug_reproduces": false
+ },
+ "buy_bid100_ask102_ltp95": {
+  "requested": 101.0,
+  "filled": 102.0,
+  "slippage": 1.0,
+  "basis": "quoted_touch_estimated_impact"
+ },
+ "sell_bid100_ask102_ltp110": {
+  "requested": 101.0,
+  "filled": 100.0,
+  "slippage": 1.0,
+  "basis": "quoted_touch_estimated_impact"
+ },
+ "final_bar_entry": {
+  "trades": 1,
+  "exit_reasons": [
+   "stop"
+  ]
+ }
+}

@@ -22,6 +22,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.backtest.costs import CostModel, SlippageModel
+from app.backtest.execution import ExecutionPolicy
 from app.backtest.feed import HistoricalFeed
 from app.data.importer import import_index_candles
 from app.evaluation import outcomes as study
@@ -92,17 +93,62 @@ def test_entry_is_the_next_bars_open_not_the_signal_price():
     assert out.entry_time == frame["timestamp"].iloc[1].isoformat()
 
 
-def test_levels_travel_with_the_fill():
-    """An overnight or intrabar gap must not silently widen the risk: the
-    engine shifts stop and target by the same amount as the fill."""
+def test_a_gapped_fill_keeps_the_strategys_own_levels():
+    """The levels are statements about the market, not offsets from the fill.
+
+    This used to shift both by the size of the gap, which kept R
+    arithmetically intact while moving the stop off the structure that
+    justified it — a trade nobody chose, recorded as though it had been. The
+    gap is recorded now and the levels stand.
+    """
     frame = bars([(24_000, 24_005, 23_995, 24_000),
                   (24_020, 24_025, 24_015, 24_020)] + flat(6))
     out = run_one(frame, signal(ist_at(9, 15)), index=0)
 
     assert out.entry == 24_020.0
+    assert out.stop == 23_980.0        # the signal's own stop, unmoved
+    assert out.target == 24_040.0
+    assert out.planned_entry == 24_000.0
+    assert out.actual_entry == 24_020.0
+    assert out.gap_amount == 20.0
+    assert out.execution_policy == "keep_planned_levels"
+    # The gap shows up as risk actually taken rather than vanishing into
+    # the levels: filled at 24,020 against a 23,980 stop is 40 points.
+    assert out.risk_per_unit == 40.0
+
+
+def test_shifting_levels_with_the_fill_is_available_but_must_be_asked_for():
+    """The old behaviour is a legitimate policy for a strategy whose levels
+    really are offsets from the fill. It is named on every trade it touches,
+    so no result can hold a silent mixture of the two conventions."""
+    frame = bars([(24_000, 24_005, 23_995, 24_000),
+                  (24_020, 24_025, 24_015, 24_020)] + flat(6))
+    out = study.evaluate_signal(
+        HistoricalFeed(frame), 0, signal(ist_at(9, 15)), FREE, NO_SLIP,
+        quantity=1,
+        policy=ExecutionPolicy(gapped_entry="shift_levels_with_fill"))
+
     assert out.stop == 24_000.0        # 23,980 shifted by +20
     assert out.target == 24_060.0      # 24,040 shifted by +20
     assert out.risk_per_unit == 20.0
+    assert out.execution_policy == "shift_levels_with_fill"
+    assert out.planned_stop == 23_980.0
+
+
+def test_a_fill_past_its_own_stop_is_refused_not_repriced():
+    """A long whose fill opens below its stop has no premise left. Sizing
+    the remainder is how one gap became 654 lots and a fictional 473%
+    return, and moving the stop to meet it invents a different trade."""
+    frame = bars([(24_000, 24_005, 23_995, 24_000),
+                  (23_970, 23_975, 23_965, 23_970)] + flat(6))
+    out = run_one(frame, signal(ist_at(9, 15)), index=0)
+
+    assert out.outcome == "entry_rejected_due_to_gap"
+    assert out.resolved is False
+    assert out.won is None
+    assert out.exit_price is None
+    assert out.r_multiple is None
+    assert out.gap_amount == -30.0
 
 
 # ---- resolution --------------------------------------------------------
@@ -260,6 +306,9 @@ def test_a_zero_width_stop_is_not_actionable():
 def seed(db, specs, signals):
     import_index_candles(db, bars(specs), "NIFTY", "5m", "test")
     for record in signals:
+        # These fixtures describe a decision on the supplied bar. Write it
+        # when that bar closes, rather than before its close existed.
+        record.created_at += timedelta(minutes=5)
         record.id = None
         db.add(record)
     db.commit()
@@ -314,7 +363,8 @@ def test_the_study_reports_distinct_bars_alongside_the_count(db):
          [signal(ist_at(9, 15), sid=1), signal(ist_at(9, 17), sid=2)])
 
     report = study.evaluate(db, "NIFTY", "5m")
-    assert report.selection["selected"] == 2
+    assert report.selection["selected"] == 1
+    assert report.selection["duplicate_bars"] == 1
     assert report.selection["distinct_bars"] == 1
 
 
@@ -460,11 +510,14 @@ def test_force_still_runs_a_pass_for_diagnostics(db, monkeypatch):
     assert len(published) == 1
 
 
-def test_the_headline_r_is_gross_and_the_cost_caveat_says_so(db):
-    """At an index level of 24,000 the engine's cost model charges about
-    2.3R a round trip, because it computes turnover from the traded price as
-    though it were an option premium. Reporting net as the headline would
-    have shown every signal losing 2-3R regardless of whether it was right."""
+def test_the_headline_r_is_gross_and_the_study_says_what_it_charged(db):
+    """Gross is the signal-quality reading; net is reported beside it.
+
+    This study used to charge the option premium schedule against an index
+    level — about 3,400 rupees a round trip at 24,000, roughly 2.3R at a
+    twenty-point stop — so `avg_r_net` measured the mispricing rather than
+    the signals. It now charges the index engine's flat figure, and says so.
+    """
     seed(db, [(24_000, 24_005, 23_995, 24_000),
               (24_000, 24_050, 23_995, 24_045)] + flat(6),
          [signal(ist_at(9, 15))])
@@ -474,13 +527,20 @@ def test_the_headline_r_is_gross_and_the_cost_caveat_says_so(db):
 
     joined = " ".join(report.caveats)
     assert "GROSS" in joined
-    assert "do not read net as expectancy" in joined
+    assert "flat per-round-trip" in joined
+    # And the assumption is printed rather than implied.
+    assert report.execution["turnover_basis"] == "flat_per_round_trip"
+    assert report.execution["cost_schedule_status"] == "configured"
 
 
-def test_a_win_is_decided_gross_not_after_costs(db):
-    """A signal that reached its target was right about the market. Whether
-    the charges on an index-priced round trip swallowed it is a separate
-    question, and conflating them would report a working signal as a loss."""
+def test_costs_no_longer_swallow_a_winning_index_signal(db):
+    """A signal that reached its target was right about the market, and the
+    charges on an index round trip are no longer large enough to hide that.
+
+    The premise of this test used to be the opposite — a 45-point win on 75
+    units came out *negative* after charges, because the charges were option
+    rates on 24,000 a point. That figure was the bug, not the market.
+    """
     seed(db, [(24_000, 24_005, 23_995, 24_000),
               (24_000, 24_050, 23_995, 24_045)] + flat(6),
          [signal(ist_at(9, 15))])
@@ -490,4 +550,9 @@ def test_a_win_is_decided_gross_not_after_costs(db):
 
     assert only["outcome"] == "target"
     assert only["won"] is True
-    assert only["net_pnl"] < 0, "test premise: costs exceed the gross win here"
+    assert only["net_pnl"] > 0
+    # Flat brokerage, nothing statutory, and the three parts still add up.
+    assert only["brokerage"] == pytest.approx(120.0)
+    assert only["statutory_fees"] == pytest.approx(0.0)
+    assert (only["gross_pnl"] - only["execution_friction"]
+            - only["charges"]) == pytest.approx(only["net_pnl"], abs=0.01)

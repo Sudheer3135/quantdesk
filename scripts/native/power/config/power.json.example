@@ -1,0 +1,99 @@
+{
+  "schema": "quantdesk_power_config/1",
+  "state_root": "/var/lib/quantdesk-power",
+  "request_dir": "/run/quantdesk-power/requests",
+  "requester_user": "quantdesk-power",
+  "window": {
+    "weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "first_attempt_ist": "17:30",
+    "last_attempt_ist": "21:00"
+  },
+  "calendar_file": "/etc/quantdesk-observer/session_calendar.json",
+  "holds_dir": "/etc/quantdesk-power/holds",
+  "observer": {
+    "user": "quantdesk-observer",
+    "state_root": "/var/lib/quantdesk-observer",
+    "python": "/usr/bin/python3",
+    "entry": "/opt/quantdesk-observer/observer.py",
+    "config": "/etc/quantdesk-observer/observer.json",
+    "accepted_versions": [
+      "0.4.14"
+    ],
+    "timers": [
+      "quantdesk-observer-liveness.timer",
+      "quantdesk-observer-premarket.timer",
+      "quantdesk-observer-midsession.timer",
+      "quantdesk-observer-afterclose.timer"
+    ],
+    "lock_wait_seconds": 600,
+    "evidence_max_age_seconds": 120
+  },
+  "units": {
+    "web": "quantdesk-web.service",
+    "api": "quantdesk-api.service",
+    "redis": "quantdesk-redis.service",
+    "postgres": "quantdesk-postgres.service"
+  },
+  "api_process_match": "uvicorn app.main:app",
+  "programs": {
+    "systemctl": "/usr/bin/systemctl",
+    "ps": "/usr/bin/ps",
+    "timedatectl": "/usr/bin/timedatectl",
+    "nft": "/usr/sbin/nft",
+    "psql": "/usr/bin/psql",
+    "pg_controldata": "/usr/lib/postgresql/16/bin/pg_controldata"
+  },
+  "postgres": {
+    "service_file": "/etc/quantdesk-power/pg_service.conf",
+    "service": "quantdesk_power",
+    "pass_file": "/etc/quantdesk-power/pgpass",
+    "data_dir": "/home/azureuser/.quantdesk/postgresql@16",
+    "cluster_user": "azureuser",
+    "app_role": "quant"
+  },
+  "timeouts": {
+    "stop_web": 60,
+    "stop_api": 330,
+    "stop_redis": 60,
+    "stop_postgres": 120,
+    "start_unit": 120,
+    "db_statement": 10,
+    "evidence": 120,
+    "command": 30
+  },
+  "package_locks": [
+    "/var/lib/dpkg/lock-frontend",
+    "/var/lib/dpkg/lock",
+    "/var/lib/apt/lists/lock",
+    "/var/cache/apt/archives/lock"
+  ],
+  "apt_units": [
+    "apt-daily.service",
+    "apt-daily-upgrade.service"
+  ],
+  "package_timers": [
+    "apt-daily.timer",
+    "apt-daily-upgrade.timer"
+  ],
+  "imds": {
+    "nft_table": "inet quantdesk_imds"
+  },
+  "azure": {
+    "subscription_id": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "quantdesk-rg",
+    "vm_name": "quantdesk-vm",
+    "api_version": "2024-07-01",
+    "request_timeout_seconds": 10,
+    "poll_budget_seconds": 900
+  },
+  "status": {
+    "key_file": "/etc/quantdesk-power/status.key",
+    "transport": "none"
+  }
+}

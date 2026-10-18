@@ -75,10 +75,11 @@ def test_the_detector_itself_works():
 # ---- the actual failure -----------------------------------------------
 
 def test_an_all_nan_indicator_column_survives_serialisation():
-    """The exact shape that broke the endpoint: constant volume makes
+    """The exact shape that broke the endpoint: substituted volume makes
     `rvol` NaN for the entire series."""
     df = MockBroker(seed=5).candles(days=3, interval="5m")
     df["volume"] = 1.0                       # what the free adapter substitutes
+    indicators.declare_volume(df, indicators.SYNTHETIC)   # and declares
 
     enriched = indicators.enrich(df)
     assert enriched["rvol"].isna().all(), "test premise: rvol should be all-NaN here"
@@ -105,10 +106,12 @@ def client(monkeypatch):
     from app.api import market
 
     class VolumelessBroker(MockBroker):
+        """Stands in for the free adapter: substitutes volume and says so."""
+
         def candles(self, symbol="NIFTY", interval="5m", days=5):
             df = super().candles(symbol, interval, days)
             df["volume"] = 1.0
-            return df
+            return indicators.declare_volume(df, indicators.SYNTHETIC)
 
     monkeypatch.setattr(market, "get_broker", lambda: VolumelessBroker())
     app = FastAPI()
