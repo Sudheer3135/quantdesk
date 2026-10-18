@@ -16,22 +16,11 @@ source "$(dirname "$0")/native/env.sh"
 mkdir -p "$LOG_DIR"
 cd "$ROOT/backend"
 
-# Prefer the project's venv, but fall back to a runnable interpreter when the
-# tree is copied without that environment (for example in script safety tests).
-PYTHON_BIN="$ROOT/.venv/bin/python"
-if [ ! -x "$PYTHON_BIN" ]; then
-  PYTHON_BIN="$(command -v python3 || command -v python || true)"
-fi
-if [ -z "$PYTHON_BIN" ]; then
-  echo "Refusing migration: no runnable python interpreter found"
-  exit 1
-fi
-
 # An explicit scratch target (QUANTDESK_DATABASE_URL, see env.sh) is named
 # before anything runs, and refused if it is in fact the desk's own database:
 # the override exists for other databases, and the desk's needs none.
 if [ -n "${QUANTDESK_DATABASE_URL:-}" ]; then
-  if ! target="$(NATIVE_DATABASE_URL="$NATIVE_DATABASE_URL" "$PYTHON_BIN" - <<'PY'
+  if ! target="$(NATIVE_DATABASE_URL="$NATIVE_DATABASE_URL" "$ROOT/.venv/bin/python" - <<'PY'
 import os
 import sys
 
@@ -61,7 +50,7 @@ PY
 fi
 
 if [ "${1:-}" = "--apply" ]; then
-  "$PYTHON_BIN" -m app.migrate --apply 2>&1 | tee -a "$LOG_DIR/migrations.log"
+  "$ROOT/.venv/bin/python" -m app.migrate --apply 2>&1 | tee -a "$LOG_DIR/migrations.log"
   exit "${PIPESTATUS[0]}"
 fi
-exec "$PYTHON_BIN" -m app.migrate "$@"
+exec "$ROOT/.venv/bin/python" -m app.migrate "$@"
