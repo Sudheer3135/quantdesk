@@ -52,13 +52,13 @@ def real_env(cfg: dict) -> controller.Env:
 
 
 def status(cfg: dict, as_json: bool) -> int:
+    allowed, why = gate.decide(cfg, facts.boot_id)
     state_dir = controller.open_state(cfg)
     try:
         jrnl = journal.Journal(state_dir, owner=os.geteuid())
         txns = jrnl.all()
         now = datetime.now(UTC)
         holds, hold_fact = facts.read_holds(cfg, now)
-        allowed, why = gate.decide(cfg, facts.boot_id)
         out = {
             "workload_start": {"allowed": allowed, "reason": why},
             "now_utc": now.isoformat(),
