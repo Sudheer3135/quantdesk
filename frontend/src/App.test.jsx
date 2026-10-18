@@ -1362,6 +1362,16 @@ describe("layout density", () => {
    evidence. The 15s / 60s lines are the backend's LIVE_SECONDS /
    DELAYED_SECONDS, mirrored here and pinned by tests/test_freshness_contract.py. */
 describe("connection status and data freshness are separate readings", () => {
+  /* These tests read ages to the second. The app's clock is sampled once a
+     second, and the shared fake timers also advance in real time, so a
+     frame built a few real milliseconds after the last sample reads a
+     second young (1m 09s for 70s) on a slow runner. Here time moves only
+     when a test moves it. */
+  beforeEach(() => {
+    vi.useRealTimers();
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+  });
+
   /* A tick as the Angel stream publishes it: received by the desk just now,
      printed by the exchange `lagSeconds` earlier. */
   const streamTick = (price, lagSeconds = 0.5) => ({
