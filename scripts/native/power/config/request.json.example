@@ -1,0 +1,15 @@
+{
+  "schema": "quantdesk_power_request_config/1",
+  "request_dir": "/run/quantdesk-power/requests",
+  "window": {
+    "weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "first_attempt_ist": "17:30",
+    "last_attempt_ist": "21:00"
+  }
+}

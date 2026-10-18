@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "status": "PROPOSAL - NOT AUTHORIZED. Needs a Log Analytics workspace and a diagnostic setting sending the Automation account's JobLogs to it: new cloud resources, an approval blocker.",
+    "why": "A metric alert has nothing to evaluate when no job ran at all (no TotalJob samples), so it cannot detect a monitor that never runs. A log search alert counts result rows; `summarize count()` without `by` returns one row with 0 when no job completed, and 0 < 1 fires."
+  },
+  "parameters": {
+    "workspaceId": {
+      "type": "string"
+    },
+    "actionGroupId": {
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/scheduledQueryRules",
+      "apiVersion": "2021-08-01",
+      "name": "qd-monitor-missing",
+      "location": "centralindia",
+      "properties": {
+        "description": "No completed qd-monitor job in 12 hours: the independent monitor itself is not running. Fires on zero rows as well as on failures.",
+        "severity": 1,
+        "enabled": true,
+        "scopes": [
+          "[parameters('workspaceId')]"
+        ],
+        "evaluationFrequency": "PT1H",
+        "windowSize": "PT12H",
+        "autoMitigate": false,
+        "criteria": {
+          "allOf": [
+            {
+              "query": "AzureDiagnostics | where ResourceProvider == \"MICROSOFT.AUTOMATION\" and Category == \"JobLogs\" | where RunbookName_s == \"qd-monitor\" and ResultType == \"Completed\" | summarize completed = count()",
+              "timeAggregation": "Total",
+              "metricMeasureColumn": "completed",
+              "operator": "LessThan",
+              "threshold": 1,
+              "failingPeriods": {
+                "numberOfEvaluationPeriods": 1,
+                "minFailingPeriodsToAlert": 1
+              }
+            }
+          ]
+        },
+        "actions": {
+          "actionGroups": [
+            "[parameters('actionGroupId')]"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+# Settles transactions a previous run did not finish: at boot (after the
+# QuantDesk services have been started or refused by the admission gate) and
+# hourly from its timer, and publishes the status record each time. It never
+# infers an Azure outcome from time, a running VM or a new boot, and never
+# reads an operation's status earlier than Azure's Retry-After permits.
+#
+# NOT INSTALLED. Disabled template.
+[Unit]
+Description=QuantDesk power: settle unfinished shutdown transactions (root)
+After=network-online.target quantdesk-power-imds.service quantdesk-api.service quantdesk-web.service
+Wants=network-online.target
+Requires=quantdesk-power-imds.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/quantdesk-power/power.py recover --config /etc/quantdesk-power/power.json
+TimeoutStartSec=20min
+Environment=TZ=Asia/Kolkata
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/quantdesk-power /run/quantdesk-power
+ReadOnlyPaths=/var/lib/quantdesk-observer /etc/quantdesk-observer
+StateDirectory=quantdesk-power
+StateDirectoryMode=0700
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

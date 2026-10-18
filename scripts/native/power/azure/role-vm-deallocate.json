@@ -1,0 +1,15 @@
+{
+  "Name": "QuantDesk VM Self-Deallocate",
+  "IsCustom": true,
+  "Description": "Assigned to the VM's own system-assigned identity: read and deallocate this VM only. Polling an operation's status needs Microsoft.Compute/locations/operations/read above VM scope (resource group or subscription; see README); that is deliberately NOT granted (it exceeds the approved VM scope), so an unreadable status leaves the outcome UNKNOWN.",
+  "Actions": [
+    "Microsoft.Compute/virtualMachines/read",
+    "Microsoft.Compute/virtualMachines/deallocate/action"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/quantdesk-vm"
+  ]
+}

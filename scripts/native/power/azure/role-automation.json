@@ -1,0 +1,16 @@
+{
+  "Name": "QuantDesk VM Start (Automation)",
+  "IsCustom": true,
+  "Description": "Read and start the one QuantDesk VM. No deallocate, no write, no run-command.",
+  "Actions": [
+    "Microsoft.Compute/virtualMachines/read",
+    "Microsoft.Compute/virtualMachines/instanceView/read",
+    "Microsoft.Compute/virtualMachines/start/action"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Compute/virtualMachines/quantdesk-vm"
+  ]
+}

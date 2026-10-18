@@ -1,0 +1,14 @@
+{
+  "schema": "quantdesk_special_session/1",
+  "session_date": "2026-11-08",
+  "label": "Muhurat trading",
+  "official_reference": "<NSE circular notifying the timings>",
+  "vm_start_ist": "2026-11-08T17:00:00+05:30",
+  "first_heartbeat_by_ist": "2026-11-08T17:20:00+05:30",
+  "session_open_ist": "2026-11-08T18:00:00+05:30",
+  "session_close_ist": "2026-11-08T19:00:00+05:30",
+  "keep_running_until_ist": "2026-11-08T20:30:00+05:30",
+  "authorization_reference": "<approval reference>",
+  "recorded_by": "<operator>",
+  "recorded_at_utc": "2026-11-01T10:00:00+00:00"
+}

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "ownerEmail": {
+      "type": "string"
+    },
+    "automationAccountId": {
+      "type": "string"
+    },
+    "vmId": {
+      "type": "string"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/actionGroups",
+      "apiVersion": "2023-01-01",
+      "name": "qd-owner-email",
+      "location": "Global",
+      "properties": {
+        "groupShortName": "qdowner",
+        "enabled": true,
+        "emailReceivers": [
+          {
+            "name": "owner",
+            "emailAddress": "[parameters('ownerEmail')]",
+            "useCommonAlertSchema": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Insights/metricAlerts",
+      "apiVersion": "2018-03-01",
+      "name": "qd-runbook-failed",
+      "location": "global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/actionGroups','qd-owner-email')]"
+      ],
+      "properties": {
+        "description": "qd-start or qd-monitor failed: a missing or failed VM start, an unexpected stop, a controller that did not complete, an incomplete or unresolved shutdown. Repeats at every failing scheduled run.",
+        "severity": 1,
+        "enabled": true,
+        "scopes": [
+          "[parameters('automationAccountId')]"
+        ],
+        "evaluationFrequency": "PT5M",
+        "windowSize": "PT5M",
+        "autoMitigate": false,
+        "criteria": {
+          "odata.type": "Microsoft.Azure.Monitor.SingleResourceMultipleMetricCriteria",
+          "allOf": [
+            {
+              "name": "failed",
+              "metricName": "TotalJob",
+              "metricNamespace": "Microsoft.Automation/automationAccounts",
+              "operator": "GreaterThan",
+              "threshold": 0,
+              "timeAggregation": "Total",
+              "dimensions": [
+                {
+                  "name": "Status",
+                  "operator": "Include",
+                  "values": [
+                    "Failed",
+                    "Suspended",
+                    "Stopped"
+                  ]
+                },
+                {
+                  "name": "Runbook",
+                  "operator": "Include",
+                  "values": [
+                    "qd-start",
+                    "qd-monitor"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "actions": [
+          {
+            "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups','qd-owner-email')]"
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Insights/activityLogAlerts",
+      "apiVersion": "2020-10-01",
+      "name": "qd-vm-operation-failed",
+      "location": "Global",
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/actionGroups','qd-owner-email')]"
+      ],
+      "properties": {
+        "description": "A start or deallocation of the QuantDesk VM failed at the Azure level.",
+        "enabled": true,
+        "scopes": [
+          "[parameters('vmId')]"
+        ],
+        "condition": {
+          "allOf": [
+            {
+              "field": "category",
+              "equals": "Administrative"
+            },
+            {
+              "field": "status",
+              "equals": "Failed"
+            },
+            {
+              "anyOf": [
+                {
+                  "field": "operationName",
+                  "equals": "Microsoft.Compute/virtualMachines/deallocate/action"
+                },
+                {
+                  "field": "operationName",
+                  "equals": "Microsoft.Compute/virtualMachines/start/action"
+                }
+              ]
+            }
+          ]
+        },
+        "actions": {
+          "actionGroups": [
+            {
+              "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups','qd-owner-email')]"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

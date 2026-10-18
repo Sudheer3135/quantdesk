@@ -1,0 +1,40 @@
+# The root controller: reconciles earlier transactions, then validates at most
+# one request and runs the shutdown transaction (see ../README.md). It is the
+# only process allowed to reach the instance metadata service (nftables rule
+# quantdesk-imds.nft: only uid 0), and it obtains the managed-identity token
+# only at the moment it submits the deallocation.
+#
+# Sandbox: everything is read-only except its own state and the request
+# directory. The observer's state stays readable and read-only: the
+# controller opens exactly one existing file there, the observer's `lock`,
+# read-only (flock needs no write access), and the observer evidence it starts
+# (as the observer account, inheriting this namespace) only reads.
+#
+# TimeoutStartSec covers the observer-lock wait (10 min), two evidence reads
+# (2 x 2 min), the service stops (1 + 5.5 + 1 + 2 min) and the poll budget
+# (15 min), with margin. If systemd stops it anyway, the journal says where it
+# was and the next run (or boot) settles it.
+#
+# NOT INSTALLED. Disabled template.
+[Unit]
+Description=QuantDesk power: conditional shutdown transaction (root)
+After=network-online.target quantdesk-power-imds.service
+Wants=network-online.target
+Requires=quantdesk-power-imds.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/quantdesk-power/power.py control --config /etc/quantdesk-power/power.json
+TimeoutStartSec=50min
+KillMode=mixed
+Environment=TZ=Asia/Kolkata
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/quantdesk-power /run/quantdesk-power
+ReadOnlyPaths=/var/lib/quantdesk-observer /etc/quantdesk-observer /opt/quantdesk-observer
+StateDirectory=quantdesk-power
+StateDirectoryMode=0700
+PrivateTmp=yes
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes

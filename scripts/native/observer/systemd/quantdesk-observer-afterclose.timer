@@ -1,0 +1,14 @@
+# After-close qualification and checkpoint detection.
+[Unit]
+Description=QuantDesk observer: afterclose check at 16:00 IST on weekdays
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:00:00 Asia/Kolkata
+# A run missed while the VM was off happens at the next boot, and the report
+# records how late it was; it is never counted as a timely check.
+Persistent=true
+AccuracySec=1s
+Unit=quantdesk-observer@afterclose.service
+
+[Install]
+WantedBy=timers.target

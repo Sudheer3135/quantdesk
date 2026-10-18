@@ -1,0 +1,11 @@
+{
+  "schema": "quantdesk_power_hold/1",
+  "hold_id": "maintenance-2026-10-30",
+  "kind": "KEEP_RUNNING",
+  "reason_code": "MAINTENANCE",
+  "from_ist": "2026-10-30T17:00:00+05:30",
+  "to_ist": "2026-10-31T09:00:00+05:30",
+  "authorization_reference": "<approval reference>",
+  "recorded_by": "<operator>",
+  "recorded_at_utc": "2026-10-30T10:00:00+00:00"
+}

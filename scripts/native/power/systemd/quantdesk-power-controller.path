@@ -1,0 +1,13 @@
+# Starts the root controller when a request file appears. The controller
+# removes every request it reads, accepted or not, so the directory empties.
+#
+# NOT INSTALLED. Disabled template.
+[Unit]
+Description=QuantDesk power: act on shutdown-evaluation requests
+
+[Path]
+DirectoryNotEmpty=/run/quantdesk-power/requests
+Unit=quantdesk-power-controller.service
+
+[Install]
+WantedBy=paths.target

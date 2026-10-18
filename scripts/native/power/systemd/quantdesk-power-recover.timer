@@ -1,0 +1,16 @@
+# Reconciliation and a fresh status record every hour at :40 (07:40 is the
+# first after the 07:30 start). It only does anything while the VM is up. Not
+# Persistent.
+#
+# NOT INSTALLED. Disabled template.
+[Unit]
+Description=QuantDesk power: hourly reconciliation and status record
+
+[Timer]
+OnCalendar=*-*-* *:40:00 Asia/Kolkata
+AccuracySec=1s
+Persistent=false
+Unit=quantdesk-power-recover.service
+
+[Install]
+WantedBy=timers.target

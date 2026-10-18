@@ -1,0 +1,39 @@
+{
+  "report_root": "/var/lib/quantdesk-observer",
+  "quantdesk_repo": "/home/azureuser/quantdesk",
+  "api_base": "http://127.0.0.1:8000",
+  "expected_revision": "2d1d25a71394455588ba1398f47735fac8a9fdcd",
+  "expected_strategy_version": "nifty-signal-engine/1",
+  "expected_parameter_hash": "49419f9bdc2c8039e65a87dacb140d6ea640e98f7e09b15f896c843752d55dbe",
+  "expected_v2_config_hash": "d27c3e341b8354831f26381983e072756d774423d325fa12294f6e9d18f28988",
+  "expected_option_chain_weight": 0.16,
+  "expected_listeners": [
+    "0.0.0.0:22",
+    "[::]:22",
+    "127.0.0.1:5173",
+    "127.0.0.1:5433",
+    "127.0.0.1:6379",
+    "127.0.0.1:8000",
+    "127.0.0.53%lo:53",
+    "127.0.0.54:53"
+  ],
+  "https_deployed": false,
+  "disk_paths": [
+    "/",
+    "/var/lib/quantdesk-observer"
+  ],
+  "bounded_phase_after": "2026-10-13",
+  "bounded_phase_sessions": 5,
+  "baseline": {
+    "positions_total": 1,
+    "journal_total": 1
+  },
+  "calendar_file": "/opt/quantdesk-observer/session_calendar.json",
+  "healthchecks": {
+    "enabled": false,
+    "base_url": "https://hc-ping.com",
+    "credentials_file": "/etc/quantdesk-observer/healthchecks.json"
+  },
+  "operator_root": "/etc/quantdesk-observer/operator",
+  "quantdesk_log": "/home/azureuser/quantdesk/logs/native/backend.log"
+}
